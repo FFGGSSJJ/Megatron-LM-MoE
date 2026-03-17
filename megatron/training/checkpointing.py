@@ -22,6 +22,8 @@ import torch
 from typing import Optional, Union, List, Dict, Any
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
+import gc
+
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
@@ -621,18 +623,33 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
+        print_rank_0(
+            f"generate_state_dict: {state_dict.keys()}"
+        )
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
+            print_rank_0(
+                f"global + torch_dist"
+            )
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
             if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
+                print_rank_0(
+                    f"validate_sharding_integrity = not {args.ckpt_assume_constant_structure}"
+                )
                 save_strategy = checkpointing_context['save_strategy']
                 # Already saved once before - don't need to rerun sharding validation
                 validate_sharding_integrity = not args.ckpt_assume_constant_structure
             else:
+                print_rank_0(
+                    f"validate_sharding_integrity = True"
+                )
                 validate_sharding_integrity = True
                 save_strategy = TorchDistSaveShardedStrategy()
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
+                    print_rank_0(
+                        f"ckpt_assume_constant_structure"
+                    )
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                     if args.async_save:
                         save_strategy.thread_count = args.dist_ckpt_workers
@@ -1821,6 +1838,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         **load_kwargs
     )
 
+    del load_kwargs
+    # collect the freed reference to load_kwargs so that CUDA can let go of load_kwargs["sharded_state_dict"] 
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # Checkpoint not loaded.
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
@@ -1876,6 +1898,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            del state_dict['model']
         else:
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
@@ -1883,6 +1906,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+                del state_dict['model%d' % i]
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
@@ -1899,6 +1923,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
             elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
+                del state_dict['optimizer']
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -2015,6 +2040,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
        or is_last_rank():
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
+    gc.collect()
     torch.cuda.empty_cache()
 
     if iteration > 0:
