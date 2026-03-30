@@ -2234,6 +2234,7 @@ def training_log(
             elapsed_time_per_iteration * 1000.0
         )
         if args.log_throughput:
+            log_string += f' tokens per sec per GPU: {tokens_per_sec_per_gpu:.2f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             log_string += f' MFU: {mfu:.2f}% |'
             if args.log_timers_to_tensorboard:
@@ -2885,6 +2886,7 @@ def train(
             record_shapes=args.pytorch_profiler_collect_shapes,
             with_stack=args.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
+            activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]
         )
         prof.start()
 
