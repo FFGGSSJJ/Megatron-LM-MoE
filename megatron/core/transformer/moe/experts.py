@@ -72,15 +72,6 @@ logger = logging.getLogger(__name__)
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
-        # register delay wgrad computation
-        # check distribured_data_parallel.py
-        self.wgrad_accumulation_and_reduce_hooks = []
-        self.expert_wgrad_scheduler = None
-        if config.moe_use_custom_function and config.delay_wgrad_compute:
-            self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
-            self.weight1.skip_backward_post_hook = True
-            self.weight2.skip_backward_post_hook = True
-
     def forward(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: list[int], /
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
