@@ -271,6 +271,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
             )
+            self.config.delay_wgrad_compute = delay_wgrad_compute
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
