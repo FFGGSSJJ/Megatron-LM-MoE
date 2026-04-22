@@ -10,6 +10,7 @@ from typing import Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
@@ -38,6 +39,11 @@ from megatron.core.transformer.moe.experts_util import (
     grouped_swiglu_mlp,
     ExpertsWgradScheduler,
 )
+from megatron.core.transformer.moe.experts_offloading_util import (
+    StreamManager, 
+    offloading_grouped_swiglu_mlp,
+)
+
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -67,6 +73,15 @@ from megatron.core.inference.moe import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    import grouped_gemm
+except ImportError:
+    grouped_gemm = None
+
+from megatron.core.tensor_parallel.layers import (
+    _initialize_affine_weight_cpu,
+)
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -886,3 +901,175 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
+    
+
+
+class OffloadingExpertsMLP(MegatronModule):
+    """An implementation of the Experts layer with fine-grained experts offloading.
+
+    This class executes each expert sequentially and offloads expert to CPU
+    to save GPU memory.
+    """
+
+    def __init__(
+        self, 
+        num_local_experts: int,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        super().__init__(config)
+        self.num_local_experts = num_local_experts
+
+        assert config.gradient_accumulation_fusion
+        assert not config.delay_wgrad_compute, "delay_wgrad_compute is not supported in OffloadingExpertsMLP for now"
+
+        self.ep_group = pg_collection.ep
+        # use pg_collection.expt_tp_group as tensor parallel group in this module.
+        self.tp_group = pg_collection.expt_tp
+        # use pg_collection.expt_dp_group as data parallel group in this module.
+        self.dp_group = pg_collection.expt_dp
+        # How many feature each rank holds for fc1 and fc2, respectively.
+        tp_size = self.tp_group.size()
+        tp_rank = self.tp_group.rank()
+        self.expert_parallel = config.expert_model_parallel_size > 1
+        
+        self.input_size = self.config.hidden_size \
+            if self.config.moe_latent_size is None \
+            else self.config.moe_latent_size
+        
+        fc1_output_size = self.config.moe_ffn_hidden_size * (2 if self.config.gated_linear_unit else 1)
+        fc1_output_size_per_partition = fc1_output_size
+        fc2_input_size = self.config.moe_ffn_hidden_size
+        fc2_input_size_per_partition = fc2_input_size
+        
+        # For now all expert weights are offloaded in CPU.
+        self.weight1 = []
+        self.weight2 = []
+        for i in range(self.num_local_experts):
+            self.register_parameter(
+                f'weight1_expert_{i}',
+                Parameter(
+                    torch.empty(
+                        self.input_size,
+                        self.config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
+                        device="cpu",
+                        dtype=config.params_dtype,
+                        pin_memory=True,
+                    )
+                ),
+            )
+            self.weight1.append(getattr(self, f'weight1_expert_{i}'))
+
+            self.register_parameter(
+                f'weight2_expert_{i}',
+                Parameter(
+                    torch.empty(
+                        self.config.moe_ffn_hidden_size,
+                        self.input_size,
+                        device="cpu",
+                        dtype=config.params_dtype,
+                        pin_memory=True,
+                    )
+                ),
+            )
+            self.weight2.append(getattr(self, f'weight2_expert_{i}'))
+
+            if config.perform_initialization:
+                _initialize_affine_weight_cpu(
+                    self.weight1[i], 
+                    self.input_size,
+                    fc1_output_size,
+                    fc1_output_size_per_partition,
+                    partition_dim=1,
+                    init_method=config.init_method,
+                    params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                )
+                _initialize_affine_weight_cpu(
+                    self.weight2[i], 
+                    fc2_input_size,
+                    self.input_size,
+                    fc2_input_size_per_partition,
+                    partition_dim=0,
+                    init_method=config.output_layer_init_method,
+                    params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                )
+            setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
+            setattr(self.weight2[i], 'allreduce', not self.expert_parallel)
+
+        # GPU buffer to prefetch CPU weights
+        self.num_stages = self.config.moe_offloading_num_stages
+        self.num_chunks = self.config.moe_offloading_num_chunks
+        assert num_local_experts % self.num_chunks == 0, "num_local_experts should be divisible by num_steps."
+        self.chunk_size = num_local_experts // self.num_chunks # one chunk contains num_local_experts // self.num_chunks experts
+        self.config.moe_offloading_chunk_size = self.chunk_size
+        
+        self.experts1_gpu_buffers = [[torch.empty(
+            self.input_size,
+            self.config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        ) for _ in range(self.chunk_size)] for _ in range(self.num_stages)]
+        self.experts2_gpu_buffers = [[torch.empty(
+            self.config.moe_ffn_hidden_size,
+            self.input_size,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        ) for _ in range(self.chunk_size)] for _ in range(self.num_stages)]
+
+        # cuda stream manager for h2d transfer and computation
+        self.stream_manager = StreamManager.get_instance()
+
+        # scheduler to determine when to trigger wgrad compute
+        self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
+
+    
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
+        if permuted_local_hidden_states.nelement() != 0:
+            output = offloading_grouped_swiglu_mlp(
+                self.weight1,
+                self.weight2,
+                self.experts1_gpu_buffers,
+                self.experts2_gpu_buffers,
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                self.num_local_experts,
+                permuted_probs,
+                self.expert_wgrad_scheduler,
+                self.stream_manager,
+                self.config,
+            )
+
+            return output, None
+        else:
+            # NOTE: it should be safe to pass empty tensor to the custom function, 
+            # but it will introduce meanless h2d transfer.
+            # TODO: add cost free path for empty input
+            output = offloading_grouped_swiglu_mlp(
+                self.weight1,
+                self.weight2,
+                self.experts1_gpu_buffers,
+                self.experts2_gpu_buffers,
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                self.num_local_experts,
+                permuted_probs,
+                self.expert_wgrad_scheduler,
+                self.stream_manager,
+                self.config,
+            )
+            return output, None
+
+
+
+
+
+
