@@ -2223,6 +2223,8 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--router-weight-adam', action='store_true',
+                       help='Use Adam optimizer for MoE router weights when muon is used.')
     group.add_argument('--muon-momentum', type=float, default=0.9,
                        help='Momentum factor for Muon optimizer')
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
