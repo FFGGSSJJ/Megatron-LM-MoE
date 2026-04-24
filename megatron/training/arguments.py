@@ -1461,6 +1461,11 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
+    # MoE expert offloading check
+    if args.moe_use_offloading_experts:
+        assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
+        assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
+
     # --skip-train checks.
     # In RL inference-only mode, --no-load-optim is user-controlled: it determines whether the
     # optimizer is created (needed for --rl-offload-optimizer-during-inference) or skipped entirely.
