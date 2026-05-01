@@ -669,10 +669,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     if param.requires_grad:
 
                         # float16 params:
-                        if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                        if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor', 'torch.BFloat16Tensor']:
                             float16_params_this_group.append(param)
                             # Create a copy
-                            main_param = param.detach().clone().float()
+                            if param.type() == 'torch.BFloat16Tensor':
+                                main_param = param.detach().clone().to(torch.cuda.current_device()).float()
+                            else:
+                                main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):

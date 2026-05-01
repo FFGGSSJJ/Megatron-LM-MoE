@@ -1415,7 +1415,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     if (
-        not args.moe_use_offloading_experts and
         not (args.use_torch_fsdp2 and args.use_cpu_initialization)
         and not args.init_model_with_meta_device
     ):

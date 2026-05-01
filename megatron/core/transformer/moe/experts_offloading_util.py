@@ -447,18 +447,18 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             cpu_weights_slice = cpu_weights[experts_idx_start:experts_idx_end]
             buf = gpu_buffers[gpu_buffer_idx]
 
-            # NOTE: batched H2D copy is used to reduce cpu overhead
             assert len(cpu_weights_slice) == len(buf), \
                 f"Number of weights in CPU slice {len(cpu_weights_slice)} does not match number of GPU buffers {len(buf)}"
-            grouped_gemm.grouped_gemm.backend.batched_h2d_async(
-                cpu_weights_slice,
-                buf,
-                h2d_stream.cuda_stream
-            )
-
-            # NOTE: fallback to non-batched copy if the above async copy has issues
-            # for idx in range(experts_idx_start, experts_idx_end):
-            #      buf[idx - experts_idx_start].copy_(cpu_weights[idx].data, non_blocking=True)
+            # NOTE: batched H2D copy is used to reduce cpu overhead
+            if cpu_weights_slice[0].is_pinned():
+                grouped_gemm.grouped_gemm.backend.batched_h2d_async(
+                    cpu_weights_slice,
+                    buf,
+                    h2d_stream.cuda_stream
+                )
+            else: # NOTE: fallback to non-batched copy if not pinned
+                for idx in range(experts_idx_start, experts_idx_end):
+                    buf[idx - experts_idx_start].copy_(cpu_weights[idx].data, non_blocking=True)
         
         return (gpu_buffer_idx, h2d_stream_idx, experts_idx_start, experts_idx_end)
     

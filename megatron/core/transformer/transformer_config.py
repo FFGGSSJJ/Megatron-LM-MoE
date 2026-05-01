@@ -753,6 +753,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_offloading_chunk_size: int = -1
     """Chunk size for offloading. If set to a positive value, it will override the chunk size calculated"""
 
+    moe_offloading_experts_skip_post_backward_hook: bool = False
+    """Whether the offloading experts MLP should skip the post backward hook."""
+
+    moe_offloading_experts_debug_mode: bool = False
+    """Whether to enable debug mode for offloading experts, which will take the flow of GroupedMLP"""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,

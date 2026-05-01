@@ -954,14 +954,15 @@ class OffloadingExpertsMLP(MegatronModule):
                     torch.empty(
                         self.input_size,
                         self.config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
-                        device="cpu",
                         dtype=config.params_dtype,
-                        pin_memory=True,
+                        device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                        pin_memory= not self.config.moe_offloading_experts_debug_mode,
                     )
                 ),
             )
             self.weight1.append(getattr(self, f'weight1_expert_{i}'))
-            self.weight1[i].skip_backward_post_hook = True
+            self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+            self.weight1[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
 
             self.register_parameter(
                 f'weight2_expert_{i}',
@@ -969,14 +970,15 @@ class OffloadingExpertsMLP(MegatronModule):
                     torch.empty(
                         self.config.moe_ffn_hidden_size,
                         self.input_size,
-                        device="cpu",
                         dtype=config.params_dtype,
-                        pin_memory=True,
+                        device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                        pin_memory= not self.config.moe_offloading_experts_debug_mode,
                     )
                 ),
             )
             self.weight2.append(getattr(self, f'weight2_expert_{i}'))
-            self.weight2[i].skip_backward_post_hook = True
+            self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+            self.weight2[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
 
             if config.perform_initialization:
                 _initialize_affine_weight_cpu(
@@ -1032,6 +1034,16 @@ class OffloadingExpertsMLP(MegatronModule):
 
         # store hooks after wgrad reduce
         self.wgrad_accumulation_and_reduce_hooks = []
+
+    def _apply(self, fn, recurse=True):
+      saved = {}
+      for name, p in list(self._parameters.items()):
+          if p is not None and getattr(p, 'is_cpu_offloaded', False):
+              saved[name] = self._parameters.pop(name)
+      out = super()._apply(fn, recurse=recurse)
+      for name, p in saved.items():
+          self._parameters[name] = p
+      return out
     
     def forward(
         self,
@@ -1040,6 +1052,19 @@ class OffloadingExpertsMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         if permuted_local_hidden_states.nelement() != 0:
+            if self.config.moe_offloading_experts_debug_mode:
+                output = grouped_swiglu_mlp(
+                    self.weight1,
+                    self.weight2,
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    self.num_local_experts,
+                    permuted_probs,
+                    self.expert_wgrad_scheduler,
+                    self.config,
+                )
+                return output, None
+            
             output = offloading_grouped_swiglu_mlp(
                 self.weight1,
                 self.weight2,
@@ -1057,6 +1082,19 @@ class OffloadingExpertsMLP(MegatronModule):
 
             return output, None
         else:
+            if self.config.moe_offloading_experts_debug_mode:
+                output = grouped_swiglu_mlp(
+                    self.weight1,
+                    self.weight2,
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    self.num_local_experts,
+                    permuted_probs,
+                    self.expert_wgrad_scheduler,
+                    self.config,
+                )
+                return output, None
+        
             # NOTE: it should be safe to pass empty tensor to the custom function, 
             # but it will introduce meanless h2d transfer.
             # TODO: add cost free path for empty input
