@@ -44,6 +44,10 @@ from megatron.core.transformer.moe.experts_offloading_util import (
     offloading_grouped_swiglu_mlp,
 )
 
+from megatron.core.transformer.moe.experts_offloading_fp8_util import (
+    offloading_fp8_grouped_swiglu_mlp,
+)
+
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -943,68 +947,145 @@ class OffloadingExpertsMLP(MegatronModule):
         fc1_output_size_per_partition = fc1_output_size
         fc2_input_size = self.config.moe_ffn_hidden_size
         fc2_input_size_per_partition = fc2_input_size
+
+        # Determine expert shape
+        # NOTE: when FP8 is enabled, we use NT layout for GEMM computation
+        # and the weight shape is initialized as (output_size, input_size)
+        fc1_expert_weight_shape = (
+            self.input_size,
+            fc1_output_size,
+        ) if not self.config.moe_use_inplace_fp8_param else (
+            fc1_output_size,
+            self.input_size,
+        )
+
+        fc2_expert_weight_shape = (
+            fc2_input_size,
+            self.input_size,
+        ) if not self.config.moe_use_inplace_fp8_param else (
+            self.input_size,
+            fc2_input_size,
+        )
         
         # For now all expert weights are offloaded in CPU.
-        self.weight1 = []
-        self.weight2 = []
-        for i in range(self.num_local_experts):
-            self.register_parameter(
-                f'weight1_expert_{i}',
-                Parameter(
-                    torch.empty(
-                        self.input_size,
-                        self.config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
-                        dtype=config.params_dtype,
-                        device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
-                        pin_memory= not self.config.moe_offloading_experts_debug_mode,
-                    )
-                ),
+        # NOTE: when FP8 is enabled, we allocate experts as a single tensor
+        # to make sure we can access main_grad as a single tensor in the backward
+        if self.config.moe_use_inplace_fp8_param:
+            self.weight1 = Parameter(
+                torch.empty(
+                    self.num_local_experts,
+                    *fc1_expert_weight_shape,
+                    dtype=config.params_dtype,
+                    device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                    pin_memory= not self.config.moe_offloading_experts_debug_mode,
+                    # device=torch.cuda.current_device(),
+                )
             )
-            self.weight1.append(getattr(self, f'weight1_expert_{i}'))
-            self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
-            self.weight1[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+            self.weight1.skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+            self.weight1.is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
 
-            self.register_parameter(
-                f'weight2_expert_{i}',
-                Parameter(
-                    torch.empty(
-                        self.config.moe_ffn_hidden_size,
-                        self.input_size,
-                        dtype=config.params_dtype,
-                        device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
-                        pin_memory= not self.config.moe_offloading_experts_debug_mode,
-                    )
-                ),
+            self.weight2 = Parameter(
+                torch.empty(
+                    self.num_local_experts,
+                    *fc2_expert_weight_shape,
+                    dtype=config.params_dtype,
+                    device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                    pin_memory= not self.config.moe_offloading_experts_debug_mode,
+                    # device=torch.cuda.current_device(),
+                )
             )
-            self.weight2.append(getattr(self, f'weight2_expert_{i}'))
-            self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
-            self.weight2[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+            self.weight2.skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+            self.weight2.is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+
+            self.weight1_list = None
+            self.weight2_list = None
 
             if config.perform_initialization:
-                _initialize_affine_weight_cpu(
-                    self.weight1[i], 
-                    self.input_size,
-                    fc1_output_size,
-                    fc1_output_size_per_partition,
-                    partition_dim=1,
-                    init_method=config.init_method,
-                    params_dtype=config.params_dtype,
-                    rank=etp_rank,
-                    world_size=etp_size,
+                for i in range(self.num_local_experts):
+                    _initialize_affine_weight_cpu(
+                        self.weight1[i], 
+                        *fc1_expert_weight_shape,
+                        fc1_output_size_per_partition,
+                        partition_dim=1,
+                        init_method=config.init_method,
+                        params_dtype=config.params_dtype,
+                        rank=etp_rank,
+                        world_size=etp_size,
+                    )
+                    _initialize_affine_weight_cpu(
+                        self.weight2[i], 
+                        *fc2_expert_weight_shape,
+                        fc2_input_size_per_partition,
+                        partition_dim=0,
+                        init_method=config.output_layer_init_method,
+                        params_dtype=config.params_dtype,
+                        rank=etp_rank,
+                        world_size=etp_size,
+                    )
+
+            setattr(self.weight1, 'allreduce', not self.expert_parallel)
+            setattr(self.weight2, 'allreduce', not self.expert_parallel)
+        else:
+            self.weight1 = []
+            self.weight2 = []
+            for i in range(self.num_local_experts):
+                self.register_parameter(
+                    f'weight1_expert_{i}',
+                    Parameter(
+                        torch.empty(
+                            self.input_size,
+                            self.config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
+                            dtype=config.params_dtype,
+                            device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                            pin_memory= not self.config.moe_offloading_experts_debug_mode,
+                        )
+                    ),
                 )
-                _initialize_affine_weight_cpu(
-                    self.weight2[i], 
-                    fc2_input_size,
-                    self.input_size,
-                    fc2_input_size_per_partition,
-                    partition_dim=0,
-                    init_method=config.output_layer_init_method,
-                    params_dtype=config.params_dtype,
-                    rank=etp_rank,
-                    world_size=etp_size,
+                self.weight1.append(getattr(self, f'weight1_expert_{i}'))
+                self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+                self.weight1[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+
+                self.register_parameter(
+                    f'weight2_expert_{i}',
+                    Parameter(
+                        torch.empty(
+                            self.config.moe_ffn_hidden_size,
+                            self.input_size,
+                            dtype=config.params_dtype,
+                            device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                            pin_memory= not self.config.moe_offloading_experts_debug_mode,
+                        )
+                    ),
                 )
-            setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
-            setattr(self.weight2[i], 'allreduce', not self.expert_parallel)
+                self.weight2.append(getattr(self, f'weight2_expert_{i}'))
+                self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+                self.weight2[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+
+                if config.perform_initialization:
+                    _initialize_affine_weight_cpu(
+                        self.weight1[i], 
+                        self.input_size,
+                        fc1_output_size,
+                        fc1_output_size_per_partition,
+                        partition_dim=1,
+                        init_method=config.init_method,
+                        params_dtype=config.params_dtype,
+                        rank=etp_rank,
+                        world_size=etp_size,
+                    )
+                    _initialize_affine_weight_cpu(
+                        self.weight2[i], 
+                        fc2_input_size,
+                        self.input_size,
+                        fc2_input_size_per_partition,
+                        partition_dim=0,
+                        init_method=config.output_layer_init_method,
+                        params_dtype=config.params_dtype,
+                        rank=etp_rank,
+                        world_size=etp_size,
+                    )
+                setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
+                setattr(self.weight2[i], 'allreduce', not self.expert_parallel)
 
         # GPU buffer to prefetch CPU weights
         self.num_stages = self.config.moe_offloading_num_stages
@@ -1012,19 +1093,41 @@ class OffloadingExpertsMLP(MegatronModule):
         assert num_local_experts % self.num_chunks == 0, "num_local_experts should be divisible by num_steps."
         self.chunk_size = num_local_experts // self.num_chunks # one chunk contains num_local_experts // self.num_chunks experts
         self.config.moe_offloading_chunk_size = self.chunk_size
-        
-        self.experts1_gpu_buffers = [[torch.empty(
-            self.input_size,
-            self.config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
+
+        # allocate tensors for gpu buffers
+        buffer_dtype = config.params_dtype if not self.config.moe_use_inplace_fp8_param else torch.float8_e4m3fn
+        experts1_gpu_buffers_storage = torch.empty(
+            self.num_stages * self.chunk_size * fc1_expert_weight_shape[0] * fc1_expert_weight_shape[1],
             device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        ) for _ in range(self.chunk_size)] for _ in range(self.num_stages)]
-        self.experts2_gpu_buffers = [[torch.empty(
-            self.config.moe_ffn_hidden_size,
-            self.input_size,
+            dtype=buffer_dtype,
+        ).view(
+            self.num_stages, self.chunk_size, fc1_expert_weight_shape[0], fc1_expert_weight_shape[1]
+        )
+        experts2_gpu_buffers_storage = torch.empty(
+            self.num_stages * self.chunk_size * fc2_expert_weight_shape[0] * fc2_expert_weight_shape[1],
             device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        ) for _ in range(self.chunk_size)] for _ in range(self.num_stages)]
+            dtype=buffer_dtype,
+        ).view(
+            self.num_stages, self.chunk_size, fc2_expert_weight_shape[0], fc2_expert_weight_shape[1]
+        )
+
+        # organize as [num_stages, chunk_size, (in, out)]
+        self.experts1_gpu_buffers = [
+            [experts1_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
+            for s in range(self.num_stages)
+        ]
+        self.experts2_gpu_buffers = [
+            [experts2_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
+            for s in range(self.num_stages)
+        ]
+
+        # organize as [num_stages, (chunk_size, in, out)]
+        self.experts1_gpu_chunks = [
+            experts1_gpu_buffers_storage[s] for s in range(self.num_stages)
+        ]
+        self.experts2_gpu_chunks = [
+            experts2_gpu_buffers_storage[s] for s in range(self.num_stages)
+        ]
 
         # cuda stream manager for h2d transfer and computation
         self.stream_manager = StreamManager.get_instance()
@@ -1035,15 +1138,20 @@ class OffloadingExpertsMLP(MegatronModule):
         # store hooks after wgrad reduce
         self.wgrad_accumulation_and_reduce_hooks = []
 
+        # padding function
+        if self.config.moe_use_inplace_fp8_param:
+            self.quantization_padding = Fp8Padding(self.num_local_experts, 128)
+            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts, 128)
+
     def _apply(self, fn, recurse=True):
-      saved = {}
-      for name, p in list(self._parameters.items()):
-          if p is not None and getattr(p, 'is_cpu_offloaded', False):
-              saved[name] = self._parameters.pop(name)
-      out = super()._apply(fn, recurse=recurse)
-      for name, p in saved.items():
-          self._parameters[name] = p
-      return out
+        saved = {}
+        for name, p in list(self._parameters.items()):
+            if p is not None and getattr(p, 'is_cpu_offloaded', False):
+                saved[name] = self._parameters.pop(name)
+        out = super()._apply(fn, recurse=recurse)
+        for name, p in saved.items():
+            self._parameters[name] = p
+        return out
     
     def forward(
         self,
@@ -1063,6 +1171,47 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.expert_wgrad_scheduler,
                     self.config,
                 )
+                return output, None
+            
+            if self.config.moe_use_inplace_fp8_param:
+                # create weight list
+                # NOTE: we cannot create the unbind list in __init__ 
+                # because the weight tensor will be replaced by DDP
+                if self.weight1_list is None:
+                    self.weight1_list = list(torch.unbind(self.weight1, dim=0))
+                if self.weight2_list is None:
+                    self.weight2_list = list(torch.unbind(self.weight2, dim=0))
+                
+                tokens_per_expert_list = tokens_per_expert.tolist()
+                permuted_local_hidden_states, tokens_per_expert_padded = self.quantization_padding(
+                    permuted_local_hidden_states, tokens_per_expert_list
+                )
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs.unsqueeze(-1), tokens_per_expert_list
+                )
+                tokens_per_expert_padded = torch.tensor(tokens_per_expert_padded, dtype=torch.int32, device='cpu')
+                
+                output = offloading_fp8_grouped_swiglu_mlp(
+                    self.weight1,
+                    self.weight2,
+                    self.weight1_list,
+                    self.weight2_list,
+                    self.experts1_gpu_buffers,
+                    self.experts2_gpu_buffers,
+                    self.experts1_gpu_chunks,
+                    self.experts2_gpu_chunks,
+                    permuted_local_hidden_states,
+                    tokens_per_expert_padded,
+                    self.num_local_experts,
+                    permuted_probs,
+                    self.expert_wgrad_scheduler,
+                    self.stream_manager,
+                    self.config,
+                    self.wgrad_accumulation_and_reduce_hooks,
+                )
+
+                output = self.quantization_unpadding(output, tokens_per_expert_list)
+
                 return output, None
             
             output = offloading_grouped_swiglu_mlp(
@@ -1094,6 +1243,38 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.config,
                 )
                 return output, None
+
+            if self.config.moe_use_inplace_fp8_param:
+                # create weight list
+                # NOTE: we cannot create the unbind list in __init__ 
+                # because the weight tensor will be replaced by DDP
+                if self.weight1_list is None:
+                    self.weight1_list = list(torch.unbind(self.weight1, dim=0))
+                if self.weight2_list is None:
+                    self.weight2_list = list(torch.unbind(self.weight2, dim=0))
+                
+                tokens_per_expert_list = tokens_per_expert.tolist()
+                
+                output = offloading_fp8_grouped_swiglu_mlp(
+                    self.weight1,
+                    self.weight2,
+                    self.weight1_list,
+                    self.weight2_list,
+                    self.experts1_gpu_buffers,
+                    self.experts2_gpu_buffers,
+                    self.experts1_gpu_chunks,
+                    self.experts2_gpu_chunks,
+                    permuted_local_hidden_states,
+                    tokens_per_expert_padded,
+                    self.num_local_experts,
+                    permuted_probs,
+                    self.expert_wgrad_scheduler,
+                    self.stream_manager,
+                    self.config,
+                    self.wgrad_accumulation_and_reduce_hooks,
+                )
+
+                return output, None
         
             # NOTE: it should be safe to pass empty tensor to the custom function, 
             # but it will introduce meanless h2d transfer.
@@ -1121,7 +1302,7 @@ class OffloadingExpertsMLP(MegatronModule):
         self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
     
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        metadata = ensure_metadata_has_dp_cp_group(metadata)                                             
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)                   
         assert self.tp_group.size() == 1, "OffloadingExpertsMLP assumes ETP size == 1"
                                                                                                         

@@ -1463,6 +1463,7 @@ def validate_args(args, defaults={}):
 
     # MoE expert offloading check
     if args.moe_use_offloading_experts:
+        assert args.expert_model_parallel_size > 1, "MoE expert offloading only works with EP > 1."
         assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
         assert args.bf16, "MoE expert offloading currently requires using bfloat16 precision."
         assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."

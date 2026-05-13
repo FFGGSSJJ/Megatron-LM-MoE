@@ -741,6 +741,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_mock_router: bool = False
 
+    moe_use_inplace_fp8_param: bool = False
+    """Whether to use FP8 parameter for MoE layer. Specifically, MoE layer will use BF16 storage, 
+    but the weights will be quantized into FP8 for computation. Both transposed and non-transposed
+    weights will be saved."""
+
     moe_use_offloading_experts: bool = False
     """Whether to use offloading experts for MoE."""
 

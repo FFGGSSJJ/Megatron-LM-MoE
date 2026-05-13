@@ -1,0 +1,466 @@
+"""Triton kernels for FP8 quantization and dequantization with per-block and per-channel scaling."""
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple
+
+from deep_gemm.utils.math import align, pack_ue8m0_to_int
+
+# referred from DeepGEMM utils
+def per_block_cast_to_fp8_cpu(x: torch.Tensor, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+    assert m % gran_k == 0 and n % gran_k == 0, \
+        f"per_block_cast_to_fp8 requires m and n to be multiples of gran_k"
+    # x_padded = torch.zeros((align(m, gran_k), align(n, gran_k)), dtype=x.dtype, device=x.device)
+    # x_padded[:m, :n] = x
+    x_view = x.view(-1, gran_k, x.size(1) // gran_k, gran_k)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = x_amax / 448.0
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return x_scaled.view_as(x)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
+
+
+@triton.jit
+def _per_block_cast_to_fp8_kernel(
+    x_ptr,
+    x_fp8_ptr,
+    sf_ptr,
+    m,
+    n,
+    stride_m,
+    stride_fp8_m,
+    stride_sf_m,
+    gran_k: tl.constexpr,
+):
+    """Each program handles one gran_k x gran_k block; one scale factor per block."""
+    block_row = tl.program_id(0)
+    block_col = tl.program_id(1)
+
+    rows = block_row * gran_k + tl.arange(0, gran_k)
+    cols = block_col * gran_k + tl.arange(0, gran_k)
+
+    offsets = rows[:, None] * stride_m + cols[None, :]
+    mask = (rows[:, None] < m) & (cols[None, :] < n)
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    x_amax = tl.max(tl.abs(x))
+    # x_amax = tl.maximum(x_amax, 1e-4)
+
+    sf = x_amax / 448.0
+    sf = tl.where(sf == 0.0, 1.0, sf)
+    inv_sf = 1.0 / sf
+    x_scaled = x * inv_sf
+    # x_scaled = tl.clamp(x_scaled, -448.0, 448.0).to(tl.float8e4nv)
+
+    fp8_offsets = rows[:, None] * stride_fp8_m + cols[None, :]
+    tl.store(x_fp8_ptr + fp8_offsets, x_scaled.to(tl.float8e4nv), mask=mask)
+
+    tl.store(sf_ptr + block_row * stride_sf_m + block_col, sf)
+
+
+@torch._dynamo.allow_in_graph
+def per_block_cast_to_fp8_gpu(
+    x: torch.Tensor, 
+    gran_k: int = 128,
+    x_fp8: torch.Tensor = None,
+    sf: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton implementation of per_block_cast_to_fp8 (GPU only).
+
+    Each gran_k x gran_k block of the input gets a single fp32 scale factor.
+    Matches the reference CPU implementation `per_block_cast_to_fp8`.
+
+    Args:
+        x: 2D tensor on a CUDA device. Both dims must be multiples of gran_k.
+        gran_k: Block size.
+
+    Returns:
+        x_fp8: (m, n) tensor in torch.float8_e4m3fn.
+        sf: (m // gran_k, n // gran_k) fp32 tensor.
+    """
+    assert x.dim() == 2
+    assert x.is_cuda, "per_block_cast_to_fp8_triton requires a CUDA tensor"
+    m, n = x.shape
+    assert m % gran_k == 0 and n % gran_k == 0, \
+        f"per_block_cast_to_fp8_triton requires m and n to be multiples of gran_k"
+
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if x_fp8 is None:
+        x_fp8 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    if sf is None:
+        sf = torch.empty((m // gran_k, n // gran_k), dtype=torch.float32, device=x.device)
+
+    grid = (m // gran_k, n // gran_k)
+    _per_block_cast_to_fp8_kernel[grid](
+        x, x_fp8, sf,
+        m, n,
+        x.stride(0), x_fp8.stride(0), sf.stride(0),
+        gran_k=gran_k,
+    )
+    return x_fp8, sf
+
+
+@triton.jit
+def _ceil_to_ue8m0(sf):
+    """Ceil a float32 value to the nearest representable UE8M0 value (exponent-only)."""
+    bits = sf.to(tl.int32, bitcast=True)
+    bits = bits & 0x7FFFFFFF  # abs: clear sign bit
+    exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    exp = exp + tl.where(mantissa > 0, 1, 0)
+    exp = tl.clamp(exp, 1, 254)
+    return (exp << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _per_token_cast_to_fp8_kernel(
+    x_ptr,
+    x_fp8_ptr,
+    sf_ptr,
+    m,
+    n,
+    padded_n,
+    stride_m,
+    stride_fp8_m,
+    stride_sf_m,
+    BLOCK_M: tl.constexpr,
+    gran_k: tl.constexpr,
+    use_ue8m0: tl.constexpr,
+):
+    """Each program handles one group (gran_k columns) for BLOCK_M rows."""
+    group_idx = tl.program_id(0)
+    row_start = tl.program_id(1) * BLOCK_M
+
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = group_idx * gran_k + tl.arange(0, gran_k)
+
+    # Load input tile; padding elements (cols >= n) are filled with 0
+    offsets = rows[:, None] * stride_m + cols[None, :]
+    load_mask = (rows[:, None] < m) & (cols[None, :] < n)
+    x = tl.load(x_ptr + offsets, mask=load_mask, other=0.0).to(tl.float32)
+
+    # Per-row absolute max within the group
+    x_amax = tl.max(tl.abs(x), axis=1)
+    # x_amax = tl.maximum(x_amax, 1e-4)
+
+    # Scale factor
+    sf = x_amax / 448.0
+    if use_ue8m0:
+        sf = _ceil_to_ue8m0(sf)
+
+    # Scale and store FP8 output
+    sf = tl.where(sf == 0.0, 1.0, sf)
+    inv_sf = 1.0 / sf[:, None]
+    x_scaled = x * inv_sf
+    # x_scaled = tl.clamp(x_scaled, -448.0, 448.0).to(tl.float8e4nv)
+    fp8_offsets = rows[:, None] * stride_fp8_m + cols[None, :]
+    fp8_mask = (rows[:, None] < m) & (cols[None, :] < n)
+    tl.store(x_fp8_ptr + fp8_offsets, x_scaled.to(tl.float8e4nv), mask=fp8_mask)
+
+    # Store scale factors
+    tl.store(sf_ptr + rows * stride_sf_m + group_idx, sf, mask=(rows < m))
+
+@torch._dynamo.allow_in_graph
+def per_token_cast_to_fp8(
+    x: torch.Tensor,
+    use_ue8m0: bool,
+    gran_k: int = 128,
+    use_packed_ue8m0: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton implementation of per_token_cast_to_fp8.
+
+    Quantizes a 2D tensor to FP8 with per-group scale factors (one scale per
+    `gran_k` elements along the token dimension). Fuses padding, reduction,
+    scaling, and type conversion into a single kernel.
+
+    Args:
+        x: Input tensor of shape (m, n), any float dtype.
+        use_ue8m0: Encode scale factors as UE8M0 (ceil to nearest exponent).
+        gran_k: Group size for scale factor computation.
+        use_packed_ue8m0: Pack UE8M0 scale factors into int32.
+
+    Returns:
+        x_fp8: Quantized tensor of shape (m, n) in torch.float8_e4m3fn.
+        sf: Scale factors of shape (m, num_groups) in fp32, or packed int32.
+    """
+    assert x.dim() == 2, f"Expected 2D input, got shape {x.shape}"
+    m, n = x.shape
+    padded_n = align(n, gran_k)
+    num_groups = padded_n // gran_k
+
+    x_fp8 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    sf = torch.empty((m, num_groups), dtype=torch.float32, device=x.device)
+
+    BLOCK_M = 4
+    grid = (num_groups, triton.cdiv(m, BLOCK_M))
+
+    _per_token_cast_to_fp8_kernel[grid](
+        x, x_fp8, sf,
+        m, n, padded_n,
+        x.stride(0), x_fp8.stride(0), sf.stride(0),
+        BLOCK_M=BLOCK_M,
+        gran_k=gran_k,
+        use_ue8m0=use_ue8m0,
+    )
+
+    if use_packed_ue8m0:
+        sf = pack_ue8m0_to_int(sf)
+
+    return x_fp8, sf
+
+
+@triton.jit
+def _per_token_dequant_from_fp8_kernel(
+    x_fp8_ptr,
+    sf_ptr,
+    out_ptr,
+    m,
+    n,
+    stride_fp8_m,
+    stride_sf_m,
+    stride_out_m,
+    BLOCK_M: tl.constexpr,
+    gran_k: tl.constexpr,
+):
+    """Inverse of _per_token_cast_to_fp8_kernel.
+
+    Each program handles one group (gran_k columns) for BLOCK_M rows.
+    out[i, j] = x_fp8[i, j].to(fp32) * sf[i, j // gran_k]
+    """
+    group_idx = tl.program_id(0)
+    row_start = tl.program_id(1) * BLOCK_M
+
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = group_idx * gran_k + tl.arange(0, gran_k)
+
+    fp8_offsets = rows[:, None] * stride_fp8_m + cols[None, :]
+    mask = (rows[:, None] < m) & (cols[None, :] < n)
+    x_fp8 = tl.load(x_fp8_ptr + fp8_offsets, mask=mask, other=0.0).to(tl.float32)
+
+    sf = tl.load(sf_ptr + rows * stride_sf_m + group_idx, mask=(rows < m), other=0.0)
+
+    out = x_fp8 * sf[:, None]
+
+    out_offsets = rows[:, None] * stride_out_m + cols[None, :]
+    tl.store(out_ptr + out_offsets, out, mask=mask)
+
+@torch._dynamo.allow_in_graph
+def per_token_dequant_from_fp8(
+    x_fp8: torch.Tensor,
+    sf: torch.Tensor,
+    gran_k: int = 128,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Triton dequantization: inverse of ``per_token_cast_to_fp8``.
+
+    Args:
+        x_fp8: FP8 tensor of shape ``(m, n)`` in ``torch.float8_e4m3fn``.
+        sf: Scale factors of shape ``(m, num_groups)`` in fp32, where
+            ``num_groups == ceil(n / gran_k)``. Must NOT be packed (callers
+            using ``use_packed_ue8m0=True`` need to unpack first).
+        gran_k: Group size used at quantization time.
+        out_dtype: Output dtype (default bfloat16).
+
+    Returns:
+        Dequantized tensor of shape ``(m, n)`` in ``out_dtype``.
+    """
+    assert x_fp8.dim() == 2, f"Expected 2D input, got shape {x_fp8.shape}"
+    assert sf.dtype == torch.float32, f"sf must be fp32 (unpacked), got {sf.dtype}"
+    m, n = x_fp8.shape
+    padded_n = align(n, gran_k)
+    num_groups = padded_n // gran_k
+    assert sf.shape == (m, num_groups), \
+        f"Expected sf shape ({m}, {num_groups}), got {sf.shape}"
+
+    out = torch.empty((m, n), dtype=out_dtype, device=x_fp8.device)
+
+    BLOCK_M = 4
+    grid = (num_groups, triton.cdiv(m, BLOCK_M))
+
+    _per_token_dequant_from_fp8_kernel[grid](
+        x_fp8, sf, out,
+        m, n,
+        x_fp8.stride(0), sf.stride(0), out.stride(0),
+        BLOCK_M=BLOCK_M,
+        gran_k=gran_k,
+    )
+
+    return out
+
+
+@triton.jit
+def _per_channel_cast_to_fp8_kernel(
+    x_ptr,
+    x_fp8_ptr,
+    sf_ptr,
+    m,
+    n,
+    stride_m,
+    stride_fp8_outer,
+    stride_sf_outer,
+    num_row_groups,
+    BLOCK_N: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    gran_k: tl.constexpr,
+    use_ue8m0: tl.constexpr,
+    TRANSPOSE: tl.constexpr,
+):
+    row_group = tl.program_id(0)
+    col_start = tl.program_id(1) * BLOCK_N
+    cols = col_start + tl.arange(0, BLOCK_N)
+    col_mask = cols < n
+
+    # Phase 1: compute per-column abs-max across the group of gran_k rows
+    row_amax = tl.full((BLOCK_N,), 1e-4, dtype=tl.float32)
+    for r in range(0, gran_k, BLOCK_ROWS):
+        rows = row_group * gran_k + r + tl.arange(0, BLOCK_ROWS)
+        offsets = rows[:, None] * stride_m + cols[None, :]
+        mask = (rows[:, None] < m) & col_mask[None, :]
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        row_amax = tl.maximum(row_amax, tl.max(tl.abs(x), axis=0))
+
+    # Compute scale factor
+    sf = row_amax / 448.0
+    sf = tl.where(sf == 0.0, 1.0, sf)
+    if use_ue8m0:
+        sf = _ceil_to_ue8m0(sf)
+
+    # Phase 2: scale and store FP8 output
+    inv_sf = 1.0 / sf[None, :]
+    for r in range(0, gran_k, BLOCK_ROWS):
+        rows = row_group * gran_k + r + tl.arange(0, BLOCK_ROWS)
+        offsets = rows[:, None] * stride_m + cols[None, :]
+        mask = (rows[:, None] < m) & col_mask[None, :]
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        x_scaled = x * inv_sf
+        # x_scaled = tl.clamp(x_scaled, -448.0, 448.0).to(tl.float8e4nv)
+        if TRANSPOSE:
+            # out shape (n, m): out[col, row] = x_scaled[row, col]
+            fp8_offsets = cols[None, :] * stride_fp8_outer + rows[:, None]
+        else:
+            # out shape (m, n): out[row, col] = x_scaled[row, col]
+            fp8_offsets = rows[:, None] * stride_fp8_outer + cols[None, :]
+        tl.store(x_fp8_ptr + fp8_offsets, x_scaled.to(tl.float8e4nv), mask=mask)
+
+    # Store scale factors
+    if TRANSPOSE:
+        # sf shape (n, num_row_groups): sf_T[col, row_group] = sf[col]
+        tl.store(sf_ptr + cols * stride_sf_outer + row_group, sf, mask=col_mask)
+    else:
+        # sf shape (num_row_groups, n): sf[row_group, col] = sf[col]
+        tl.store(sf_ptr + row_group * stride_sf_outer + cols, sf, mask=col_mask)
+
+@torch._dynamo.allow_in_graph
+def per_channel_cast_to_fp8(
+    x: torch.Tensor,
+    use_ue8m0: bool,
+    gran_k: int = 128,
+    transpose: bool = False,
+    pack_kmajor: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton implementation of per_channel_cast_to_fp8.
+
+    Quantizes a 2D tensor to FP8.  Rows are partitioned into groups of
+    ``gran_k``; within each group every column gets its own scale factor,
+    shared across all rows in the group.
+
+    Args:
+        x: Input tensor of shape ``(m, n)`` where ``m % gran_k == 0``.
+        use_ue8m0: Encode scale factors as UE8M0.
+        gran_k: Number of rows per group.
+        transpose: If True, both the FP8 output and the scale factors are
+            written in transposed layout: x_fp8 shape ``(n, m)`` and sf shape
+            ``(n, m // gran_k)``. Otherwise output shape is ``(m, n)`` and sf
+            shape is ``(m // gran_k, n)``.
+
+    Returns:
+        x_fp8: Quantized tensor in ``torch.float8_e4m3fn``. Shape is
+            ``(n, m)`` if ``transpose`` else ``(m, n)``.
+        sf: Scale factors in fp32. Shape is ``(n, m // gran_k)`` if
+            ``transpose`` else ``(m // gran_k, n)``.
+    """
+    assert x.dim() == 2 and x.size(0) % gran_k == 0, \
+        f"Expected 2D input with m % {gran_k} == 0, got shape {x.shape}"
+    m, n = x.shape
+    num_row_groups = m // gran_k
+
+    if transpose:
+        x_fp8 = torch.empty((n, m), dtype=torch.float8_e4m3fn, device=x.device)
+        sf = torch.empty((n, num_row_groups), dtype=torch.float32, device=x.device)
+    else:
+        x_fp8 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+        sf = torch.empty((num_row_groups, n), dtype=torch.float32, device=x.device)
+
+    BLOCK_N = 64
+    BLOCK_ROWS = 16
+    grid = (num_row_groups, triton.cdiv(n, BLOCK_N))
+
+    _per_channel_cast_to_fp8_kernel[grid](
+        x, x_fp8, sf,
+        m, n,
+        x.stride(0), x_fp8.stride(0), sf.stride(0),
+        num_row_groups,
+        BLOCK_N=BLOCK_N,
+        BLOCK_ROWS=BLOCK_ROWS,
+        gran_k=gran_k,
+        use_ue8m0=use_ue8m0,
+        TRANSPOSE=transpose,
+    )
+
+    return x_fp8, sf
+
+
+@triton.jit
+def _pack_kmajor_kernel(
+    a_ptr, out_ptr,
+    prefixes_ptr, ks_ptr,
+    M,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    g = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    prefix = tl.load(prefixes_ptr + g)
+    K_g = tl.load(ks_ptr + g)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_m = offs_m < M
+    mask_k = offs_k < K_g
+
+    a_ptrs = a_ptr + (prefix + offs_k)[:, None] * M + offs_m[None, :]
+    tile = tl.load(a_ptrs, mask=mask_k[:, None] & mask_m[None, :])
+
+    out_base = out_ptr + prefix * M
+    out_ptrs = out_base + offs_m[:, None] * K_g + offs_k[None, :]
+    tl.store(out_ptrs, tl.trans(tile),
+             mask=mask_m[:, None] & mask_k[None, :])
+
+@torch._dynamo.allow_in_graph
+def pack_to_kmajor(
+    a: torch.Tensor, 
+    ks: list[int], 
+    ks_tensor: torch.Tensor,
+    prefixes: torch.Tensor
+):
+    K_total, M = a.shape                                                                                                               
+    assert a.is_contiguous(), f"pack_to_kmajor: a not contiguous, strides={a.stride()}, shape={a.shape}"                               
+    assert a.dim() == 2                                                                                                                
+    assert K_total == sum(ks), f"K_total={K_total} but sum(ks)={sum(ks)}"                                                              
+    assert ks_tensor.numel() == len(ks)                                                                                              
+    assert ks_tensor.dtype in (torch.int32, torch.int64)
+    out = torch.empty(K_total * M, dtype=a.dtype, device=a.device)
+    
+    BLOCK_M=64
+    BLOCK_K=64
+    num_warps=4
+    grid = (len(ks), triton.cdiv(M, BLOCK_M), triton.cdiv(max(ks), BLOCK_K))
+    _pack_kmajor_kernel[grid](a, out, prefixes, ks_tensor, M,
+                              BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+                              num_warps=num_warps)
+    a.data._typed_storage().resize_(0)
+    return out

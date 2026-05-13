@@ -29,8 +29,12 @@ class StreamManager:
     '''
     _instance = None
 
-    def __init__(self, num_h2d_streams):
-        self.num_compute_streams = 4
+    def __init__(
+        self, 
+        num_h2d_streams,
+        num_compute_streams=4,
+    ):
+        self.num_compute_streams = num_compute_streams
         self.num_h2d_streams = num_h2d_streams
         self.h2d_streams = [torch.cuda.Stream() for _ in range(num_h2d_streams)]
         # self.h2d_streams.append(torch.cuda.default_stream())
@@ -39,9 +43,13 @@ class StreamManager:
         self.compute_cuda_streams = [stream.cuda_stream for stream in self.compute_streams]
 
     @classmethod
-    def get_instance(cls, num_h2d_streams=2):
+    def get_instance(
+        cls, 
+        num_h2d_streams=2,
+        num_compute_streams=4,
+    ):
         if cls._instance is None:
-            cls._instance = StreamManager(num_h2d_streams)
+            cls._instance = StreamManager(num_h2d_streams, num_compute_streams)
         return cls._instance
 
     def get_h2d_stream(self, idx) -> torch.cuda.Stream:
@@ -56,6 +64,12 @@ class StreamManager:
             self.compute_streams[i].record_event(self.compute_stream_events[i])
         for i in range(self.num_compute_streams):
             default_stream.wait_event(self.compute_stream_events[i])
+    
+    def default_stream_wait_h2d_stream(self, idx):
+        default_stream = torch.cuda.default_stream()
+        h2d_stream = self.get_h2d_stream(idx)
+        h2d_stream.record_event(self.compute_stream_events[0])
+        default_stream.wait_event(self.compute_stream_events[0])
     
     def compute_streams_wait_default_stream(self):
         default_stream = torch.cuda.default_stream()
@@ -75,6 +89,12 @@ class StreamManager:
         h2d_stream.record_event(self.compute_stream_events[0])
         for i in range(self.num_compute_streams):
             self.compute_streams[i].wait_event(self.compute_stream_events[0])
+    
+    def h2d_stream_wait_default_stream(self, idx):
+        h2d_stream = self.get_h2d_stream(idx)
+        default_stream = torch.cuda.default_stream()
+        default_stream.record_event(self.compute_stream_events[0])
+        h2d_stream.wait_event(self.compute_stream_events[0])
 
 
 class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
