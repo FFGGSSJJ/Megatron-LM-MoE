@@ -3,11 +3,40 @@ try:
     import deep_gemm
 except ImportError:
     deep_gemm = None
+import matplotlib.pyplot as plt
 
 def diff_tensor_norm(t1, t2):
     t1f = t1.to(torch.float)
     t2f = t2.to(torch.float)
     return torch.norm(t1f - t2f).item() / torch.norm(t2f).item()
+
+def plot_tensor_hist(tensor: torch.Tensor, name, bins=100, title="Tensor Value Distribution"):
+    values = tensor.flatten().detach().cpu().float().numpy()
+    mean = values.mean()
+    var = values.var()
+    std = values.std()
+
+    plt.figure(figsize=(8, 4))
+    plt.hist(values, bins=bins, edgecolor="black", alpha=0.75)
+
+    # vertical lines for mean ± std
+    plt.axvline(mean, color="red", linestyle="--", label=f"Mean: {mean:.4e}")
+    plt.axvline(mean + std, color="orange", linestyle=":", label=f"+1 Std: {mean+std:.4e}")
+    plt.axvline(mean - std, color="orange", linestyle=":", label=f"−1 Std: {mean-std:.4e}")
+
+    # stats box in the corner
+    stats_text = f"Var: {var:.4e}\nStd: {std:.4e}\nMean: {mean:.4e}"
+    plt.text(0.97, 0.95, stats_text, transform=plt.gca().transAxes,
+             fontsize=9, verticalalignment="top", horizontalalignment="right",
+             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    plt.title(title)
+    plt.xlabel("Value")
+    plt.ylabel("Frequency")
+    plt.legend(loc="upper left")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"./{name}_histogram.png")
 
 def release(t: torch.Tensor):
     """Helper function to release tensors that are no longer needed to save memory.

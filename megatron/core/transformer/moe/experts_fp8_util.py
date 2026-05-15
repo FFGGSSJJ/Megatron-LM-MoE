@@ -5,7 +5,7 @@ import itertools
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler
-from megatron.core.transformer.moe.utils import (
+from megatron.core.transformer.moe.fp8_utils import (
     m_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_nt_contiguous,
     diff_tensor_norm,

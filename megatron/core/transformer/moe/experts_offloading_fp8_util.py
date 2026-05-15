@@ -12,9 +12,10 @@ except ImportError:
 
 from megatron.core.transformer.moe.experts_offloading_util import StreamManager
 from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler, MergedSwiGLU
-from megatron.core.transformer.moe.utils import (
+from megatron.core.transformer.moe.fp8_utils import (
     m_grouped_fp8_gemm_nt_contiguous, 
     k_grouped_fp8_gemm_nt_contiguous,
+    release,
 )
 from megatron.core.transformer.moe.fp8_jit import (
     per_block_cast_to_fp8_gpu,
@@ -691,6 +692,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             per_token_cast_to_fp8(permuted_local_hidden_states, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
         
         # split hidden states, outputs and token_per_experts into chunks for each expert chunks
+        # NOTE: this part of logic is CPU-bound and presents ovehead. 
         tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
         tokens_per_expert_chunks_psum = [torch.cumsum(t, dim=0).to(torch.int32).to(permuted_local_hidden_states.device) for t in tokens_per_expert_chunks]
         total_token_num_per_chunk = [chunk.sum().item() for chunk in tokens_per_expert_chunks]
@@ -730,6 +732,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         # context saving
         ctx.fp8_parameter_manager = fp8_parameter_manager
+        ctx.fp8_hidden_state_per_chunk = fp8_hidden_state_per_chunk
         ctx.wgrad_accumulation_and_reduce_hooks = wgrad_accumulation_and_reduce_hooks
         ctx.num_local_experts = num_local_experts
         ctx.tokens_per_expert = tokens_per_expert
@@ -747,12 +750,30 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx.gpu_w2_chunks = gpu_w2_chunks
         ctx.stream_manager = stream_manager
         ctx.config = config
-        ctx.save_for_backward(
-            fp8_permuted_local_hidden_states[0], 
-            fp8_permuted_local_hidden_states[1], 
-            fc1_output, 
-            permuted_probs
+
+        activation_recompute = (
+            config.recompute_granularity == 'selective'
+            and "moe_act" in config.recompute_modules
         )
+        ctx.activation_recompute = activation_recompute
+
+        if activation_recompute:
+            release(fc1_output)
+            ctx.save_for_backward(
+                fp8_permuted_local_hidden_states[0], 
+                fp8_permuted_local_hidden_states[1], 
+                None, None,
+                permuted_probs
+            )
+        else:
+            fp8_fc1_output = per_token_cast_to_fp8(fc1_output, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+            ctx.save_for_backward(
+                fp8_permuted_local_hidden_states[0], 
+                fp8_permuted_local_hidden_states[1], 
+                fp8_fc1_output[0], 
+                fp8_fc1_output[1], 
+                permuted_probs
+            )
 
         return y, None
 
@@ -779,12 +800,30 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert_chunks_psum: list[torch.Tensor] = ctx.tokens_per_expert_chunks_psum
         tokens_per_expert: torch.Tensor = ctx.tokens_per_expert
         fp8_parameter_manager: FP8ExpertsParameterManager = ctx.fp8_parameter_manager
+        fp8_hidden_state_per_chunk: tuple[list[torch.Tensor], list[torch.Tensor]] = ctx.fp8_hidden_state_per_chunk
         (
             fp8_permuted_local_hidden_states, 
             fp8_permuted_local_hidden_states_scales, 
-            fc1_output, 
+            fp8_fc1_output, fp8_fc1_output_scales,
             permuted_probs
         ) = ctx.saved_tensors
+
+        if ctx.activation_recompute:
+            # recompute the activation for backward
+            fc1_output = OffloadingExpertsFP8GroupedSwiMLP.call_forward_a(
+                cpu_w1_list,
+                gpu_w1_buffers,
+                gpu_w1_chunks,
+                (fp8_permuted_local_hidden_states, fp8_permuted_local_hidden_states_scales),
+                fp8_hidden_state_per_chunk,
+                total_token_num_per_chunk,
+                tokens_per_expert_chunks_psum,
+                stream_manager,
+                fp8_parameter_manager,
+                config,
+            )
+        else:
+            fc1_output = per_token_dequant_from_fp8(fp8_fc1_output, fp8_fc1_output_scales)
 
         grad_y = grad_outputs[0].contiguous()
 
