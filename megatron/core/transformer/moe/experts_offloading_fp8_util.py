@@ -20,15 +20,35 @@ from megatron.core.transformer.moe.fp8_utils import (
 from megatron.core.transformer.moe.fp8_jit import (
     per_block_cast_to_fp8_gpu,
     per_token_cast_to_fp8, 
-    per_channel_cast_to_fp8, 
+    per_channel_cast_to_fp8_pack_kmajor,
     per_token_dequant_from_fp8,
-    pack_to_kmajor,
 )
 from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
     swiglu_backward,
 )
 
+_dummy_wgrads = {}
+
+def get_dummy_wgrad(
+    shape: list, 
+    dtype: torch.dtype, 
+    device, 
+    zero=False
+) -> torch.Tensor:
+    """Returns a dummy tensor of given shape."""
+    global _dummy_wgrads
+    wgard_key = (*shape, dtype)
+    if wgard_key not in _dummy_wgrads:
+        _dummy_wgrads[wgard_key] = torch.empty(
+            shape,
+            dtype=dtype,
+            device=device,
+            requires_grad=False,
+        )
+    if zero:
+        _dummy_wgrads[wgard_key].fill_(0)
+    return _dummy_wgrads[wgard_key].detach()
 
 class FP8ExpertsParameterManager:
     _instance = None
@@ -535,7 +555,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         for i in range(len(w)):
             if fuse_gradient_accumulation:
                 w[i].grad_added_to_main_grad = True
-                w[i].grad = torch.empty_like(w[i])
+                w[i].grad = get_dummy_wgrad(w[i].shape, w[i].dtype, w[i].device)
 
     @classmethod
     def call_backward_grad_w2(
@@ -558,12 +578,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         with k_grouped_fp8_gemm: grad_y [m, h] @ s [m, H]
         """
         s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
-        fp8_s = per_channel_cast_to_fp8(s, use_ue8m0=False, gran_k=128, transpose=False)
+        fp8_s = per_channel_cast_to_fp8_pack_kmajor(
+            s, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum, 
+            use_ue8m0=False, gran_k=128, free_input=True,
+        )
 
+        assert cpu_w2.main_grad is not None
         wgrad_output = cpu_w2.main_grad
-
-        grad_y = (pack_to_kmajor(grad_y[0], tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum), grad_y[1].T)
-        fp8_s = (pack_to_kmajor(fp8_s[0], tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum), fp8_s[1].T)
         
         stream_manager.compute_streams_wait_default_stream()
         k_grouped_fp8_gemm_nt_contiguous(
@@ -598,10 +619,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         dw1 [2*H, h] = grad_a.T [2*H, m] @ x.T [h, m]
         with k_grouped_fp8_gemm: grad_a [m, 2*H] @ x [m, h]
         """
+        assert cpu_w1.main_grad is not None
         wgrad_output = cpu_w1.main_grad
-        
-        grad_a = (pack_to_kmajor(grad_a[0], tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum), grad_a[1].T)
-        x = (pack_to_kmajor(x[0], tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum), x[1].T)
         
         stream_manager.compute_streams_wait_default_stream()
         k_grouped_fp8_gemm_nt_contiguous(
@@ -693,9 +712,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         
         # split hidden states, outputs and token_per_experts into chunks for each expert chunks
         # NOTE: this part of logic is CPU-bound and presents ovehead. 
-        tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
-        tokens_per_expert_chunks_psum = [torch.cumsum(t, dim=0).to(torch.int32).to(permuted_local_hidden_states.device) for t in tokens_per_expert_chunks]
-        total_token_num_per_chunk = [chunk.sum().item() for chunk in tokens_per_expert_chunks]
+        # tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
+        # tokens_per_expert_chunks_psum = [torch.cumsum(t, dim=0).to(torch.int32).to(permuted_local_hidden_states.device) for t in tokens_per_expert_chunks]
+        # total_token_num_per_chunk = [chunk.sum().item() for chunk in tokens_per_expert_chunks]
+        tokens_per_expert_chunks_psum, total_token_num_per_chunk = \
+            grouped_gemm.grouped_gemm.backend.tokens_per_expert_chunk_sum(tokens_per_expert, config.moe_offloading_chunk_size, permuted_local_hidden_states.device)
+        
         fp8_hidden_state_per_chunk = (
             list(torch.split(fp8_permuted_local_hidden_states[0], total_token_num_per_chunk)),
             list(torch.split(fp8_permuted_local_hidden_states[1], total_token_num_per_chunk)),
@@ -736,7 +758,6 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx.wgrad_accumulation_and_reduce_hooks = wgrad_accumulation_and_reduce_hooks
         ctx.num_local_experts = num_local_experts
         ctx.tokens_per_expert = tokens_per_expert
-        ctx.tokens_per_expert_chunks = tokens_per_expert_chunks
         ctx.tokens_per_expert_chunks_psum = tokens_per_expert_chunks_psum
         ctx.total_token_num_per_chunk = total_token_num_per_chunk
         ctx.expert_wgrad_scheduler = expert_wgrad_scheduler
@@ -796,7 +817,6 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         stream_manager: StreamManager = ctx.stream_manager
         expert_wgrad_scheduler: ExpertsWgradScheduler = ctx.expert_wgrad_scheduler
         total_token_num_per_chunk: list[int] = ctx.total_token_num_per_chunk
-        tokens_per_expert_chunks: tuple[torch.Tensor] = ctx.tokens_per_expert_chunks
         tokens_per_expert_chunks_psum: list[torch.Tensor] = ctx.tokens_per_expert_chunks_psum
         tokens_per_expert: torch.Tensor = ctx.tokens_per_expert
         fp8_parameter_manager: FP8ExpertsParameterManager = ctx.fp8_parameter_manager
@@ -838,11 +858,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # dequantize the input from FP8 to BF16
         bf16_x = per_token_dequant_from_fp8(fp8_permuted_local_hidden_states, fp8_permuted_local_hidden_states_scales)
 
-        # quantize grad_y to FP8
-        fp8_grad_y = per_token_cast_to_fp8(grad_y, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
-        fp8_grad_y_t = per_channel_cast_to_fp8(grad_y, use_ue8m0=False, gran_k=128, transpose=False)
-
         # backward computation
+        fp8_grad_y = per_token_cast_to_fp8(grad_y, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
         grad_a, grad_probs = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_a(
             fp8_grad_y,
             fc1_output,
@@ -857,11 +874,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             config,
         )
 
-        # quantize grad_a to FP8
-        fp8_grad_a = per_token_cast_to_fp8(grad_a, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
-        fp8_grad_a_t = per_channel_cast_to_fp8(grad_a, use_ue8m0=False, gran_k=128, transpose=False)
-
         # backward grad_x computation
+        fp8_grad_a = per_token_cast_to_fp8(grad_a, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
         grad_x = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_x(
             fp8_grad_a,
             cpu_w1_list,
@@ -875,6 +889,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # backward grad_w2 computation
+        fp8_grad_y_t = per_channel_cast_to_fp8_pack_kmajor(
+            grad_y, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
+            use_ue8m0=False, gran_k=128, free_input=True,
+        )
         OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w2(
             fp8_grad_y_t,
             fc1_output,
@@ -891,7 +909,14 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # backward grad_w1 computation
-        fp8_x_t = per_channel_cast_to_fp8(bf16_x, use_ue8m0=False, gran_k=128, transpose=False)
+        fp8_grad_a_t = per_channel_cast_to_fp8_pack_kmajor(
+            grad_a, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
+            use_ue8m0=False, gran_k=128, free_input=True,
+        )
+        fp8_x_t = per_channel_cast_to_fp8_pack_kmajor(
+            bf16_x, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
+            use_ue8m0=False, gran_k=128, free_input=True,
+        )
         OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w1(
             fp8_grad_a_t,
             fp8_x_t,

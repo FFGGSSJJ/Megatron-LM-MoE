@@ -462,5 +462,171 @@ def pack_to_kmajor(
     _pack_kmajor_kernel[grid](a, out, prefixes, ks_tensor, M,
                               BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
                               num_warps=num_warps)
-    a.data._typed_storage().resize_(0)
+    a.data.untyped_storage().resize_(0)
     return out
+
+
+@triton.jit
+def _pack_kmajor_per_channel_fp8_kernel(
+    x_ptr,            # bf16/fp16/fp32 input, shape (M_total, N), contiguous
+    out_ptr,          # fp8 flat output buffer, size M_total * N
+    sf_ptr,           # fp32 scale factors, shape (M_total // gran_k, N), contiguous
+    prefixes_ptr,     # int (num_experts,): cumulative row offsets
+    ks_ptr,           # int (num_experts,): rows per expert
+    N,
+    stride_xm,
+    BLOCK_N: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    gran_k: tl.constexpr,
+    use_ue8m0: tl.constexpr,
+):
+    """Fused per_channel_cast_to_fp8 + pack_to_kmajor.
+
+    Per expert g (rows [prefix[g] : prefix[g]+K_g)), within each gran_k-row group:
+      - phase 1: per-column abs-max over gran_k rows → scale factor
+      - phase 2: scale, cast to fp8, store transposed into expert's packed slab
+                 (layout (N, K_g) at byte offset prefix[g]*N elements).
+
+    Caller-side preconditions:
+      - K_g % gran_k == 0 for every expert.
+      - x is contiguous, M_total % gran_k == 0.
+    """
+    g = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rg = tl.program_id(2)  # row-group index within the expert
+
+    K_g = tl.load(ks_ptr + g)
+    # Skip programs past this expert's row-group count.
+    if rg * gran_k >= K_g:
+        return
+
+    prefix = tl.load(prefixes_ptr + g)
+
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < N
+
+    base_row = prefix + rg * gran_k
+
+    # Phase 1: per-column abs-max across the gran_k rows of this group.
+    row_amax = tl.full((BLOCK_N,), 1e-4, dtype=tl.float32)
+    for r in range(0, gran_k, BLOCK_ROWS):
+        rows = base_row + r + tl.arange(0, BLOCK_ROWS)
+        offs = rows[:, None] * stride_xm + cols[None, :]
+        x = tl.load(x_ptr + offs, mask=col_mask[None, :], other=0.0).to(tl.float32)
+        row_amax = tl.maximum(row_amax, tl.max(tl.abs(x), axis=0))
+
+    sf = row_amax / 448.0
+    sf = tl.where(sf == 0.0, 1.0, sf)
+    if use_ue8m0:
+        sf = _ceil_to_ue8m0(sf)
+    inv_sf = 1.0 / sf
+
+    # Phase 2: rescale, cast to fp8, store as transposed tile into the
+    # expert's packed (N, K_g) slab.
+    out_base = out_ptr + prefix * N
+    for r in range(0, gran_k, BLOCK_ROWS):
+        rows = base_row + r + tl.arange(0, BLOCK_ROWS)
+        rows_local = rg * gran_k + r + tl.arange(0, BLOCK_ROWS)
+        offs = rows[:, None] * stride_xm + cols[None, :]
+        x = tl.load(x_ptr + offs, mask=col_mask[None, :], other=0.0).to(tl.float32)
+        x_scaled = x * inv_sf[None, :]
+        x_fp8 = x_scaled.to(tl.float8e4nv)                  # (BLOCK_ROWS, BLOCK_N)
+        x_fp8_t = tl.trans(x_fp8)                           # (BLOCK_N, BLOCK_ROWS)
+        out_offs = cols[:, None] * K_g + rows_local[None, :]
+        tl.store(out_base + out_offs, x_fp8_t,
+                 mask=col_mask[:, None])
+
+    # Scale factors: write in (M_total // gran_k, N) layout; caller returns .T view.
+    global_rg = base_row // gran_k
+    tl.store(sf_ptr + global_rg * N + cols, sf, mask=col_mask)
+
+
+@torch._dynamo.allow_in_graph
+def per_channel_cast_to_fp8_pack_kmajor(
+    x: torch.Tensor,
+    ks: list[int],
+    ks_tensor: torch.Tensor,
+    prefixes: torch.Tensor,
+    use_ue8m0: bool = False,
+    gran_k: int = 128,
+    free_input: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused ``per_channel_cast_to_fp8(transpose=False)`` + ``pack_to_kmajor``.
+
+    Equivalent to::
+
+        fp8, sf = per_channel_cast_to_fp8(x, use_ue8m0, gran_k, transpose=False)
+        fp8_packed = pack_to_kmajor(fp8, ks, ks_tensor, prefixes)
+        return fp8_packed, sf.T
+
+    but eliminates the intermediate ``(M_total, N)`` fp8 staging buffer and the
+    second HBM round-trip.
+
+    Args:
+        x: Input tensor of shape ``(M_total, N)``. Must be contiguous.
+            ``M_total == sum(ks)`` and ``M_total % gran_k == 0``.
+        ks: Per-expert row counts. Each ``ks[i]`` MUST be a multiple of
+            ``gran_k`` so that scale row-groups never straddle expert
+            boundaries.
+        ks_tensor: ``ks`` as an int32/int64 CUDA tensor.
+        prefixes: int32/int64 CUDA tensor of cumulative row offsets
+            (``[0, ks[0], ks[0]+ks[1], ...]``).
+        use_ue8m0: Encode scale factors as UE8M0.
+        gran_k: Number of rows per scale-factor group.
+        free_input: If True, resize ``x``'s storage to 0 after launch (matches
+            the eager-free behavior of the legacy ``pack_to_kmajor``).
+
+    Returns:
+        out: ``(M_total * N,)`` flat fp8 buffer, per-expert k-major packed.
+        sf: ``(N, M_total // gran_k)`` fp32 view (transposed).
+    """
+    assert x.dim() == 2 and x.is_cuda, f"expected 2D CUDA tensor, got {x.shape}"
+    assert x.is_contiguous(), f"x must be contiguous, strides={x.stride()}"
+    M_total, N = x.shape
+    assert M_total % gran_k == 0, f"M_total={M_total} not a multiple of gran_k={gran_k}"
+    assert ks_tensor.numel() == len(ks)
+    assert ks_tensor.dtype in (torch.int32, torch.int64)
+    assert prefixes.dtype in (torch.int32, torch.int64)
+    assert sum(ks) == M_total, f"sum(ks)={sum(ks)} != M_total={M_total}"
+    for i, k in enumerate(ks):
+        assert k % gran_k == 0, (
+            f"ks[{i}]={k} must be a multiple of gran_k={gran_k} "
+            f"(scale groups cannot straddle expert boundaries)"
+        )
+
+    num_experts = len(ks)
+    num_row_groups_total = M_total // gran_k
+    max_ks = max(ks) if num_experts > 0 else 0
+    max_row_groups = max_ks // gran_k
+
+    out = torch.empty(M_total * N, dtype=torch.float8_e4m3fn, device=x.device)
+    sf = torch.empty((num_row_groups_total, N), dtype=torch.float32, device=x.device)
+
+    if max_row_groups == 0:
+        return out, sf.T
+
+    # NOTE on tuning: the transposed fp8 store writes BLOCK_ROWS contiguous
+    # bytes per row of the output tile (stride K_g separates rows). Small
+    # BLOCK_ROWS leaves stores well below a memory transaction and tanks
+    # throughput. Empirically BLOCK_ROWS=64 matches pack_to_kmajor's tile
+    # size and saturates HBM. Phase-1 amax is unaffected by BLOCK_ROWS.
+    BLOCK_N = 64
+    BLOCK_ROWS = 64
+    num_warps = 4
+    grid = (num_experts, triton.cdiv(N, BLOCK_N), max_row_groups)
+    _pack_kmajor_per_channel_fp8_kernel[grid](
+        x, out, sf,
+        prefixes, ks_tensor,
+        N,
+        x.stride(0),
+        BLOCK_N=BLOCK_N,
+        BLOCK_ROWS=BLOCK_ROWS,
+        gran_k=gran_k,
+        use_ue8m0=use_ue8m0,
+        num_warps=num_warps,
+    )
+
+    if free_input:
+        x.data.untyped_storage().resize_(0)
+
+    return out, sf.T
