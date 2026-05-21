@@ -19,9 +19,11 @@ from megatron.core.transformer.moe.fp8_utils import (
 )
 from megatron.core.transformer.moe.fp8_jit import (
     per_block_cast_to_fp8_gpu,
-    per_token_cast_to_fp8, 
+    per_token_cast_to_fp8,
+    per_token_cast_to_fp8_chunked_fused,
     per_channel_cast_to_fp8_pack_kmajor,
     per_token_dequant_from_fp8,
+    per_token_dequant_from_fp8_chunked,
 )
 from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
@@ -226,7 +228,10 @@ class FP8ExpertsParameterManager:
         for uid in self._uid_to_is_first_microbatch:
             self._uid_to_is_first_microbatch[uid] = True
     
-    def _quantize_weight(self, wid: int):
+    def _quantize_weight(
+        self, 
+        wid: int,
+    ):
         bf16_param = self._wid_to_bf16_weight_map[wid]
         bf16_param_slices = self._wid_to_sliced_bf16_weight_map[wid]
 
@@ -244,7 +249,7 @@ class FP8ExpertsParameterManager:
         param_numel = bf16_param.numel()
 
         # H2D
-        device_buffer = self.expert_quantization_buffer[param_numel][0].view(bf16_param.shape)
+        device_buffer = self.expert_quantization_buffer[param_numel][0].view(bf16_param.shape).to(torch.cuda.current_device())
         device_buffer.copy_(
             bf16_param.data,
             non_blocking=False,
@@ -376,11 +381,15 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # quantize the swiglu output to FP8
-        fp8_s = per_token_cast_to_fp8(s, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
-        fp8_s_per_chunk = (
-            list(torch.split(fp8_s[0], total_token_num_per_chunk)),
-            list(torch.split(fp8_s[1], total_token_num_per_chunk)),
+        # fp8_s = per_token_cast_to_fp8(s, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+        # fp8_s_per_chunk = (
+        #     list(torch.split(fp8_s[0], total_token_num_per_chunk)),
+        #     list(torch.split(fp8_s[1], total_token_num_per_chunk)),
+        # )
+        fp8_s, fp8_s_chunks, fp8_s_scales_chunks = per_token_cast_to_fp8_chunked_fused(
+            s, total_token_num_per_chunk, gran_k=128,
         )
+        fp8_s_per_chunk = (fp8_s_chunks, fp8_s_scales_chunks)
 
         # fc2 chunk-level interleaving computation
         fc2_output = torch.empty_like(permuted_local_hidden_states[0], dtype=torch.bfloat16)
@@ -419,7 +428,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
     @classmethod
     def call_backward_grad_a(
         cls,
-        grad_y: tuple[torch.Tensor, torch.Tensor],
+        grad_y: tuple,  # (fp8_full, fp8_chunks_list, sf_chunks_list)
         a: torch.Tensor,
         cpu_w2: list[torch.Tensor],
         gpu_w2_buffers: list[list[torch.Tensor]],
@@ -436,8 +445,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         da [m, 2*H] = backward_swiglu(da, a, permuted_probs)
         """
-        fp8_grad_y_per_chunk = list(torch.split(grad_y[0], total_token_num_per_chunk))
-        fp8_grad_y_scales_per_chunk = list(torch.split(grad_y[1], total_token_num_per_chunk))
+        fp8_grad_y_per_chunk = grad_y[1]
+        fp8_grad_y_scales_per_chunk = grad_y[2]
         grad_s = torch.empty(
             grad_y[0].shape[0],
             config.moe_ffn_hidden_size,
@@ -485,7 +494,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
     @classmethod
     def call_backward_grad_x(
         cls,
-        grad_a: tuple[torch.Tensor, torch.Tensor],
+        grad_a: tuple,  # (fp8_full, fp8_chunks_list, sf_chunks_list)
         cpu_w1: list[torch.Tensor],
         gpu_w1_buffers: list[list[torch.Tensor]],
         gpu_w1_chunks: list[torch.Tensor],
@@ -498,8 +507,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         """
         dx [m, h] = a [m, 2*H] @ w1.T [h, 2*H]
         """
-        fp8_grad_a_per_chunk = list(torch.split(grad_a[0], total_token_num_per_chunk))
-        fp8_grad_a_scales_per_chunk = list(torch.split(grad_a[1], total_token_num_per_chunk))
+        fp8_grad_a_per_chunk = grad_a[1]
+        fp8_grad_a_scales_per_chunk = grad_a[2]
         grad_x = torch.empty(
             grad_a[0].shape[0],
             config.hidden_size,
@@ -570,6 +579,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         stream_manager: StreamManager,
         num_local_experts: int,
         config: TransformerConfig,
+        wgrad_scheduler: ExpertsWgradScheduler = None,
         delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
     ):
@@ -585,6 +595,16 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         assert cpu_w2.main_grad is not None
         wgrad_output = cpu_w2.main_grad
+
+        # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
+        # register the wgrad computation to be executed later.
+        if delay_wgrad_compute and wgrad_scheduler is not None:
+            wgrad_scheduler.register(
+                k_grouped_fp8_gemm_nt_contiguous,
+                tokens_per_expert_list, tokens_per_expert_cuda, grad_y, fp8_s, num_local_experts, torch.cuda.current_stream(), wgrad_output
+            )
+            cls._wgrad_post_process([cpu_w2], wgrad_output, fuse_gradient_accumulation)
+            return
         
         stream_manager.compute_streams_wait_default_stream()
         k_grouped_fp8_gemm_nt_contiguous(
@@ -621,6 +641,16 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         """
         assert cpu_w1.main_grad is not None
         wgrad_output = cpu_w1.main_grad
+
+        # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
+        # register the wgrad computation to be executed later.
+        if delay_wgrad_compute and wgrad_scheduler is not None:
+            wgrad_scheduler.register(
+                k_grouped_fp8_gemm_nt_contiguous,
+                tokens_per_expert_list, tokens_per_expert_cuda, grad_a, x, num_local_experts, torch.cuda.current_stream(), wgrad_output
+            )
+            cls._wgrad_post_process([cpu_w1], wgrad_output, fuse_gradient_accumulation)
+            return
         
         stream_manager.compute_streams_wait_default_stream()
         k_grouped_fp8_gemm_nt_contiguous(
@@ -658,13 +688,14 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_cpu_weights_slice = fp8_cpu_weights[experts_idx_start:experts_idx_end]
             buf = gpu_buffers[gpu_buffer_idx]
 
-            if transposed:
-                buf = [b.view(b.shape[1], b.shape[0]) for b in buf]
+            # NOTE: the view logic for transposed buffer might be unnecessary
+            # if transposed:
+            #     buf = [b.view(b.shape[1], b.shape[0]) for b in buf]
 
             assert len(fp8_cpu_weights_slice) == len(buf), \
                 f"Number of weights in CPU slice {len(fp8_cpu_weights_slice)} does not match number of GPU buffers {len(buf)}"
             # NOTE: batched H2D copy is used to reduce cpu overhead
-            if fp8_cpu_weights_slice[0].is_pinned():
+            if not config.moe_offloading_experts_debug_mode:
                 grouped_gemm.grouped_gemm.backend.batched_h2d_async(
                     fp8_cpu_weights_slice,
                     buf,
@@ -705,11 +736,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         assert cpu_w1.shape[0] == num_local_experts, f"Expected cpu_w1 to have {num_local_experts} experts, but got {cpu_w1.shape[0]}"
         assert cpu_w2.shape[0] == num_local_experts, f"Expected cpu_w2 to have {num_local_experts} experts, but got {cpu_w2.shape[0]}"
-
-        # quantize the hidden states to FP8
-        fp8_permuted_local_hidden_states = \
-            per_token_cast_to_fp8(permuted_local_hidden_states, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
-        
+    
         # split hidden states, outputs and token_per_experts into chunks for each expert chunks
         # NOTE: this part of logic is CPU-bound and presents ovehead. 
         # tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
@@ -717,11 +744,20 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # total_token_num_per_chunk = [chunk.sum().item() for chunk in tokens_per_expert_chunks]
         tokens_per_expert_chunks_psum, total_token_num_per_chunk = \
             grouped_gemm.grouped_gemm.backend.tokens_per_expert_chunk_sum(tokens_per_expert, config.moe_offloading_chunk_size, permuted_local_hidden_states.device)
-        
-        fp8_hidden_state_per_chunk = (
-            list(torch.split(fp8_permuted_local_hidden_states[0], total_token_num_per_chunk)),
-            list(torch.split(fp8_permuted_local_hidden_states[1], total_token_num_per_chunk)),
+
+        # per-chunk FP8 quantize: produces sf buffers in MN-major
+        # TMA-aligned layout so DeepGEMM's transform_sf_into_required_layout
+        # early-returns without launching transpose kernel for sf
+        fp8_x_full, fp8_x_chunks, fp8_x_sf_chunks = per_token_cast_to_fp8_chunked_fused(
+            permuted_local_hidden_states, total_token_num_per_chunk, gran_k=128,
         )
+
+        # build a full sf tensor view for downstream sites that expect a single
+        # (M, num_groups) tensor (e.g. saved_for_backward, dequant). The SF
+        # storage is non-contiguous across chunks, so this concatenation copies;
+        # we therefore only materialize it lazily when needed.
+        fp8_permuted_local_hidden_states = (fp8_x_full, fp8_x_sf_chunks)
+        fp8_hidden_state_per_chunk = (fp8_x_chunks, fp8_x_sf_chunks)
 
         # forward for the first linear layer
         fc1_output = OffloadingExpertsFP8GroupedSwiMLP.call_forward_a(
@@ -778,21 +814,23 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
         ctx.activation_recompute = activation_recompute
 
+        # NOTE: fp8 sf chunks live on ctx (list of tensors); save_for_backward
+        # only stores tensors. The full sf can be reconstructed by concatenation
+        # if needed, but the chunks are already in the layout we want.
+        ctx.fp8_permuted_local_hidden_states_sf_chunks = fp8_x_sf_chunks
         if activation_recompute:
             release(fc1_output)
             ctx.save_for_backward(
-                fp8_permuted_local_hidden_states[0], 
-                fp8_permuted_local_hidden_states[1], 
+                fp8_permuted_local_hidden_states[0],
                 None, None,
                 permuted_probs
             )
         else:
             fp8_fc1_output = per_token_cast_to_fp8(fc1_output, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
             ctx.save_for_backward(
-                fp8_permuted_local_hidden_states[0], 
-                fp8_permuted_local_hidden_states[1], 
-                fp8_fc1_output[0], 
-                fp8_fc1_output[1], 
+                fp8_permuted_local_hidden_states[0],
+                fp8_fc1_output[0],
+                fp8_fc1_output[1],
                 permuted_probs
             )
 
@@ -821,9 +859,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert: torch.Tensor = ctx.tokens_per_expert
         fp8_parameter_manager: FP8ExpertsParameterManager = ctx.fp8_parameter_manager
         fp8_hidden_state_per_chunk: tuple[list[torch.Tensor], list[torch.Tensor]] = ctx.fp8_hidden_state_per_chunk
+        fp8_permuted_local_hidden_states_sf_chunks: list = ctx.fp8_permuted_local_hidden_states_sf_chunks
         (
-            fp8_permuted_local_hidden_states, 
-            fp8_permuted_local_hidden_states_scales, 
+            fp8_permuted_local_hidden_states,
             fp8_fc1_output, fp8_fc1_output_scales,
             permuted_probs
         ) = ctx.saved_tensors
@@ -834,7 +872,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 cpu_w1_list,
                 gpu_w1_buffers,
                 gpu_w1_chunks,
-                (fp8_permuted_local_hidden_states, fp8_permuted_local_hidden_states_scales),
+                (fp8_permuted_local_hidden_states, fp8_permuted_local_hidden_states_sf_chunks),
                 fp8_hidden_state_per_chunk,
                 total_token_num_per_chunk,
                 tokens_per_expert_chunks_psum,
@@ -849,19 +887,26 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         # prepare tokens_per_expert for packing the grad_y and grad_a
         tokens_per_expert_list = tokens_per_expert.tolist()
-        tokens_per_expert_cuda = tokens_per_expert.to(torch.int32).to(grad_y.device)
+        tokens_per_expert_cuda = tokens_per_expert.to(torch.int32).to(grad_y.device, non_blocking=True)
         tokens_per_expert_cumsum = torch.tensor(
             [0, *itertools.accumulate(tokens_per_expert_list[:-1])],
-            device=grad_y.device, dtype=torch.int32
+            dtype=torch.int32
+        ).to(grad_y.device, non_blocking=True)
+
+        # dequantize the input from FP8 to BF16 (chunked SF layout)
+        bf16_x = per_token_dequant_from_fp8_chunked(
+            fp8_permuted_local_hidden_states,
+            fp8_permuted_local_hidden_states_sf_chunks,
+            total_token_num_per_chunk,
+            gran_k=128,
         )
 
-        # dequantize the input from FP8 to BF16
-        bf16_x = per_token_dequant_from_fp8(fp8_permuted_local_hidden_states, fp8_permuted_local_hidden_states_scales)
-
-        # backward computation
-        fp8_grad_y = per_token_cast_to_fp8(grad_y, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+        # backward computation (per-chunk quantize -> avoids transpose in DeepGEMM)
+        fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks = per_token_cast_to_fp8_chunked_fused(
+            grad_y, total_token_num_per_chunk, gran_k=128,
+        )
         grad_a, grad_probs = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_a(
-            fp8_grad_y,
+            (fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks),
             fc1_output,
             cpu_w2_list,
             gpu_w2_buffers,
@@ -875,9 +920,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # backward grad_x computation
-        fp8_grad_a = per_token_cast_to_fp8(grad_a, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+        fp8_grad_a_full, fp8_grad_a_chunks, fp8_grad_a_sf_chunks = per_token_cast_to_fp8_chunked_fused(
+            grad_a, total_token_num_per_chunk, gran_k=128,
+        )
         grad_x = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_x(
-            fp8_grad_a,
+            (fp8_grad_a_full, fp8_grad_a_chunks, fp8_grad_a_sf_chunks),
             cpu_w1_list,
             gpu_w1_buffers,
             gpu_w1_chunks,
@@ -904,6 +951,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             stream_manager,
             ctx.num_local_experts,
             config,
+            expert_wgrad_scheduler,
             config.delay_wgrad_compute,
             config.gradient_accumulation_fusion,
         )
@@ -940,8 +988,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # this is needed as the hook may fail to be triggered if 
         # the parameter is on CPU, and hence cause hanging when
         # overlap_grad_reduce is enabled
-        for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
-            hook_fn()
+        if not config.delay_wgrad_compute:
+            for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
+                hook_fn()
 
         return grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
 

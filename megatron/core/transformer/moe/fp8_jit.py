@@ -125,6 +125,7 @@ def _per_token_cast_to_fp8_kernel(
     stride_m,
     stride_fp8_m,
     stride_sf_m,
+    stride_sf_k,
     BLOCK_M: tl.constexpr,
     gran_k: tl.constexpr,
     use_ue8m0: tl.constexpr,
@@ -160,7 +161,7 @@ def _per_token_cast_to_fp8_kernel(
     tl.store(x_fp8_ptr + fp8_offsets, x_scaled.to(tl.float8e4nv), mask=fp8_mask)
 
     # Store scale factors
-    tl.store(sf_ptr + rows * stride_sf_m + group_idx, sf, mask=(rows < m))
+    tl.store(sf_ptr + rows * stride_sf_m + group_idx * stride_sf_k, sf, mask=(rows < m))
 
 @torch._dynamo.allow_in_graph
 def per_token_cast_to_fp8(
@@ -199,7 +200,8 @@ def per_token_cast_to_fp8(
     _per_token_cast_to_fp8_kernel[grid](
         x, x_fp8, sf,
         m, n, padded_n,
-        x.stride(0), x_fp8.stride(0), sf.stride(0),
+        x.stride(0), x_fp8.stride(0),
+        sf.stride(0), sf.stride(1),
         BLOCK_M=BLOCK_M,
         gran_k=gran_k,
         use_ue8m0=use_ue8m0,
@@ -211,6 +213,187 @@ def per_token_cast_to_fp8(
     return x_fp8, sf
 
 
+@torch._dynamo.allow_in_graph
+def per_token_cast_to_fp8_chunked(
+    x: torch.Tensor,
+    chunk_sizes: list,
+    gran_k: int = 128,
+    use_ue8m0: bool = False,
+) -> Tuple[torch.Tensor, list, list]:
+    """Per-token FP8 quantization that writes each chunk's scale factor into
+    its own MN-major, TMA-aligned buffer.
+
+    Returns (fp8_full, fp8_chunks, sf_chunks) where each sf_chunks[i] has
+    shape (chunk_sizes[i], num_groups) with strides (1, align(chunk_sizes[i], 4))
+    — already in the layout DeepGEMM's m_grouped_fp8_gemm_nt_contiguous
+    early-returns on, so no transpose kernel is launched downstream.
+    """
+    assert x.dim() == 2, f"Expected 2D input, got shape {x.shape}"
+    assert not use_ue8m0, "ue8m0 path not supported for chunked variant"
+    m, n = x.shape
+    padded_n = align(n, gran_k)
+    num_groups = padded_n // gran_k
+
+    fp8_full = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    fp8_chunks = list(torch.split(fp8_full, chunk_sizes, dim=0))
+    x_chunks = list(torch.split(x, chunk_sizes, dim=0))
+
+    sf_chunks = []
+    BLOCK_M = 4
+    for cm, xc, fp8c in zip(chunk_sizes, x_chunks, fp8_chunks):
+        tma_aligned_cm = align(cm, 4)  # 16B / sizeof(fp32) = 4 elements
+        sf = torch.empty_strided(
+            (cm, num_groups),
+            (1, tma_aligned_cm),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        grid = (num_groups, triton.cdiv(cm, BLOCK_M))
+        _per_token_cast_to_fp8_kernel[grid](
+            xc, fp8c, sf,
+            cm, n, padded_n,
+            xc.stride(0), fp8c.stride(0),
+            sf.stride(0), sf.stride(1),
+            BLOCK_M=BLOCK_M,
+            gran_k=gran_k,
+            use_ue8m0=use_ue8m0,
+        )
+        sf_chunks.append(sf)
+
+    return fp8_full, fp8_chunks, sf_chunks
+
+
+@triton.jit
+def _per_token_cast_to_fp8_chunked_fused_kernel(
+    x_ptr,
+    x_fp8_ptr,
+    sf_flat_ptr,
+    chunk_sizes_ptr,        # int32[num_chunks]
+    chunk_row_starts_ptr,   # int32[num_chunks]
+    sf_offsets_ptr,         # int32[num_chunks]
+    sf_strides_ptr,         # int32[num_chunks]  (== align(cm, 4))
+    n,
+    padded_n,
+    stride_m,
+    stride_fp8_m,
+    BLOCK_M: tl.constexpr,
+    gran_k: tl.constexpr,
+    use_ue8m0: tl.constexpr,
+):
+    """Fused per-chunk quantize. Grid = (num_groups, num_chunks, ceil(max_cm/BLOCK_M)).
+
+    Each program handles one (chunk, row-tile, column-group). Programs whose
+    local_rows fall past the chunk's cm are masked out and become no-ops.
+    Scale factors are written into a flat fp32 buffer at per-chunk offsets with
+    strides ``(1, align(cm, 4))`` — MN-major TMA-aligned for DeepGEMM.
+    """
+    group_idx = tl.program_id(0)
+    chunk_id  = tl.program_id(1)
+    row_tile  = tl.program_id(2)
+
+    cm        = tl.load(chunk_sizes_ptr      + chunk_id)
+    row_start = tl.load(chunk_row_starts_ptr + chunk_id)
+    sf_off    = tl.load(sf_offsets_ptr       + chunk_id)
+    sf_str_k  = tl.load(sf_strides_ptr       + chunk_id)
+
+    local_rows  = row_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask    = local_rows < cm
+    global_rows = row_start + local_rows
+
+    cols = group_idx * gran_k + tl.arange(0, gran_k)
+
+    offsets   = global_rows[:, None] * stride_m + cols[None, :]
+    load_mask = row_mask[:, None] & (cols[None, :] < n)
+    x = tl.load(x_ptr + offsets, mask=load_mask, other=0.0).to(tl.float32)
+
+    x_amax = tl.max(tl.abs(x), axis=1)
+
+    sf = x_amax / 448.0
+    if use_ue8m0:
+        sf = _ceil_to_ue8m0(sf)
+    sf = tl.where(sf == 0.0, 1.0, sf)
+    inv_sf = 1.0 / sf[:, None]
+    x_scaled = x * inv_sf
+
+    fp8_offsets = global_rows[:, None] * stride_fp8_m + cols[None, :]
+    fp8_mask    = row_mask[:, None] & (cols[None, :] < n)
+    tl.store(x_fp8_ptr + fp8_offsets, x_scaled.to(tl.float8e4nv), mask=fp8_mask)
+
+    sf_addr = sf_off + local_rows + group_idx * sf_str_k
+    tl.store(sf_flat_ptr + sf_addr, sf, mask=row_mask)
+
+
+@torch._dynamo.allow_in_graph
+def per_token_cast_to_fp8_chunked_fused(
+    x: torch.Tensor,
+    chunk_sizes: list,
+    gran_k: int = 128,
+    use_ue8m0: bool = False,
+) -> Tuple[torch.Tensor, list, list]:
+    """Single-launch fused variant of :func:`per_token_cast_to_fp8_chunked`.
+
+    Allocates one flat fp32 SF buffer; per-chunk views are constructed via
+    ``torch.as_strided`` with strides ``(1, align(cm, 4))`` so DeepGEMM still
+    early-returns from ``get_mn_major_tma_aligned_tensor`` (no transpose).
+    """
+    assert x.dim() == 2, f"Expected 2D input, got shape {x.shape}"
+    assert not use_ue8m0, "ue8m0 path not supported for fused variant"
+    m, n = x.shape
+    padded_n = align(n, gran_k)
+    num_groups = padded_n // gran_k
+    num_chunks = len(chunk_sizes)
+    assert sum(chunk_sizes) == m, \
+        f"sum(chunk_sizes)={sum(chunk_sizes)} != m={m}"
+
+    # Per-chunk metadata (small int32 arrays, packed into one H2D)
+    sf_strides_list = [align(cm, 4) for cm in chunk_sizes]
+    sf_sizes_list   = [s * num_groups for s in sf_strides_list]
+    sf_offsets_list = [0]
+    for s in sf_sizes_list[:-1]:
+        sf_offsets_list.append(sf_offsets_list[-1] + s)
+    chunk_row_starts_list = [0]
+    for cm in chunk_sizes[:-1]:
+        chunk_row_starts_list.append(chunk_row_starts_list[-1] + cm)
+
+    total_sf_size = sum(sf_sizes_list)
+    max_cm = max(chunk_sizes)
+
+    # Pack the four small int32 arrays into a single CPU tensor and copy once
+    meta_cpu = torch.tensor(
+        list(chunk_sizes) + chunk_row_starts_list + sf_offsets_list + sf_strides_list,
+        dtype=torch.int32,
+    )
+    meta = meta_cpu.to(x.device, non_blocking=True)
+    chunk_sizes_cuda      = meta[0:num_chunks]
+    chunk_row_starts_cuda = meta[num_chunks:2 * num_chunks]
+    sf_offsets_cuda       = meta[2 * num_chunks:3 * num_chunks]
+    sf_strides_cuda       = meta[3 * num_chunks:4 * num_chunks]
+
+    fp8_full = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    sf_flat  = torch.empty(total_sf_size, dtype=torch.float32, device=x.device)
+
+    BLOCK_M = 4
+    grid = (num_groups, num_chunks, triton.cdiv(max_cm, BLOCK_M))
+    _per_token_cast_to_fp8_chunked_fused_kernel[grid](
+        x, fp8_full, sf_flat,
+        chunk_sizes_cuda, chunk_row_starts_cuda,
+        sf_offsets_cuda, sf_strides_cuda,
+        n, padded_n,
+        x.stride(0), fp8_full.stride(0),
+        BLOCK_M=BLOCK_M,
+        gran_k=gran_k,
+        use_ue8m0=use_ue8m0,
+    )
+
+    fp8_chunks = list(torch.split(fp8_full, chunk_sizes, dim=0))
+    sf_chunks = [
+        torch.as_strided(sf_flat, (cm, num_groups), (1, st), storage_offset=off)
+        for cm, st, off in zip(chunk_sizes, sf_strides_list, sf_offsets_list)
+    ]
+
+    return fp8_full, fp8_chunks, sf_chunks
+
+
 @triton.jit
 def _per_token_dequant_from_fp8_kernel(
     x_fp8_ptr,
@@ -220,6 +403,7 @@ def _per_token_dequant_from_fp8_kernel(
     n,
     stride_fp8_m,
     stride_sf_m,
+    stride_sf_k,
     stride_out_m,
     BLOCK_M: tl.constexpr,
     gran_k: tl.constexpr,
@@ -239,7 +423,7 @@ def _per_token_dequant_from_fp8_kernel(
     mask = (rows[:, None] < m) & (cols[None, :] < n)
     x_fp8 = tl.load(x_fp8_ptr + fp8_offsets, mask=mask, other=0.0).to(tl.float32)
 
-    sf = tl.load(sf_ptr + rows * stride_sf_m + group_idx, mask=(rows < m), other=0.0)
+    sf = tl.load(sf_ptr + rows * stride_sf_m + group_idx * stride_sf_k, mask=(rows < m), other=0.0)
 
     out = x_fp8 * sf[:, None]
 
@@ -282,11 +466,46 @@ def per_token_dequant_from_fp8(
     _per_token_dequant_from_fp8_kernel[grid](
         x_fp8, sf, out,
         m, n,
-        x_fp8.stride(0), sf.stride(0), out.stride(0),
+        x_fp8.stride(0), sf.stride(0), sf.stride(1), out.stride(0),
         BLOCK_M=BLOCK_M,
         gran_k=gran_k,
     )
 
+    return out
+
+
+@torch._dynamo.allow_in_graph
+def per_token_dequant_from_fp8_chunked(
+    x_fp8: torch.Tensor,
+    sf_chunks: list,
+    chunk_sizes: list,
+    gran_k: int = 128,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Per-chunk dequant. Each ``sf_chunks[i]`` is shape
+    ``(chunk_sizes[i], num_groups)`` with arbitrary 2D strides.
+    """
+    assert x_fp8.dim() == 2
+    m, n = x_fp8.shape
+    padded_n = align(n, gran_k)
+    num_groups = padded_n // gran_k
+    assert sum(chunk_sizes) == m
+
+    out = torch.empty((m, n), dtype=out_dtype, device=x_fp8.device)
+    fp8_chunks = list(torch.split(x_fp8, chunk_sizes, dim=0))
+    out_chunks = list(torch.split(out, chunk_sizes, dim=0))
+
+    BLOCK_M = 4
+    for cm, fp8c, sfc, outc in zip(chunk_sizes, fp8_chunks, sf_chunks, out_chunks):
+        assert sfc.shape == (cm, num_groups)
+        grid = (num_groups, triton.cdiv(cm, BLOCK_M))
+        _per_token_dequant_from_fp8_kernel[grid](
+            fp8c, sfc, outc,
+            cm, n,
+            fp8c.stride(0), sfc.stride(0), sfc.stride(1), outc.stride(0),
+            BLOCK_M=BLOCK_M,
+            gran_k=gran_k,
+        )
     return out
 
 

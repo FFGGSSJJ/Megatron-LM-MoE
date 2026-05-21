@@ -925,7 +925,6 @@ class OffloadingExpertsMLP(MegatronModule):
         self.num_local_experts = num_local_experts
 
         assert config.gradient_accumulation_fusion
-        assert not config.delay_wgrad_compute, "delay_wgrad_compute is not supported in OffloadingExpertsMLP for now"
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -1130,7 +1129,7 @@ class OffloadingExpertsMLP(MegatronModule):
         ]
 
         # cuda stream manager for h2d transfer and computation
-        self.stream_manager = StreamManager.get_instance()
+        self.stream_manager = StreamManager.get_instance(num_compute_streams=1 if self.config.moe_use_inplace_fp8_param else 4)
 
         # scheduler to determine when to trigger wgrad compute
         self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
@@ -1253,8 +1252,6 @@ class OffloadingExpertsMLP(MegatronModule):
                 if self.weight2_list is None:
                     self.weight2_list = list(torch.unbind(self.weight2, dim=0))
                 
-                tokens_per_expert_list = tokens_per_expert.tolist()
-                
                 output = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
@@ -1265,7 +1262,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.experts1_gpu_chunks,
                     self.experts2_gpu_chunks,
                     permuted_local_hidden_states,
-                    tokens_per_expert_padded,
+                    tokens_per_expert,
                     self.num_local_experts,
                     permuted_probs,
                     self.expert_wgrad_scheduler,
@@ -1296,7 +1293,13 @@ class OffloadingExpertsMLP(MegatronModule):
             return output, None
         
     def backward_dw(self):
-        raise NotImplementedError("backward_dw is not implemented in OffloadingExpertsMLP for now")
+        if self.config.delay_wgrad_compute:
+            self.expert_wgrad_scheduler.pop_callback()
+            self.expert_wgrad_scheduler.pop_callback()
+
+            # trigger grad reduce hook
+            for hook_fn in self.wgrad_accumulation_and_reduce_hooks:
+                hook_fn()
     
     def register_wgrad_accumulation_and_reduce_hooks(self, hook_fn):
         self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)

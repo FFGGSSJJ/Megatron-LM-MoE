@@ -1467,7 +1467,6 @@ def validate_args(args, defaults={}):
         assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
         assert args.bf16, "MoE expert offloading currently requires using bfloat16 precision."
         assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
-        assert not args.delay_wgrad_compute, "Delaying wgrad compute is not supported with MoE expert offloading for now."
 
         if args.overlap_grad_reduce:
             args.moe_offloading_experts_skip_post_backward_hook = True
