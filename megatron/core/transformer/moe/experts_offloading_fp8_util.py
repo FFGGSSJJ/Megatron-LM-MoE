@@ -141,6 +141,11 @@ class FP8ExpertsParameterManager:
         )
         self.config = config
 
+        if self.config.moe_use_extra_fp8_param_storage:
+            # extra storage for fp8 weights
+            self._wid_to_extra_fp8_weight_storage: dict[int, torch.Tensor] = {}
+            self._wid_to_extra_fp8_weight_storage_slices: dict[int, tuple[torch.Tensor]] = {}
+
     def get_fp8_weights(
         self,
         bf16_weights: list[torch.nn.Parameter] | list[torch.Tensor],
@@ -276,14 +281,41 @@ class FP8ExpertsParameterManager:
 
         # D2H
         with torch.no_grad():
-            fp8_weight = (
-                bf16_param_slices[0]
-                .copy_(fp8_weight.data, non_blocking=False)
-            )
-            fp8_weight_t = (
-                bf16_param_slices[1]
-                .copy_(fp8_weight_t.data, non_blocking=False)
-            )
+            if not self.config.moe_use_extra_fp8_param_storage:
+                # in-place update 
+                fp8_weight = (
+                    bf16_param_slices[0]
+                    .copy_(fp8_weight.data, non_blocking=False)
+                )
+                fp8_weight_t = (
+                    bf16_param_slices[1]
+                    .copy_(fp8_weight_t.data, non_blocking=False)
+                )
+            else:
+                extra_fp8_storage = self._wid_to_extra_fp8_weight_storage.get(wid, None)
+                extra_fp8_storage_slices = self._wid_to_extra_fp8_weight_storage_slices.get(wid, None)
+                if extra_fp8_storage is None:
+                    # allocate new storage if not exist
+                    extra_fp8_storage = torch.empty_like(bf16_param.data, pin_memory=bf16_param.data.is_pinned())
+                    self._wid_to_extra_fp8_weight_storage[wid] = extra_fp8_storage
+                    extra_fp8_storage_slices = list(torch.unbind(extra_fp8_storage.view(2, bf16_param.shape[0] // 2, *bf16_param.shape[1:]), dim=0))
+                    self._wid_to_extra_fp8_weight_storage_slices[wid] = (
+                        extra_fp8_storage_slices[0].view(torch.float8_e4m3fn).view(bf16_param.shape[0], bf16_param.shape[1]),
+                        extra_fp8_storage_slices[1].view(torch.float8_e4m3fn).view(bf16_param.shape[1], bf16_param.shape[0])
+                    )
+                    
+                extra_fp8_storage = self._wid_to_extra_fp8_weight_storage[wid]
+                extra_fp8_storage_slices = self._wid_to_extra_fp8_weight_storage_slices[wid]
+                
+                # use extra storage
+                fp8_weight = (
+                    extra_fp8_storage_slices[0]
+                    .copy_(fp8_weight.data, non_blocking=False)
+                )
+                fp8_weight_t = (
+                    extra_fp8_storage_slices[1]
+                    .copy_(fp8_weight_t.data, non_blocking=False)
+                )
         
         
         # if fp8_weight_scale_tensor is not None:
@@ -733,6 +765,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         config: TransformerConfig = args[-2]
         wgrad_accumulation_and_reduce_hooks: list = args[-1]
         fp8_parameter_manager: FP8ExpertsParameterManager = FP8ExpertsParameterManager.get_instance()
+        fp8_parameter_manager.config = config
 
         assert cpu_w1.shape[0] == num_local_experts, f"Expected cpu_w1 to have {num_local_experts} experts, but got {cpu_w1.shape[0]}"
         assert cpu_w2.shape[0] == num_local_experts, f"Expected cpu_w2 to have {num_local_experts} experts, but got {cpu_w2.shape[0]}"

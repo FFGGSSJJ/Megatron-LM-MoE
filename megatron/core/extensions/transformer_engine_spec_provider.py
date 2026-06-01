@@ -76,8 +76,7 @@ class TESpecProvider(BackendSpecProvider):
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm and moe_use_offloading_experts:
             return partial(
-                OffloadingExpertsMLP, 
-                None,
+                OffloadingExpertsMLP,
             )
         if moe_use_grouped_gemm and TEColumnParallelGroupedLinear is not None:
             return partial(

@@ -746,6 +746,10 @@ class TransformerConfig(ModelParallelConfig):
     but the weights will be quantized into FP8 for computation. Both transposed and non-transposed
     weights will be saved."""
 
+    moe_use_extra_fp8_param_storage: bool = False
+    """Whether to use extra storage for FP8 parameters in MoE layer. This flag works with
+    moe_use_inplace_fp8_param. If True, MoE layer will use separate FP8 parameter storage in addition to the original BF16 parameter storage."""
+
     moe_use_offloading_experts: bool = False
     """Whether to use offloading experts for MoE."""
 

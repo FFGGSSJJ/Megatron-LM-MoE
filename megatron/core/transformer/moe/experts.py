@@ -48,6 +48,11 @@ from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     offloading_fp8_grouped_swiglu_mlp,
 )
 
+from megatron.core.transformer.moe.fp8_utils import (
+    build_offloading_expert_sharded_tensor,
+    make_fused_experts_sharded_factory,
+)
+
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -1305,35 +1310,80 @@ class OffloadingExpertsMLP(MegatronModule):
         self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
     
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Maps local experts to global experts (interchangeable across variants).
+
+        Both OffloadingExpertsMLP variants emit the same per-expert, expert-parallel
+        sharded layout under keys ``{prefix}experts.weight{1,2}`` in ``(in, out)``
+        orientation, so a checkpoint saved by one is loadable by the other:
+
+        - bf16 variant: per-expert params already ``(in, out)`` -> saved directly.
+        - inplace-fp8 variant: a single fused ``(num_local, out, in)`` master is
+          transposed per expert via a ``ShardedTensorFactory`` (one per fused
+          param, keyed by the real param name so ``load_state_dict`` maps it back).
+        """
         metadata = ensure_metadata_has_dp_cp_group(metadata)
-        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)                   
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         assert self.tp_group.size() == 1, "OffloadingExpertsMLP assumes ETP size == 1"
-                                                                                                        
-        num_global_experts = self.ep_group.size() * self.num_local_experts                               
-        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts                      
-        ep_axis = len(sharded_offsets)                                                                   
+
+        num_global_experts = self.ep_group.size() * self.num_local_experts
+        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
         replica_id = (0, 0, self.dp_group.rank())
-                                                                                                        
+
+        if self.config.moe_use_inplace_fp8_param:
+            # The fused bf16 master is only valid when fp8 lives in extra storage;
+            # otherwise self.weight1/2 are overwritten in place with packed fp8 bytes
+            # (see _quantize_weight in experts_offloading_fp8_util.py).
+            assert self.config.moe_use_extra_fp8_param_storage, (
+                "Checkpointing inplace-fp8 OffloadingExpertsMLP requires "
+                "moe_use_extra_fp8_param_storage=True so the bf16 weights are "
+                "preserved (otherwise self.weight1/2 hold packed fp8 bytes)."
+            )
+            sharded_state_dict = {}
+            for wname, fused_weight in (('weight1', self.weight1), ('weight2', self.weight2)):
+                sharded_state_dict[f'{prefix}{wname}'] = make_fused_experts_sharded_factory(
+                    fused_weight,
+                    prefix,
+                    wname,
+                    num_local_experts=self.num_local_experts,
+                    local_expert_indices_offset=local_expert_indices_offset,
+                    num_global_experts=num_global_experts,
+                    sharded_offsets=sharded_offsets,
+                    replica_id=replica_id,
+                    singleton_local_shards=singleton_local_shards,
+                )
+            return sharded_state_dict
+
         sharded_state_dict = {}
         for i in range(self.num_local_experts):
             g_idx = local_expert_indices_offset + i
             w1 = getattr(self, f'weight1_expert_{i}')
             w2 = getattr(self, f'weight2_expert_{i}')
 
-            if singleton_local_shards:
-                w1_key = f'{prefix}experts.{g_idx}.weight1'
-                w2_key = f'{prefix}experts.{g_idx}.weight2'                                        
-                offsets = sharded_offsets                                                          
-            else:
-                w1_key = f'{prefix}experts.weight1'                                                
-                w2_key = f'{prefix}experts.weight2'
-                offsets = (*sharded_offsets, (ep_axis, g_idx, num_global_experts))                 
-
-            sharded_state_dict[f'{prefix}weight1_expert_{i}'] = ShardedTensor.from_rank_offsets(   
-                w1_key, w1, *offsets, replica_id=replica_id,                                       
+            sharded_state_dict[f'{prefix}weight1_expert_{i}'] = (
+                build_offloading_expert_sharded_tensor(
+                    w1,
+                    prefix,
+                    'weight1',
+                    g_idx,
+                    sharded_offsets=sharded_offsets,
+                    num_global_experts=num_global_experts,
+                    replica_id=replica_id,
+                    singleton_local_shards=singleton_local_shards,
+                    transpose=False,
+                )
             )
-            sharded_state_dict[f'{prefix}weight2_expert_{i}'] = ShardedTensor.from_rank_offsets(
-                w2_key, w2, *offsets, replica_id=replica_id,                                       
+            sharded_state_dict[f'{prefix}weight2_expert_{i}'] = (
+                build_offloading_expert_sharded_tensor(
+                    w2,
+                    prefix,
+                    'weight2',
+                    g_idx,
+                    sharded_offsets=sharded_offsets,
+                    num_global_experts=num_global_experts,
+                    replica_id=replica_id,
+                    singleton_local_shards=singleton_local_shards,
+                    transpose=False,
+                )
             )
         return sharded_state_dict
 

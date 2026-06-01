@@ -888,7 +888,7 @@ class _ParamAndGradBuffer:
 
         # CPU weight
         self.use_cpu_param_data = False
-        if params[0].device == torch.device("cpu"):
+        if self.params[0].device == torch.device("cpu"):
             self.use_cpu_param_data = True
 
         # Check that params are unique.

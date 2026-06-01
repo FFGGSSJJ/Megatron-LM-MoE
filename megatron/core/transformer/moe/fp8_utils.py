@@ -5,6 +5,8 @@ except ImportError:
     deep_gemm = None
 import matplotlib.pyplot as plt
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+
 def diff_tensor_norm(t1, t2):
     t1f = t1.to(torch.float)
     t2f = t2.to(torch.float)
@@ -42,6 +44,126 @@ def release(t: torch.Tensor):
     """Helper function to release tensors that are no longer needed to save memory.
     """
     t.untyped_storage().resize_(0)
+
+def build_offloading_expert_sharded_tensor(
+    weight_slice: torch.Tensor,
+    prefix: str,
+    weight_name: str,
+    global_expert_idx: int,
+    *,
+    sharded_offsets: tuple,
+    num_global_experts: int,
+    replica_id,
+    singleton_local_shards: bool,
+    transpose: bool,
+):
+    """Build the ShardedTensor for a single offloaded expert weight.
+
+    Produces the *same* on-disk representation for both OffloadingExpertsMLP
+    variants so their checkpoints are interchangeable:
+
+    - bf16 variant: per-expert params stored as ``(in, out)`` -> ``transpose=False``
+    - inplace-fp8 variant: fused master stored as ``(out, in)`` (NT layout)
+      -> ``transpose=True`` to land on the same ``(in, out)`` checkpoint layout.
+
+    The expert is expressed as a *prepended* axis fragment exactly like
+    ``SequentialMLP``/``TEGroupedMLP`` (see ``apply_swiglu_sharded_factory``),
+    i.e. ``prepend_axis_num == len(offsets)``, which is what makes the expert
+    dimension compose cleanly with any pipeline/tensor ``sharded_offsets``.
+
+    Args:
+        weight_slice (torch.Tensor): one expert's 2D weight. ``(in, out)`` when
+            ``transpose=False`` else ``(out, in)``.
+        prefix (str): module prefix for the on-disk key.
+        weight_name (str): ``'weight1'`` or ``'weight2'``.
+        global_expert_idx (int): this expert's index in the global expert range.
+        sharded_offsets (tuple): offsets inherited from parent modules (PP, ...).
+        num_global_experts (int): total experts across the expert-parallel group.
+        replica_id: ShardedTensor replica id (PP, TP, DP).
+        singleton_local_shards (bool): when True each expert is saved under its own
+            global key with no expert sharding axis.
+        transpose (bool): transpose ``(out, in) -> (in, out)`` before saving.
+    """
+    data = weight_slice.transpose(0, 1).contiguous() if transpose else weight_slice
+    if singleton_local_shards:
+        key = f'{prefix}experts.{global_expert_idx}.{weight_name}'
+        offsets = sharded_offsets
+    else:
+        key = f'{prefix}experts.{weight_name}'
+        offsets = (
+            *sharded_offsets,
+            (len(sharded_offsets), global_expert_idx, num_global_experts),
+        )
+    return ShardedTensor.from_rank_offsets(
+        key,
+        data,
+        *offsets,
+        replica_id=replica_id,
+        prepend_axis_num=len(offsets),
+    )
+
+
+def make_fused_experts_sharded_factory(
+    fused_weight: torch.Tensor,
+    prefix: str,
+    weight_name: str,
+    *,
+    num_local_experts: int,
+    local_expert_indices_offset: int,
+    num_global_experts: int,
+    sharded_offsets: tuple,
+    replica_id,
+    singleton_local_shards: bool,
+):
+    """ShardedTensorFactory for one fused inplace-fp8 expert weight.
+
+    ``fused_weight`` is the single ``(num_local_experts, out, in)`` bf16 master
+    parameter used by the inplace-fp8 ``OffloadingExpertsMLP``. The factory:
+
+    - ``build_fn``: emits one per-expert ShardedTensor (transposed to the
+      ``(in, out)`` checkpoint layout, sharded over the expert axis), so the
+      on-disk tensor matches the per-expert bf16 checkpoint exactly.
+    - ``merge_fn``: re-stacks the loaded per-expert ``(in, out)`` tensors back
+      into the fused ``(num_local_experts, out, in)`` master on load.
+
+    The factory is keyed by the real parameter name (``f'{prefix}{weight_name}'``)
+    so ``module.load_state_dict`` maps the merged tensor back to the fused param.
+    """
+
+    @torch.no_grad()
+    def build_fn(key, t, rep_id, flattened_range):
+        assert flattened_range is None, "flattening unsupported for offloaded experts"
+        shards = []
+        for i in range(num_local_experts):
+            global_expert_idx = local_expert_indices_offset + i
+            shards.append(
+                build_offloading_expert_sharded_tensor(
+                    t[i],
+                    prefix,
+                    weight_name,
+                    global_expert_idx,
+                    sharded_offsets=sharded_offsets,
+                    num_global_experts=num_global_experts,
+                    replica_id=rep_id,
+                    singleton_local_shards=singleton_local_shards,
+                    transpose=True,
+                )
+            )
+        return shards
+
+    @torch.no_grad()
+    def merge_fn(loaded_shards):
+        # list of (in, out) -> fused (num_local_experts, out, in)
+        return torch.stack([s.transpose(0, 1) for s in loaded_shards], dim=0).contiguous()
+
+    return ShardedTensorFactory(
+        f'{prefix}{weight_name}',
+        fused_weight,
+        build_fn,
+        merge_fn,
+        replica_id,
+    )
+
 
 def m_grouped_fp8_gemm_nt_contiguous(
     tokens_per_expert: torch.Tensor,

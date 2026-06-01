@@ -139,7 +139,6 @@ class LocalSpecProvider(BackendSpecProvider):
         if moe_use_offloading_experts:
             return partial(
                 OffloadingExpertsMLP,
-                None,
             )
         return partial(
             SequentialMLP,

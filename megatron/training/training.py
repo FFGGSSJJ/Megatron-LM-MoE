@@ -2968,7 +2968,7 @@ def train(
                  torch.distributed.get_rank() in args.profile_ranks)):
             if args.use_pytorch_profiler:
                 prof.step()
-            if iteration == args.nsys_profile_step_start:
+            if iteration == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
