@@ -297,11 +297,7 @@ def get_megatron_muon_optimizer(
                 not getattr(param, 'is_embedding_or_output_parameter', False)
                 and len(param.shape) == 2
             ):
-                if config.router_weight_adam and 'router.weight' in name:
-                    # NOTE: adapt adam for router weight update if necessary
-                    nonlinear_params.append(param)
-                else:
-                    linear_params.append(param)
+                linear_params.append(param)
             else:
                 nonlinear_params.append(param)
 
