@@ -296,7 +296,7 @@ class FP8ExpertsParameterManager:
                 extra_fp8_storage_slices = self._wid_to_extra_fp8_weight_storage_slices.get(wid, None)
                 if extra_fp8_storage is None:
                     # allocate new storage if not exist
-                    extra_fp8_storage = torch.empty_like(bf16_param.data, pin_memory=bf16_param.data.is_pinned())
+                    extra_fp8_storage = torch.empty_like(bf16_param.data, device=bf16_param.data.device, pin_memory=bf16_param.data.is_pinned())
                     self._wid_to_extra_fp8_weight_storage[wid] = extra_fp8_storage
                     extra_fp8_storage_slices = list(torch.unbind(extra_fp8_storage.view(2, bf16_param.shape[0] // 2, *bf16_param.shape[1:]), dim=0))
                     self._wid_to_extra_fp8_weight_storage_slices[wid] = (
