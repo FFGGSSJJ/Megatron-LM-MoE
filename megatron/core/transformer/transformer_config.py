@@ -552,8 +552,6 @@ class TransformerConfig(ModelParallelConfig):
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
 
-    fp8_activation: bool = False
-
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
@@ -732,14 +730,6 @@ class TransformerConfig(ModelParallelConfig):
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
-
-    moe_use_legacy_grouped_gemm: bool = False
-
-    moe_use_custom_function: bool = False
-
-    moe_split_expert_weights: bool = False
-
-    moe_mock_router: bool = False
 
     moe_use_inplace_fp8_param: bool = False
     """Whether to use FP8 parameter for MoE layer. Specifically, MoE layer will use BF16 storage, 
