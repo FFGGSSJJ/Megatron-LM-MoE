@@ -532,7 +532,7 @@ class GroupedSwiMLP(torch.autograd.Function):
             and "moe_act" in config.recompute_modules
         )
         ctx.activation_recompute = activation_recompute
-        if config.fp8_activation:
+        if config.moe_use_fp8_activation:
             if HAVE_TE:
                 quantizer = Float8BlockQuantizer(
                     fp8_dtype=TE_DType[torch.float8_e4m3fn],
@@ -607,7 +607,7 @@ class GroupedSwiMLP(torch.autograd.Function):
 
         # rematerialize activation if needed
         # NOTE: fp8 tensors have to be manually released after dequantization
-        if config.fp8_activation:
+        if config.moe_use_fp8_activation:
             x = ctx.qx.dequantize()
             release(ctx.qx)
             if not ctx.activation_recompute:

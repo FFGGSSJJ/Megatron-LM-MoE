@@ -731,6 +731,10 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_use_fp8_activation: bool = False
+    """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
+    be quantized into FP8 for storage."""
+
     moe_use_inplace_fp8_param: bool = False
     """Whether to use FP8 parameter for MoE layer. Specifically, MoE layer will use BF16 storage, 
     but the weights will be quantized into FP8 for computation. Both transposed and non-transposed

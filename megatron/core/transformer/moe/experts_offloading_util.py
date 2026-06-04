@@ -553,7 +553,7 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             and "moe_act" in config.recompute_modules
         )
         ctx.activation_recompute = activation_recompute
-        if config.fp8_activation:
+        if config.moe_use_fp8_activation:
             if HAVE_TE:
                 quantizer = Float8BlockQuantizer(
                     fp8_dtype=TE_DType[torch.float8_e4m3fn],
@@ -629,7 +629,7 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
 
         # rematerialize activation if needed
         # NOTE: fp8 tensors have to be manually released after dequantization
-        if config.fp8_activation:
+        if config.moe_use_fp8_activation:
             permuted_local_hidden_states = ctx.qx.dequantize()
             hidden_state_per_chunk = list(torch.split(permuted_local_hidden_states, total_token_num_per_chunk))
             release(ctx.qx)
