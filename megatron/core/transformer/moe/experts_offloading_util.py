@@ -1,3 +1,9 @@
+# Copyright (c) 2026, Swiss AI Institute
+"""
+This module implements utilities for MoE experts offloading, including:
+1) StreamManager: a singleton class to manage CUDA streams and events for offloading experts, enabling chunk-level interleaving of GPU computation and CPU-GPU communication.
+2) OffloadingExpertsGroupedSwiMLP: an autograd function for the forward and backward pass of the grouped SwiGLU MLP in offloading experts, with chunk-level interleaving of GPU computation and CPU-GPU communication to hide the data transfer latency of expert weights.
+"""
 from __future__ import annotations
 import torch
 import collections

@@ -1,3 +1,6 @@
+"""
+FP8 functions interface for checkpointing and DeepGEMM calls in MoE layers.
+"""
 import torch
 try:
     import deep_gemm

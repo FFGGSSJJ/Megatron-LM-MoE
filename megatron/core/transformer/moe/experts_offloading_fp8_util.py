@@ -1,6 +1,11 @@
+# Copyright (c) 2026, Swiss AI Institute
+"""
+Utilities for MoE experts offloading with FP8 support, including:
+1) FP8ExpertsParameterManager: a singleton class to manage the FP8 quantization of expert weights
+2) OffloadingExpertsFP8GroupedSwiMLP: an autograd function for the forward and backward pass of the grouped SwiGLU MLP in offloading experts with FP8 support
+"""
 from __future__ import annotations
 import torch
-from dataclasses import dataclass
 import itertools
 
 from megatron.core.transformer.transformer_config import TransformerConfig

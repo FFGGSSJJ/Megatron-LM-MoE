@@ -1,4 +1,10 @@
-
+# Copyright (c) 2026, Swiss AI Institute
+"""
+This module implements utility classes and functions for Mixture of Experts (MoE) in the Megatron-LM framework, including:
+1) ExpertsWgradScheduler: a utility class to manage the scheduling of weight gradient computations for MoE experts, allowing for delayed computation of weight gradients to enable better interleaving of GPU computation and CPU-GPU communication.
+2) MergedSwiGLU: a custom autograd function that implements the forward and backward pass of the SwiGLU activation function, with optional probability scaling for the forward pass and corresponding adjustments in the backward pass.
+3) GroupedSwiMLP: a custom autograd function that implements the forward and backward pass of a grouped linear layer followed by a SwiGLU activation and another grouped linear layer, with support for delayed weight gradient computation and optional FP8 activation quantization for memory efficiency.
+"""
 from __future__ import annotations
 import torch
 import collections
