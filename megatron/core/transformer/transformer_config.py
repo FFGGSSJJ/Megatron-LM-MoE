@@ -762,6 +762,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_offloading_experts_debug_mode: bool = False
     """Whether to enable debug mode for offloading experts, which will take the flow of GroupedMLP"""
 
+    moe_offloading_experts_te_style_init: bool = True
+    """Whether OffloadingExpertsMLP should initialize expert weights to match the TEGroupedMLP
+    path (GPU init under the expert-parallel CUDA RNG tracker) instead of the default CPU
+    master-weight init. When False (default), the original CPU-based initialization is used."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,

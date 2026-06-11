@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 import collections
 import queue
+from typing import Optional
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -708,3 +709,60 @@ def grouped_swiglu_mlp(
     )
 
     return output
+
+def grouped_swiglu_mlp_torch_ref(
+    w1,
+    w2,
+    permuted_local_hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+    permuted_probs: torch.Tensor,
+    expert_wgrad_scheduler: Optional[ExpertsWgradScheduler] = None,
+    config: Optional["TransformerConfig"] = None,
+) -> torch.Tensor:
+    """Pure-PyTorch reference path for the grouped SwiGLU MoE experts.
+
+    Drop-in replacement for ``grouped_swiglu_mlp`` used only to verify
+    correctness. Each expert is evaluated with plain ``torch.matmul`` and the
+    backward pass is handled entirely by autograd -- no grouped GEMM, no custom
+    CUDA streams / weight-prefetch buffers, and no manual ``main_grad`` writes.
+    Expert-weight gradients reach ``main_grad`` through the standard DDP backward
+    hook, exactly like an ordinary linear layer. This isolates whether a failure
+    lives in the grouped-GEMM / offloading machinery or in the surrounding
+    dispatcher / VPP wiring.
+
+    Per expert ``i`` (``x_i: [t_i, in]``, ``w1[i]: [in, 2H]``, ``w2[i]: [H, in]``):
+
+        fc1 = x_i @ w1[i]                 # [t_i, 2H]
+        gate, lin = fc1.chunk(2, dim=-1)
+        s = (silu(gate) * lin) * probs_i  # [t_i, H]
+        y_i = s @ w2[i]                   # [t_i, in]
+
+    ``expert_wgrad_scheduler`` and ``config`` are accepted only for signature
+    compatibility with ``grouped_swiglu_mlp`` and are unused.
+    """
+    # Normalize weights to a list of per-expert 2D tensors (supports both the
+    # per-expert parameter list and a stacked [E, in, 2H] / [E, H, in] tensor).
+    w1_list = list(torch.unbind(w1, dim=0)) if isinstance(w1, torch.Tensor) else list(w1)
+    w2_list = list(torch.unbind(w2, dim=0)) if isinstance(w2, torch.Tensor) else list(w2)
+
+    # torch.split needs python ints; .tolist() syncs if tokens_per_expert is on GPU.
+    tokens = (
+        tokens_per_expert.tolist()
+        if isinstance(tokens_per_expert, torch.Tensor)
+        else list(tokens_per_expert)
+    )
+
+    x_chunks = torch.split(permuted_local_hidden_states, tokens, dim=0)
+    probs_chunks = torch.split(permuted_probs.reshape(-1), tokens, dim=0)
+
+    outputs = []
+    for i in range(num_local_experts):
+        x_i = x_chunks[i]
+        fc1 = torch.matmul(x_i, w1_list[i])                       # [t_i, 2H]
+        gate, lin = fc1.chunk(2, dim=-1)
+        s = F.silu(gate) * lin                                    # [t_i, H]
+        s = (s * probs_chunks[i].unsqueeze(-1)).to(x_i.dtype)
+        outputs.append(torch.matmul(s, w2_list[i]))               # [t_i, in]
+
+    return torch.cat(outputs, dim=0)

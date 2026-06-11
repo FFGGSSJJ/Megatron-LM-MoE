@@ -134,30 +134,26 @@ def make_fused_experts_sharded_factory(
 
     ``build_fn`` honors the ``key`` it is handed (``ShardedTensorFactory.build``
     passes ``self.key``) rather than rebuilding keys solely from the captured
-    ``prefix``/``weight_name``. This is required so that when a mixed-precision
-    optimizer re-keys the factory to serialize its fp32 master copy (e.g.
-    ``optimizer.state.fp32_param.<key>`` via ``make_sharded_optimizer_tensor``),
-    the emitted shards inherit that prefix instead of colliding with the model
-    weight shards (which otherwise surfaces as an fp32-vs-bf16 dtype mismatch in
-    ``validate_sharding_integrity``).
-    """
+    ``prefix``/``weight_name``. This is required because callers can re-key the
+    factory in two ways:
 
-    base_key = f'{prefix}{weight_name}'
+    - VPP replaces the local layer prefix with the global checkpoint layer prefix.
+    - A mixed-precision optimizer prepends its fp32 master-copy namespace.
+
+    Deriving the emitted shard prefix from the runtime key handles both cases.
+    """
 
     @torch.no_grad()
     def build_fn(key, t, rep_id, flattened_range):
         assert flattened_range is None, "flattening unsupported for offloaded experts"
-        # A caller (e.g. the optimizer serializing its fp32 master) may re-key the
-        # factory to '<extra_prefix>.<base_key>'. Recover that extra prefix and
-        # apply it to the per-expert shards so they stay in the caller's namespace.
-        assert key.endswith(base_key), (key, base_key)
-        key_prefix = key[: len(key) - len(base_key)]
+        assert key.endswith(weight_name), (key, weight_name)
+        runtime_prefix = key[: -len(weight_name)]
         shards = []
         for i in range(num_local_experts):
             global_expert_idx = local_expert_indices_offset + i
             sh_ten = build_offloading_expert_sharded_tensor(
                 t[i],
-                prefix,
+                runtime_prefix,
                 weight_name,
                 global_expert_idx,
                 sharded_offsets=sharded_offsets,
@@ -166,8 +162,6 @@ def make_fused_experts_sharded_factory(
                 singleton_local_shards=singleton_local_shards,
                 transpose=True,
             )
-            if key_prefix:
-                sh_ten.key = f'{key_prefix}{sh_ten.key}'
             shards.append(sh_ten)
         return shards
 

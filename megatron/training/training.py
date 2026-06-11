@@ -192,7 +192,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker, get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
 )
@@ -2187,25 +2187,6 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
         )
-
-        # log moe layer related metrics
-        load_imbalance_tracker, expert_path_tracker = get_moe_metrics_tracker()
-        if wandb_writer:
-            wandb_writer.log(load_imbalance_tracker, iteration)
-        if wandb_writer and iteration % 100 == 0:
-            plt.figure(figsize=(16, 9))
-            _ep_matrix = expert_path_tracker["expert_path"]
-            _ep_vmax = _ep_matrix.float().mean().item() * 2
-            plt.imshow(
-                _ep_matrix,
-                cmap='viridis',
-                interpolation='nearest',
-                vmin=0,
-                vmax=_ep_vmax,
-            )
-            plt.colorbar(label='Value Intensity', orientation='horizontal')
-            wandb_writer.log({"expert_path_heatmap": plt}, iteration)
-            # expert_path_tracker["expert_path"].zero_()
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:

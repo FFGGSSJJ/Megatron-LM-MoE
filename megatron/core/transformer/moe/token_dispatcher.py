@@ -742,6 +742,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        # ---- DEBUG: verify dispatch split-size invariant before the EP all-to-all ----
+        # The all_to_all_single requires sum(input_splits) == permutated tokens dim0, and
+        # sum(output_splits) == received tokens dim0. A mismatch ("Split sizes doesn't match
+        # total dim 0 size") means input_splits/output_splits are inconsistent with the
+        # permuted tensor (stale state, wrong routing_map, or unsynced DtoH copy).
+        if int(self.input_splits.sum()) != permutated_local_input_tokens.shape[0]:
+            import torch.distributed as _dist
+
+            raise RuntimeError(
+                f"[dispatch split mismatch] rank={_dist.get_rank()} "
+                f"ep_rank={self.ep_group.rank()} "
+                f"sum(input_splits)={int(self.input_splits.sum())} "
+                f"permuted_tokens.shape[0]={permutated_local_input_tokens.shape[0]} "
+                f"num_out_tokens={self.num_out_tokens} "
+                f"sum(output_splits)={int(self.output_splits.sum())} "
+                f"input_splits={self.input_splits.tolist()} "
+                f"output_splits={self.output_splits.tolist()} "
+                f"hidden_shape={self.hidden_shape}"
+            )
+        # ---- END DEBUG ----
         global_input_tokens, global_probs = MoEAlltoAllTokenDispatcherFunction.apply(
             self.ep_group,
             self.output_splits,

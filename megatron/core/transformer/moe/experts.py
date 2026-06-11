@@ -36,7 +36,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_align_size_for_quantization,
 )
 from megatron.core.transformer.moe.experts_util import (
-    grouped_swiglu_mlp,
+    grouped_swiglu_mlp_torch_ref,
     ExpertsWgradScheduler,
 )
 from megatron.core.transformer.moe.experts_offloading_util import (
@@ -88,8 +88,13 @@ try:
 except ImportError:
     grouped_gemm = None
 
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
+    set_tensor_model_parallel_attributes,
 )
 
 
@@ -1005,27 +1010,39 @@ class OffloadingExpertsMLP(MegatronModule):
             self.weight2_list = None
 
             if config.perform_initialization:
-                for i in range(self.num_local_experts):
-                    _initialize_affine_weight_cpu(
-                        self.weight1[i], 
-                        *fc1_expert_weight_shape,
-                        fc1_output_size_per_partition,
-                        partition_dim=1,
-                        init_method=config.init_method,
-                        params_dtype=config.params_dtype,
-                        rank=etp_rank,
-                        world_size=etp_size,
+                if config.moe_offloading_experts_te_style_init:
+                    # Inplace-FP8 weights are already stored in TE's [out, in] layout.
+                    self._init_expert_weights_like_te(
+                        self.weight1,
+                        self.weight2,
+                        fc1_out_size=fc1_output_size,
+                        fc1_in_size=self.input_size,
+                        fc2_out_size=self.input_size,
+                        fc2_in_size=fc2_input_size,
+                        weights_in_te_layout=True,
                     )
-                    _initialize_affine_weight_cpu(
-                        self.weight2[i], 
-                        *fc2_expert_weight_shape,
-                        fc2_input_size_per_partition,
-                        partition_dim=0,
-                        init_method=config.output_layer_init_method,
-                        params_dtype=config.params_dtype,
-                        rank=etp_rank,
-                        world_size=etp_size,
-                    )
+                else:
+                    for i in range(self.num_local_experts):
+                        _initialize_affine_weight_cpu(
+                            self.weight1[i],
+                            *fc1_expert_weight_shape,
+                            fc1_output_size_per_partition,
+                            partition_dim=1,
+                            init_method=config.init_method,
+                            params_dtype=config.params_dtype,
+                            rank=etp_rank,
+                            world_size=etp_size,
+                        )
+                        _initialize_affine_weight_cpu(
+                            self.weight2[i],
+                            *fc2_expert_weight_shape,
+                            fc2_input_size_per_partition,
+                            partition_dim=0,
+                            init_method=config.output_layer_init_method,
+                            params_dtype=config.params_dtype,
+                            rank=etp_rank,
+                            world_size=etp_size,
+                        )
 
             setattr(self.weight1, 'allreduce', not self.expert_parallel)
             setattr(self.weight2, 'allreduce', not self.expert_parallel)
@@ -1046,7 +1063,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     ),
                 )
                 self.weight1.append(getattr(self, f'weight1_expert_{i}'))
-                self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+                self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook and not config.moe_offloading_experts_debug_mode
                 self.weight1[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
 
                 self.register_parameter(
@@ -1062,12 +1079,14 @@ class OffloadingExpertsMLP(MegatronModule):
                     ),
                 )
                 self.weight2.append(getattr(self, f'weight2_expert_{i}'))
-                self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
+                self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook and not config.moe_offloading_experts_debug_mode
                 self.weight2[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
 
-                if config.perform_initialization:
+                # TE-style init runs as a group after all params are registered
+                # (see below); the original CPU init runs per-expert here.
+                if config.perform_initialization and not config.moe_offloading_experts_te_style_init:
                     _initialize_affine_weight_cpu(
-                        self.weight1[i], 
+                        self.weight1[i],
                         self.input_size,
                         fc1_output_size,
                         fc1_output_size_per_partition,
@@ -1078,7 +1097,7 @@ class OffloadingExpertsMLP(MegatronModule):
                         world_size=etp_size,
                     )
                     _initialize_affine_weight_cpu(
-                        self.weight2[i], 
+                        self.weight2[i],
                         fc2_input_size,
                         self.input_size,
                         fc2_input_size_per_partition,
@@ -1090,6 +1109,18 @@ class OffloadingExpertsMLP(MegatronModule):
                     )
                 setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
                 setattr(self.weight2[i], 'allreduce', not self.expert_parallel)
+
+            if config.perform_initialization and config.moe_offloading_experts_te_style_init:
+                # Non-FP8 weights are stored transposed ([in, out]) relative to TE.
+                self._init_expert_weights_like_te(
+                    self.weight1,
+                    self.weight2,
+                    fc1_out_size=fc1_output_size,
+                    fc1_in_size=self.input_size,
+                    fc2_out_size=self.input_size,
+                    fc2_in_size=fc2_input_size,
+                    weights_in_te_layout=False,
+                )
 
         # GPU buffer to prefetch CPU weights
         self.num_stages = self.config.moe_offloading_num_stages
@@ -1147,6 +1178,73 @@ class OffloadingExpertsMLP(MegatronModule):
             self.quantization_padding = Fp8Padding(self.num_local_experts, 128)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts, 128)
 
+    def _init_expert_weights_like_te(
+        self,
+        weights1,
+        weights2,
+        fc1_out_size: int,
+        fc1_in_size: int,
+        fc2_out_size: int,
+        fc2_in_size: int,
+        weights_in_te_layout: bool,
+    ):
+        """Initialize expert weights to match the TEGroupedMLP path.
+
+        TEGroupedMLP delegates to TE's ``GroupedLinear``, which builds each expert weight on
+        GPU in ``[out_features, in_features]`` layout and applies ``init_method`` under the
+        expert-parallel CUDA RNG tracker, looping over experts within a single fork so that
+        consecutive experts draw distinct values (and different EP ranks differ). The default
+        CPU path (``_initialize_affine_weight_cpu``) instead builds an fp32 master weight with
+        the un-forked global CPU RNG, so it produces different values. This method reproduces
+        the TE behaviour:
+
+        - ``linear_fc1`` is initialized before ``linear_fc2`` so the tracker's RNG stream
+          advances in the same order as TE (which constructs fc1 before fc2).
+        - each expert weight is created on GPU in ``params_dtype`` and ``[out, in]`` layout,
+          matching TE's weight tensors element-for-element.
+        - the result is copied into our (CPU-resident, possibly transposed) parameter, and the
+          tensor-model-parallel attributes that ``_initialize_affine_weight_cpu`` would have
+          stamped are preserved.
+
+        ``weights_in_te_layout`` is True when the parameters are already stored as
+        ``[out, in]`` (the inplace-FP8 case) and False when stored transposed as ``[in, out]``.
+        """
+        device = torch.cuda.current_device()
+        # TE only forks the tracker once it has been seeded (e.g. via
+        # model_parallel_cuda_manual_seed); otherwise it falls back to the default RNG.
+        use_tracker = get_cuda_rng_tracker().is_initialized()
+
+        def _init_group(weights, out_size, in_size, init_method, partition_dim):
+            def _do_init():
+                for i in range(self.num_local_experts):
+                    # TE orientation: [out_features, in_features], params_dtype, on GPU.
+                    weight = torch.empty(
+                        out_size, in_size, dtype=self.config.params_dtype, device=device
+                    )
+                    init_method(weight)
+                    if not weights_in_te_layout:
+                        # Our parameter stores [in_features, out_features]; transpose to match.
+                        weight = weight.t()
+                    with torch.no_grad():
+                        weights[i].data.copy_(weight)
+                    # Preserve the TP attributes set by _initialize_affine_weight_cpu, which are
+                    # read by sharded_state_dict and gradient bookkeeping.
+                    set_tensor_model_parallel_attributes(
+                        tensor=weights[i], is_parallel=True, dim=partition_dim, stride=1
+                    )
+
+            if use_tracker:
+                with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+                    _do_init()
+            else:
+                _do_init()
+
+        # Order matters: TE constructs linear_fc1 before linear_fc2.
+        _init_group(weights1, fc1_out_size, fc1_in_size, self.config.init_method, partition_dim=1)
+        _init_group(
+            weights2, fc2_out_size, fc2_in_size, self.config.output_layer_init_method, partition_dim=0
+        )
+
     def _apply(self, fn, recurse=True):
         saved = {}
         for name, p in list(self._parameters.items()):
@@ -1165,7 +1263,7 @@ class OffloadingExpertsMLP(MegatronModule):
     ):
         if permuted_local_hidden_states.nelement() != 0:
             if self.config.moe_offloading_experts_debug_mode:
-                output = grouped_swiglu_mlp(
+                output = grouped_swiglu_mlp_torch_ref(
                     self.weight1,
                     self.weight2,
                     permuted_local_hidden_states,
@@ -1236,7 +1334,7 @@ class OffloadingExpertsMLP(MegatronModule):
             return output, None
         else:
             if self.config.moe_offloading_experts_debug_mode:
-                output = grouped_swiglu_mlp(
+                output = grouped_swiglu_mlp_torch_ref(
                     self.weight1,
                     self.weight2,
                     permuted_local_hidden_states,

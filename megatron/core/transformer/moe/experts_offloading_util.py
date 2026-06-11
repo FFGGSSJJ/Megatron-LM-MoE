@@ -44,7 +44,6 @@ class StreamManager:
         self.num_h2d_streams = num_h2d_streams
         self.h2d_streams = [torch.cuda.Stream() for _ in range(num_h2d_streams)]
         # self.h2d_streams.append(torch.cuda.default_stream())
-        self.compute_stream_events = [torch.cuda.Event() for _ in range(self.num_compute_streams)]
         self.compute_streams = [torch.cuda.Stream() for _ in range(self.num_compute_streams)]
         self.compute_cuda_streams = [stream.cuda_stream for stream in self.compute_streams]
 
@@ -64,43 +63,49 @@ class StreamManager:
     def get_compute_streams(self) -> list[int]:
         return self.compute_cuda_streams
     
-    def default_stream_wait_compute_streams(self):
+    def get_launch_streams(self) -> list[torch.cuda.Stream]:
+        # VPP can execute a model chunk on a non-default current stream.
+        current_stream = torch.cuda.current_stream()
         default_stream = torch.cuda.default_stream()
+        if current_stream.cuda_stream == default_stream.cuda_stream:
+            return [current_stream]
+        return [current_stream, default_stream]
+
+    def launch_streams_wait_compute_streams(self):
+        launch_streams = self.get_launch_streams()
         for i in range(self.num_compute_streams):
-            self.compute_streams[i].record_event(self.compute_stream_events[i])
-        for i in range(self.num_compute_streams):
-            default_stream.wait_event(self.compute_stream_events[i])
-    
+            for launch_stream in launch_streams:
+                launch_stream.wait_stream(self.compute_streams[i])
+
     def default_stream_wait_h2d_stream(self, idx):
-        default_stream = torch.cuda.default_stream()
+        torch.cuda.default_stream().wait_stream(self.get_h2d_stream(idx))
+
+    def compute_streams_wait_launch_streams(self):
+        launch_streams = self.get_launch_streams()
+        for i in range(self.num_compute_streams):
+            for launch_stream in launch_streams:
+                self.compute_streams[i].wait_stream(launch_stream)
+
+    def h2d_stream_wait_consumer_streams(self, idx):
         h2d_stream = self.get_h2d_stream(idx)
-        h2d_stream.record_event(self.compute_stream_events[0])
-        default_stream.wait_event(self.compute_stream_events[0])
-    
-    def compute_streams_wait_default_stream(self):
-        default_stream = torch.cuda.default_stream()
-        default_stream.record_event(self.compute_stream_events[0])
+        for launch_stream in self.get_launch_streams():
+            h2d_stream.wait_stream(launch_stream)
         for i in range(self.num_compute_streams):
-            self.compute_streams[i].wait_event(self.compute_stream_events[0])
-    
-    def h2d_stream_wait_compute_streams(self, idx):
-        h2d_stream = self.get_h2d_stream(idx)
-        for i in range(self.num_compute_streams):
-            self.compute_streams[i].record_event(self.compute_stream_events[i])
-        for i in range(self.num_compute_streams):
-            h2d_stream.wait_event(self.compute_stream_events[i])
+            h2d_stream.wait_stream(self.compute_streams[i])
 
     def compute_streams_wait_h2d_stream(self, idx):
         h2d_stream = self.get_h2d_stream(idx)
-        h2d_stream.record_event(self.compute_stream_events[0])
         for i in range(self.num_compute_streams):
-            self.compute_streams[i].wait_event(self.compute_stream_events[0])
-    
+            self.compute_streams[i].wait_stream(h2d_stream)
+
+    def consumer_streams_wait_event(self, event):
+        for launch_stream in self.get_launch_streams():
+            launch_stream.wait_event(event)
+        for i in range(self.num_compute_streams):
+            self.compute_streams[i].wait_event(event)
+
     def h2d_stream_wait_default_stream(self, idx):
-        h2d_stream = self.get_h2d_stream(idx)
-        default_stream = torch.cuda.default_stream()
-        default_stream.record_event(self.compute_stream_events[0])
-        h2d_stream.wait_event(self.compute_stream_events[0])
+        self.get_h2d_stream(idx).wait_stream(torch.cuda.default_stream())
 
 
 class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
@@ -148,8 +153,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
 
             # NOTE: underlying groupedgemm is has sync problem
             # wait for the current chunk of weights to be ready on GPU
-            stream_manager.compute_streams_wait_default_stream()
-            stream_manager.compute_streams_wait_h2d_stream(curr_buffer_metadata[1])
+            stream_manager.compute_streams_wait_launch_streams()
+            stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             grouped_gemm.grouped_gemm.backend.gmmfwd(
                 batch_sizes=tokens_per_expert_chunk,
                 a=hidden_states_chunk,
@@ -159,8 +164,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
                 trans_a=False,
                 trans_b=False,
             )
-            stream_manager.h2d_stream_wait_compute_streams(curr_buffer_metadata[1])
-            stream_manager.default_stream_wait_compute_streams()
+            stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
+            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
@@ -206,8 +211,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
             # NOTE: underlying groupedgemm is multi-stream
-            stream_manager.compute_streams_wait_default_stream()
-            stream_manager.compute_streams_wait_h2d_stream(curr_buffer_metadata[1])
+            stream_manager.compute_streams_wait_launch_streams()
+            stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             grouped_gemm.grouped_gemm.backend.gmmfwd(
                 batch_sizes=tokens_per_expert_chunk,
                 a=s_chunk,
@@ -217,8 +222,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
                 trans_a=False,
                 trans_b=False,
             )
-            stream_manager.h2d_stream_wait_compute_streams(curr_buffer_metadata[1])
-            stream_manager.default_stream_wait_compute_streams()
+            stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
+            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
@@ -261,8 +266,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             grad_s_chunk = grad_s_per_chunk[chunk_idx]
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
-            stream_manager.compute_streams_wait_default_stream()
-            stream_manager.compute_streams_wait_h2d_stream(curr_buffer_metadata[1])
+            stream_manager.compute_streams_wait_launch_streams()
+            stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             grouped_gemm.grouped_gemm.backend.gmmfwd(
                 batch_sizes=tokens_per_expert_chunk,
                 a=grad_y_chunk,
@@ -272,8 +277,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
                 trans_a=False,
                 trans_b=True,
             )
-            stream_manager.h2d_stream_wait_compute_streams(curr_buffer_metadata[1])
-            stream_manager.default_stream_wait_compute_streams()
+            stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
+            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
@@ -314,8 +319,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             grad_x_chunk = grad_x_per_chunk[chunk_idx]
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
-            stream_manager.compute_streams_wait_default_stream()
-            stream_manager.compute_streams_wait_h2d_stream(curr_buffer_metadata[1])
+            stream_manager.compute_streams_wait_launch_streams()
+            stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             grouped_gemm.grouped_gemm.backend.gmmfwd(
                 batch_sizes=tokens_per_expert_chunk,
                 a=grad_a_chunk,
@@ -325,8 +330,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
                 trans_a=False,
                 trans_b=True,
             )
-            stream_manager.h2d_stream_wait_compute_streams(curr_buffer_metadata[1])
-            stream_manager.default_stream_wait_compute_streams()
+            stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
+            stream_manager.launch_streams_wait_compute_streams()
             
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
@@ -378,7 +383,7 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             beta = 0.0
 
         # compute wgrad immediately if not delay_wgrad_compute or wgrad_scheduler is None
-        stream_manager.compute_streams_wait_default_stream()
+        stream_manager.compute_streams_wait_launch_streams()
         grad_w2 = grouped_gemm.grouped_gemm.backend.gmmbwd(
             s, 
             grad_y,
@@ -390,7 +395,7 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             alpha = alpha,
             beta = beta,
         )
-        stream_manager.default_stream_wait_compute_streams()
+        stream_manager.launch_streams_wait_compute_streams()
 
         OffloadingExpertsGroupedSwiMLP._wgrad_post_process(cpu_w2, wgrad_output, fuse_gradient_accumulation)
         return grad_w2
@@ -436,7 +441,7 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
 
         
         # compute wgrad immediately if not delay_wgrad_compute or wgrad_scheduler is None
-        stream_manager.compute_streams_wait_default_stream()
+        stream_manager.compute_streams_wait_launch_streams()
         grad_w1 = grouped_gemm.grouped_gemm.backend.gmmbwd(
             x,
             grad_a,
@@ -448,7 +453,7 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             alpha = alpha,
             beta = beta,
         )
-        stream_manager.default_stream_wait_compute_streams()
+        stream_manager.launch_streams_wait_compute_streams()
 
         # post process wgrad for ddp
         OffloadingExpertsGroupedSwiMLP._wgrad_post_process(cpu_w1, grad_w1, fuse_gradient_accumulation)
@@ -485,8 +490,21 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             else: # NOTE: fallback to non-batched copy if not pinned
                 for idx in range(experts_idx_start, experts_idx_end):
                     buf[idx - experts_idx_start].copy_(cpu_weights[idx].data, non_blocking=True)
-        
-        return (gpu_buffer_idx, h2d_stream_idx, experts_idx_start, experts_idx_end)
+
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(h2d_stream)
+
+        # NOTE: this is a temp solution to resolve a correctness issue encoutered
+        # when VPP is enabled
+        h2d_stream.synchronize()
+
+        return (
+            gpu_buffer_idx,
+            h2d_stream_idx,
+            experts_idx_start,
+            experts_idx_end,
+            copy_done_event,
+        )
     
     @staticmethod
     def forward(
