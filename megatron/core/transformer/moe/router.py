@@ -706,9 +706,9 @@ class TopKRouter(Router):
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
-        # if self.training:
-        #     with torch.no_grad():
-        #         tokens_per_expert = routing_map.sum(dim=0).float().cpu()
+        if self.training:
+            with torch.no_grad():
+                tokens_per_expert = routing_map.sum(dim=0).float().cpu()
 
         return probs, routing_map
 
