@@ -286,6 +286,35 @@ def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: b
     )
 
 
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_weight_decay_all_param(mock_get_world_size):
+    """With weight_decay_all_param=True, every parameter (including scalar/1d params such as
+    biases and norm weights) receives weight decay (wd_mult=1.0). No wd_mult=0.0 override is
+    registered, so all parameters collapse into a single param group."""
+
+    # Initialize the model with layernorm so we also cover norm weights.
+    net = Net(add_layernorm=True)
+
+    config = OptimizerConfig(optimizer='adam', lr=0.01, weight_decay_all_param=True)
+    config_overrides = get_standard_config_overrides(config=config)
+
+    # No weight-decay-skipping override should be registered.
+    assert config_overrides == {}
+
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    # All parameters share the default config, so there is exactly one param group.
+    assert len(param_groups) == 1
+    assert param_groups[0]['wd_mult'] == 1.0
+
+    p_set = set(net.parameters())
+    assert set(param_groups[0]['params']) == p_set
+    assert len(param_groups[0]['params']) == len(p_set)
+
+
 def test_chained_optimizer():
     net = Net()
     optimizer_1 = Adam(list(net.parameters())[:2], lr=0.01)
