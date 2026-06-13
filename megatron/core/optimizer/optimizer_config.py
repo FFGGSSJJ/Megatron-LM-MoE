@@ -165,6 +165,11 @@ class OptimizerConfig:
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
+    weight_decay_all_param: bool = False
+    """If true, apply weight decay to all parameters, including the scalar/1d parameters
+       (e.g. biases and norm weights) that Megatron skips by default. Takes precedence over
+       apply_wd_to_qk_layernorm."""
+
     ##############
     # Precision
     ##############
