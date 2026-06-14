@@ -428,9 +428,15 @@ def get_gpt_layer_local_submodules(
         backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
 
-    # Sandwich norm: a standalone norm on each sublayer output, before the residual add. Reuse the
-    # same (LayerNorm/RMSNorm) implementation already selected for the layer's other norms.
-    post_layer_norm = layer_norm if sandwich_norm else IdentityOp
+    # Sandwich norm: a standalone norm on each sublayer output, before the residual add. Built with
+    # has_residual=False: unlike the pre-norms it does not sit on the residual stream (the residual
+    # add happens after it, in the bias-dropout-add), so it must stay a plain single-tensor norm and
+    # not the residual-fused variant. Matches the model's LayerNorm/RMSNorm type.
+    post_layer_norm = (
+        backend.layer_norm(rms_norm=(normalization == "RMSNorm"), for_qk=False, has_residual=False)
+        if sandwich_norm
+        else IdentityOp
+    )
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
