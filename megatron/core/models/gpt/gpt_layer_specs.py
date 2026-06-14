@@ -77,12 +77,15 @@ def get_gpt_layer_with_inference_submodules(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    sandwich_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        sandwich_norm (bool, optional): Add a normalization to each sublayer's output before the
+            residual add (sandwich norm). Defaults to False.
     """
     assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
     backend = InferenceSpecProvider()
@@ -94,6 +97,9 @@ def get_gpt_layer_with_inference_submodules(
         use_te_op_fuser=False,
         use_te_activation_func=False,
     )
+
+    # Sandwich norm: a standalone norm on each sublayer output, before the residual add.
+    post_layer_norm = backend.layer_norm() if sandwich_norm else IdentityOp
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -125,9 +131,11 @@ def get_gpt_layer_with_inference_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=post_layer_norm,
             pre_mlp_layernorm=IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=post_layer_norm,
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
@@ -148,9 +156,11 @@ def get_gpt_layer_with_inference_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=post_layer_norm,
             pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=post_layer_norm,
             sharded_state_dict_keys_map={
                 "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                 "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -183,6 +193,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
+    sandwich_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -200,6 +211,8 @@ def get_gpt_layer_with_transformer_engine_submodules(
         mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
                                                layernorm when backend supports. Otherwise fall back
                                                to the unfused MLA.
+        sandwich_norm (bool, optional): Add a normalization to each sublayer's output before the
+                                        residual add (sandwich norm). Defaults to False.
 
     Returns:
         TransformerLayerSubmodules: TE modules to construct a TransformerLayer
@@ -232,6 +245,10 @@ def get_gpt_layer_with_transformer_engine_submodules(
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
     )
+
+    # Sandwich norm: a standalone norm on each sublayer output, before the residual add.
+    # TENorm picks LayerNorm/RMSNorm from config.normalization at build time.
+    post_layer_norm = backend.layer_norm() if sandwich_norm else IdentityOp
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -271,9 +288,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                post_self_attn_layernorm=post_layer_norm,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                post_mlp_layernorm=post_layer_norm,
                 sharded_state_dict_keys_map=(
                     {
                         "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
@@ -302,9 +321,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=post_layer_norm,
             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=post_layer_norm,
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
@@ -325,9 +346,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=post_layer_norm,
             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=post_layer_norm,
             sharded_state_dict_keys_map={
                 "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                 "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -359,6 +382,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    sandwich_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -370,6 +394,8 @@ def get_gpt_layer_local_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        sandwich_norm (bool, optional): Add a normalization to each sublayer's output before the
+            residual add (sandwich norm). Defaults to False.
 
     Returns:
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
@@ -402,6 +428,16 @@ def get_gpt_layer_local_submodules(
         backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
 
+    # Sandwich norm: a standalone norm on each sublayer output, before the residual add. Built with
+    # has_residual=False: unlike the pre-norms it does not sit on the residual stream (the residual
+    # add happens after it, in the bias-dropout-add), so it must stay a plain single-tensor norm and
+    # not the residual-fused variant. Matches the model's LayerNorm/RMSNorm type.
+    post_layer_norm = (
+        backend.layer_norm(rms_norm=(normalization == "RMSNorm"), for_qk=False, has_residual=False)
+        if sandwich_norm
+        else IdentityOp
+    )
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return TransformerLayerSubmodules(
@@ -422,9 +458,11 @@ def get_gpt_layer_local_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=post_layer_norm,
             pre_mlp_layernorm=layer_norm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=post_layer_norm,
         )
     else:
         return TransformerLayerSubmodules(
@@ -445,9 +483,11 @@ def get_gpt_layer_local_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=post_layer_norm,
             pre_mlp_layernorm=layer_norm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=post_layer_norm,
             sharded_state_dict_keys_map={
                 "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                 "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
@@ -568,6 +608,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            sandwich_norm=config.sandwich_norm,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -580,6 +621,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            sandwich_norm=config.sandwich_norm,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -587,6 +629,7 @@ def get_gpt_decoder_layer_specs(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             qk_l2_norm=qk_l2_norm,
+            sandwich_norm=config.sandwich_norm,
         )
         moe_layer_spec = get_gpt_layer_with_inference_spec(
             qk_layernorm=config.qk_layernorm,
@@ -595,6 +638,7 @@ def get_gpt_decoder_layer_specs(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            sandwich_norm=config.sandwich_norm,
         )
     else:
         layer_norm_impl = LNImpl
@@ -608,6 +652,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            sandwich_norm=config.sandwich_norm,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -619,6 +664,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            sandwich_norm=config.sandwich_norm,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

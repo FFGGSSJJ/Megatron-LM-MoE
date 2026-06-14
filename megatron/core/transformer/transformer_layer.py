@@ -213,6 +213,8 @@ class TransformerLayerSubmodules:
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
+        post_self_attn_layernorm: Specification for the (sandwich-norm) layer normalization applied
+            to the self-attention output before the residual add. Defaults to a no-op.
         pre_cross_attn_layernorm: Specification for the layer
             normalization before cross-attention.
         cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
@@ -223,6 +225,8 @@ class TransformerLayerSubmodules:
         mlp (Union[ModuleSpec, type]): Specification for the MLP in Dense layer.
         mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after the MLP.
+        post_mlp_layernorm: Specification for the (sandwich-norm) layer normalization applied to
+            the MLP output before the residual add. Defaults to a no-op.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
     """
@@ -230,6 +234,7 @@ class TransformerLayerSubmodules:
     input_layernorm: LayerNormBuilder = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_self_attn_layernorm: LayerNormBuilder = IdentityOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
@@ -238,6 +243,7 @@ class TransformerLayerSubmodules:
     pre_mlp_layernorm: LayerNormBuilder = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_mlp_layernorm: LayerNormBuilder = IdentityOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -335,6 +341,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
+        # [Module 3.5: Post SelfAttention Layernorm] Optional sandwich-norm applied to the
+        # self-attention output before the residual add. IdentityOp (no-op) unless enabled.
+        self.post_self_attn_layernorm = submodules.post_self_attn_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
             config=self.config,
@@ -398,6 +412,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
+
+        # [Module 9.5: Post MLP Layernorm] Optional sandwich-norm applied to the MLP output
+        # before the residual add. IdentityOp (no-op) unless enabled.
+        self.post_mlp_layernorm = submodules.post_mlp_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
@@ -525,6 +547,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
+    @staticmethod
+    def _apply_post_norm(output_with_bias, post_norm):
+        """Apply a sandwich-norm to a sublayer's output before the residual add.
+
+        ``output_with_bias`` is the ``(output, bias)`` pair produced by a sublayer (attention
+        or MLP). When sandwich norm is enabled, ``post_norm`` is a real normalization module:
+        the bias (if any) is folded into the output, the result is normalized, and
+        ``(normed, None)`` is returned so the downstream bias-dropout-add simply applies dropout
+        and the residual add, yielding ``residual + dropout(Norm(output + bias))``. When sandwich
+        norm is disabled, ``post_norm`` is an ``IdentityOp`` and the pair is returned unchanged,
+        preserving the fused bias-dropout-add path exactly (no extra work, no behavior change).
+        """
+        if isinstance(post_norm, IdentityOp):
+            return output_with_bias
+        output, bias = output_with_bias
+        if bias is not None:
+            output = output + bias
+        return apply_module(post_norm)(output), None
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -632,6 +673,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
+
+        # Optional sandwich norm: normalize the self-attention output before the residual add.
+        attention_output_with_bias = self._apply_post_norm(
+            attention_output_with_bias, self.post_self_attn_layernorm
+        )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -864,6 +910,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
             )
+
+        # Optional sandwich norm: normalize the MLP output before the residual add.
+        mlp_output_with_bias = self._apply_post_norm(
+            mlp_output_with_bias, self.post_mlp_layernorm
+        )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
