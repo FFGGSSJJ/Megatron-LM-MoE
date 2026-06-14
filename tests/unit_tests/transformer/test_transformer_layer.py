@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
@@ -313,3 +314,99 @@ def get_tensor_shapes_for_tp(transformer_config, tp_size):
         'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
         'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
     }
+
+
+def test_apply_post_norm_sandwich_norm_math():
+    """Unit-test the core sandwich-norm hook (CPU only, no model parallel / TE required).
+
+    When enabled, the hook must fold the bias into the sublayer output, normalize the result,
+    and drop the bias (so the downstream bias-dropout-add only adds the residual). When disabled
+    it must return the ``(output, bias)`` pair unchanged so the fused bias-dropout-add is intact.
+    """
+    torch.manual_seed(0)
+    hidden = 8
+    output = torch.randn(4, 2, hidden)
+    bias = torch.randn(hidden)
+    norm = torch.nn.LayerNorm(hidden)
+    norm.weight.data.normal_()
+    norm.bias.data.normal_()
+
+    # Disabled (IdentityOp): the (output, bias) pair is returned unchanged.
+    out_disabled, bias_disabled = TransformerLayer._apply_post_norm((output, bias), IdentityOp())
+    assert out_disabled is output
+    assert bias_disabled is bias
+
+    # Enabled with a bias: bias is folded in, output is normalized, bias is dropped.
+    out_enabled, bias_enabled = TransformerLayer._apply_post_norm((output, bias), norm)
+    assert bias_enabled is None
+    torch.testing.assert_close(out_enabled, norm(output + bias))
+
+    # Enabled without a bias: just normalize the output.
+    out_no_bias, bias_no_bias = TransformerLayer._apply_post_norm((output, None), norm)
+    assert bias_no_bias is None
+    torch.testing.assert_close(out_no_bias, norm(output))
+
+
+class TestSandwichNormTransformerLayer:
+    """Integration tests for the --sandwich-norm option (requires GPU + Transformer Engine)."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_layer(sandwich_norm):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            sandwich_norm=sandwich_norm,
+            use_cpu_initialization=True,
+        )
+        return TransformerLayer(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules(sandwich_norm=sandwich_norm),
+        )
+
+    def test_post_norms_wired(self):
+        # Disabled: both post-norms are no-ops.
+        off = self._build_layer(sandwich_norm=False)
+        assert isinstance(off.post_self_attn_layernorm, IdentityOp)
+        assert isinstance(off.post_mlp_layernorm, IdentityOp)
+
+        # Enabled: both post-norms are real normalization modules with their own parameters.
+        on = self._build_layer(sandwich_norm=True)
+        assert not isinstance(on.post_self_attn_layernorm, IdentityOp)
+        assert not isinstance(on.post_mlp_layernorm, IdentityOp)
+        assert sum(p.numel() for p in on.parameters()) > sum(p.numel() for p in off.parameters())
+
+    @pytest.mark.parametrize("sandwich_norm", [False, True])
+    def test_gpu_forward(self, sandwich_norm):
+        layer = self._build_layer(sandwich_norm=sandwich_norm).cuda()
+        config = layer.config
+        sequence_length, micro_batch_size = 32, 2
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size)).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+    def test_sandwich_norm_changes_output(self):
+        # Sandwich norm normalizes each sublayer's contribution, so the layer output must differ
+        # from the standard pre-norm layer given identical inputs and seeded weights.
+        sequence_length, micro_batch_size, hidden = 32, 2, 12
+        hidden_states = torch.rand((sequence_length, micro_batch_size, hidden)).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        model_parallel_cuda_manual_seed(123)
+        baseline = self._build_layer(sandwich_norm=False).cuda()
+        out_baseline, _ = baseline(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        model_parallel_cuda_manual_seed(123)
+        sandwiched = self._build_layer(sandwich_norm=True).cuda()
+        out_sandwiched, _ = sandwiched(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        assert not torch.allclose(out_baseline, out_sandwiched)
