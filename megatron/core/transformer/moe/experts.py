@@ -5,6 +5,7 @@ import logging
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from math import ceil
 from typing import Optional, Protocol, Tuple
 
@@ -13,7 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import squared_relu
+from megatron.core.activations import GatedPolyNorm, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -234,6 +235,17 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        # Gated PolyNorm replaces the GLU gate with a learnable module. The grouped path runs
+        # all local experts in one call, so we hold one coefficient pair per local expert and
+        # expand them per-token via tokens_per_expert (see GatedPolyNorm). tp_group is the
+        # expert-TP group, over which each expert's ffn is sharded when ETP > 1.
+        if self.config.gpn:
+            self.gated_polynorm = GatedPolyNorm(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+            )
+
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
             not_none(self.config.moe_ffn_hidden_size),
@@ -301,9 +313,15 @@ class TEGroupedMLP(MegatronModule):
             .to(intermediate_parallel.dtype)
         )
 
-    def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
+    def bias_act_func(
+        self, intermediate_parallel, bias_parallel, permuted_probs, tokens_per_expert=None
+    ):
         """
         Applies bias and activation function to the output of linear_fc1.
+
+        ``tokens_per_expert`` (the per-local-expert token counts of ``intermediate_parallel``)
+        is only used when ``config.gpn`` is set, to map each expert's GatedPolyNorm
+        coefficients onto its tokens.
         """
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
@@ -346,9 +364,11 @@ class TEGroupedMLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
+                    if self.config.gpn:
+                        gate = self.gated_polynorm(x_glu, tokens_per_expert)
+                    else:
+                        gate = self.config.activation_func(x_glu)
+                    return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
@@ -413,12 +433,19 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+                # Bind tokens_per_expert (a non-tensor) via partial so the checkpointed
+                # function still receives only tensor args.
                 bias_act_output = self.activation_checkpoint.checkpoint(
-                    self.bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    partial(self.bias_act_func, tokens_per_expert=tokens_per_expert),
+                    fc1_output,
+                    bias_parallel,
+                    permuted_probs,
                 )
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = self.bias_act_func(fc1_output, bias_parallel, permuted_probs)
+                bias_act_output = self.bias_act_func(
+                    fc1_output, bias_parallel, permuted_probs, tokens_per_expert
+                )
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
@@ -451,8 +478,22 @@ class TEGroupedMLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
+            module_sharded_offsets = sharded_offsets
+            if name == 'gated_polynorm' and not singleton_local_shards:
+                # The GatedPolyNorm coefficients are stored as a single (num_local_experts,)
+                # tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
+                # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
+                # mirroring how the expert weights are mapped to global experts. Without this,
+                # every EP rank would write the same key with identical offsets/replica_id and
+                # silently overwrite each other. (Note: this maps local->global experts for a
+                # fixed EP size; resharding the coefficients across a different EP size, or
+                # cross-loading them between TEGroupedMLP and SequentialMLP, is not supported.)
+                module_sharded_offsets = (
+                    *sharded_offsets,
+                    (len(sharded_offsets), self.ep_group.rank(), self.ep_group.size()),
+                )
             sub_sd = sharded_state_dict_default(
-                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+                module, f'{name}.', module_sharded_offsets, metadata, tp_group=self.tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts

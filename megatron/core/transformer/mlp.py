@@ -23,6 +23,7 @@ from megatron.core.fusions.fused_bias_geglu import (
     quick_gelu,
     weighted_bias_quick_geglu_impl,
 )
+from megatron.core.activations import GatedPolyNorm
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -228,6 +229,15 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        # Gated PolyNorm replaces the GLU gate with a learnable module. A dense MLP (and each
+        # SequentialMLP / shared expert, which are themselves MLPs) owns a single coefficient
+        # pair, so num_local_experts=1 here. tp_group is the group over which this MLP's ffn is
+        # sharded, so the norm can reduce feature statistics across it when TP > 1.
+        if self.config.gpn:
+            self.gated_polynorm = GatedPolyNorm(
+                num_local_experts=1, config=self.config, tp_group=self.tp_group
+            )
+
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
             not_none(
@@ -314,9 +324,11 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
+                    if self.config.gpn:
+                        gate = self.gated_polynorm(x_glu)
+                    else:
+                        gate = self.config.activation_func(x_glu)
+                    return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
