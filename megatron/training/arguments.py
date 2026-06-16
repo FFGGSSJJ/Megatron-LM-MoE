@@ -2025,6 +2025,9 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # defined explicitly as CLI arguments below
+        "gpn",
+        "sandwich_norm",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2095,17 +2098,14 @@ def _add_network_size_args(parser):
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--gpn', action='store_true',
-                       help='Replace the SiLU gate of SwiGLU with a learnable Gated PolyNorm '
-                       'gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). Implies gated linear '
-                       'units. Each MoE expert gets its own GatedPolyNorm coefficients. Not '
-                       'compatible with bias-activation fusion, TE activation, fp8/fp4, '
-                       'offloading experts, or inference-optimized transformer impl.')
+                       help='Replace the SiLU gate of SwiGLU with a learnable Gated PolyNorm: '
+                       'gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). Implies gated linear units. '
+                       'Each MoE expert gets its own GatedPolyNorm coefficients.')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
-                       'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))). '
-                       'Applies to the self-attention and MLP sublayers.')
+                       'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
