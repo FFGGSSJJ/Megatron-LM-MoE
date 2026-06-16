@@ -17,6 +17,7 @@ from megatron.core.transformer.moe.experts import (
     GroupedMLPSubmodules,
     InferenceGroupedMLP,
     SequentialMLP,
+    OffloadingExpertsMLP,
 )
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
@@ -86,7 +87,7 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
+    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False,) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         ...
 
@@ -130,8 +131,15 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module to use for attention"""
         return DotProductAttention
 
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
+    def grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool,
+        moe_use_offloading_experts: bool = False,
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
+        if moe_use_offloading_experts:
+            return partial(
+                OffloadingExpertsMLP,
+            )
         return partial(
             SequentialMLP,
             submodules=MLPSubmodules(

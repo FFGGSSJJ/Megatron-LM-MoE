@@ -232,12 +232,52 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 
+        def _allgather_helper_experts_param(params_list, group):
+            rank = get_pg_rank(group)
+            world_size = get_pg_size(group)
+            # fall back to the GPU path if there are no params or they aren't on CPU
+            if len(params_list[rank]) == 0 or params_list[rank][0].device.type != 'cpu':
+                _allgather_helper(params_list, group)
+                return
+
+            dest_device = torch.cuda.current_device()
+            dtype = params_list[rank][0].dtype
+
+            # Rank-by-rank broadcast through a single flat GPU scratch buffer
+            # to reduce peak GPU memory usage
+            for src_rank in range(world_size):
+                # the parameter shard holds by src_rank
+                shard = params_list[src_rank]
+                if len(shard) == 0:
+                    continue
+                flat_size = sum(p.numel() for p in shard)
+                buf = torch.empty(flat_size, device=dest_device, dtype=dtype)
+
+                if src_rank == rank:
+                    offset = 0
+                    for p in shard:
+                        n = p.numel()
+                        buf[offset:offset + n].copy_(p.data.view(-1))
+                        offset += n
+
+                src_global = torch.distributed.get_global_rank(group, src_rank)
+                torch.distributed.broadcast(buf, src=src_global, group=group)
+
+                if src_rank != rank:
+                    offset = 0
+                    for p in shard:
+                        n = p.numel()
+                        p.data.view(-1).copy_(buf[offset:offset + n])
+                        offset += n
+
+                del buf
+
         if self.pg_collection is None:
             return
         if self.dp_cp_params_list:
             _allgather_helper(self.dp_cp_params_list, self.pg_collection.dp_cp)
         if self.expt_dp_params_list:
-            _allgather_helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            _allgather_helper_experts_param(self.expt_dp_params_list, self.pg_collection.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):

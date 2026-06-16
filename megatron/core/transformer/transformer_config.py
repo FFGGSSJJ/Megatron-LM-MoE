@@ -731,6 +731,42 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_use_fp8_activation: bool = False
+    """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
+    be quantized into FP8 for storage."""
+
+    moe_use_inplace_fp8_param: bool = False
+    """Whether to use FP8 parameter for MoE layer. Specifically, MoE layer will use BF16 storage, 
+    but the weights will be quantized into FP8 for computation. Both transposed and non-transposed
+    weights will be saved."""
+
+    moe_use_extra_fp8_param_storage: bool = False
+    """Whether to use extra storage for FP8 parameters in MoE layer. This flag works with
+    moe_use_inplace_fp8_param. If True, MoE layer will use separate FP8 parameter storage in addition to the original BF16 parameter storage."""
+
+    moe_use_offloading_experts: bool = False
+    """Whether to use offloading experts for MoE."""
+
+    moe_offloading_num_chunks: int = 8
+    """Number of chunks to split the expert weights into for offloading. """
+
+    moe_offloading_num_stages: int = 2
+    """Number of pipeline stages to for loading and computation"""
+
+    moe_offloading_chunk_size: int = -1
+    """Chunk size for offloading. If set to a positive value, it will override the chunk size calculated"""
+
+    moe_offloading_experts_skip_post_backward_hook: bool = False
+    """Whether the offloading experts MLP should skip the post backward hook."""
+
+    moe_offloading_experts_debug_mode: bool = False
+    """Whether to enable debug mode for offloading experts, which will take the flow of GroupedMLP"""
+
+    moe_offloading_experts_te_style_init: bool = True
+    """Whether OffloadingExpertsMLP should initialize expert weights to match the TEGroupedMLP
+    path (GPU init under the expert-parallel CUDA RNG tracker) instead of the default CPU
+    master-weight init. When False (default), the original CPU-based initialization is used."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
