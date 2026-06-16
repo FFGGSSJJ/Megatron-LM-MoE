@@ -91,23 +91,26 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
-    # First, figure out how we are going to do wd skipping. The two main approaches are:
+    # First, figure out how we are going to do wd skipping. The main approaches are:
     #  1. The classic megatron approach of skipping all len 1 and bias parameters.
     #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
-    if config.apply_wd_to_qk_layernorm:
-        shape_1_not_qkln_param = ParamWithNamePredicate(
-            name="s1_not_qkln",
-            fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
-            and not ("q_layernorm." in name or "k_layernorm." in name),
-        )
-        param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
-    else:
-        param_length_1_match = ParamPredicate(
-            name="param_len_1", fn=lambda param: len(param.shape) == 1
-        )
-        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+    #  3. Applying weight decay to every parameter (weight_decay_all_param), in which case we
+    #     register no wd_mult=0.0 override at all. This takes precedence over 1 and 2.
+    if not config.weight_decay_all_param:
+        if config.apply_wd_to_qk_layernorm:
+            shape_1_not_qkln_param = ParamWithNamePredicate(
+                name="s1_not_qkln",
+                fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
+                and not ("q_layernorm." in name or "k_layernorm." in name),
+            )
+            param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
+        else:
+            param_length_1_match = ParamPredicate(
+                name="param_len_1", fn=lambda param: len(param.shape) == 1
+            )
+            param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
-    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+        config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}

@@ -2220,6 +2220,10 @@ def _add_regularization_args(parser):
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
+    group.add_argument('--weight-decay-all-param', action='store_true',
+                       help='Apply weight decay to all parameters, including the scalar/1d '
+                       'parameters (e.g. biases and norm weights) that are skipped by default. '
+                       'Takes precedence over --apply-wd-to-qk-layernorm.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,

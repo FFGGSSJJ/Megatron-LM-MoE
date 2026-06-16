@@ -220,6 +220,13 @@ class TransformerConfig(ModelParallelConfig):
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
+    sandwich_norm: bool = False
+    """If True, apply an extra `normalization`-type norm to each sublayer's output before it is
+    added back to the residual stream (a.k.a. sandwich norm / post-norm), so that each layer
+    computes `x = x + Norm(Sublayer(Norm(x)))`. This normalizes the residual-branch contribution
+    while leaving the residual stream itself untouched, which bounds activation growth in deep
+    networks. Applies to the self-attention and MLP sublayers."""
+
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
@@ -1075,6 +1082,14 @@ class TransformerConfig(ModelParallelConfig):
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+        if self.sandwich_norm and self.inference_fuse_tp_communication:
+            raise ValueError(
+                "sandwich_norm is not compatible with inference_fuse_tp_communication: the "
+                "fused TP inference kernel folds the residual add into the attention/MLP output "
+                "projection, leaving no point at which to normalize the sublayer output before "
+                "the residual add."
+            )
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(

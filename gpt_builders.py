@@ -137,12 +137,14 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            sandwich_norm=config.sandwich_norm,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
             config.qk_layernorm,
             config.multi_latent_attention,
             qk_l2_norm=config.qk_l2_norm,
+            sandwich_norm=config.sandwich_norm,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -156,4 +158,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            sandwich_norm=config.sandwich_norm,
         )
