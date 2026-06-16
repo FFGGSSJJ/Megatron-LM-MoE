@@ -20,7 +20,7 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP, OffloadingExpertsMLP
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
@@ -72,8 +72,12 @@ class TESpecProvider(BackendSpecProvider):
         """Which module to use for attention"""
         return TEDotProductAttention
 
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
+    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False,) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
+        if moe_use_grouped_gemm and moe_use_offloading_experts:
+            return partial(
+                OffloadingExpertsMLP,
+            )
         if moe_use_grouped_gemm and TEColumnParallelGroupedLinear is not None:
             return partial(
                 TEGroupedMLP,

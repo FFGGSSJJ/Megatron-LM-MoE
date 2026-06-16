@@ -20,6 +20,7 @@ def get_moe_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    moe_use_offloading_experts: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE.
 
@@ -37,7 +38,8 @@ def get_moe_module_spec(
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
-        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm,
+        moe_use_offloading_experts=moe_use_offloading_experts,
     )
 
 
@@ -46,6 +48,7 @@ def get_moe_module_spec_for_backend(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    moe_use_offloading_experts: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
     assert num_experts is not None
@@ -58,7 +61,10 @@ def get_moe_module_spec_for_backend(
         linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
     )
 
-    experts = backend.grouped_mlp_modules(moe_grouped_gemm is not None and moe_grouped_gemm)
+    experts = backend.grouped_mlp_modules(
+        moe_grouped_gemm is not None and moe_grouped_gemm,
+        moe_use_offloading_experts=moe_use_offloading_experts,
+    )
     # shared experts spec
     shared_experts = partial(SharedExpertMLP, submodules=mlp)
 

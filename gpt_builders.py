@@ -127,6 +127,7 @@ def _get_transformer_layer_spec(use_te, config):
         return get_gpt_layer_with_transformer_engine_spec(
             config.num_moe_experts,
             config.moe_grouped_gemm,
+            config.moe_use_offloading_experts,
             config.qk_layernorm,
             config.multi_latent_attention,
             config.experimental_attention_variant,
@@ -149,6 +150,7 @@ def _get_transformer_layer_spec(use_te, config):
         return get_gpt_layer_local_spec(
             config.num_moe_experts,
             config.moe_grouped_gemm,
+            config.moe_use_offloading_experts,
             config.qk_layernorm,
             config.multi_latent_attention,
             config.experimental_attention_variant,

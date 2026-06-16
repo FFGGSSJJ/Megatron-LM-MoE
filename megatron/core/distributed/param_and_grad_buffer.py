@@ -193,8 +193,10 @@ class _ParamAndGradBucketGroup:
         # responsible for, param_to_bucket maps params to the corresponding bucket.
         self.param_to_bucket = {}
         self.params = set()
+        self.is_expert_param_on_cpu = True
         for bucket in self.buckets:
             for param in bucket.params_list:
+                self.is_expert_param_on_cpu = self.is_expert_param_on_cpu and (param.device == torch.device("cpu"))
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
 
@@ -414,18 +416,93 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
+
+                    if bucket.param_data.device == torch.device("cpu"):
+                        continue
+                    else:
+                        dist_all_gather_func(
+                            bucket.param_data,
+                            local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
+                        )
+            
+            # handle CPU buckets outside the coalescing manager   
+            # NOTE: when overlap is disabled, to aoivd large GPU memory consumption we take
+            # a chunked all-gather approach for CPU buckets. 
+            # When overlap is enabled, As all device hold the buckets
+            # in the same order, it should be safe to launch sync all-gather by order
+            if self.ddp_config.overlap_grad_reduce:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_param_buffer_shard_list[idx] is None:
+                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]              
+                    if bucket.param_data.device == torch.device("cpu"):
+                        gpu_param = torch.empty_like(bucket.param_data, device=torch.cuda.current_device())
+                        gpu_local = local_data_view.to(torch.cuda.current_device(), non_blocking=False)
+                        torch.distributed.all_gather_into_tensor(
+                            gpu_param, 
+                            gpu_local, 
+                            group=self.intra_distributed_optimizer_instance_group
+                        )  # sync
+                        bucket.param_data.copy_(gpu_param, non_blocking=False)
+                        gpu_param.data.storage().resize_(0)
+                        gpu_local.data.storage().resize_(0)
+                        del gpu_param, gpu_local
+            else:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_param_buffer_shard_list[idx] is None:
+                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]                                                                                                                                                                
+                    if bucket.param_data.device == torch.device("cpu"):
+                        world = self.intra_distributed_optimizer_instance_size
+                        shard_numel = local_data_view.numel()
+                        # chunk = 1/8 of the per-rank shard -> 8 iterations, ~8x lower peak GPU memory usage
+                        num_chunks = 8
+                        chunk_shard = (shard_numel + num_chunks - 1) // num_chunks
+                        device = torch.cuda.current_device()
+                        dtype = bucket.param_data.dtype
+
+                        gs_buf = torch.empty(chunk_shard, dtype=dtype, device=device)
+                        gf_buf = torch.empty(chunk_shard * world, dtype=dtype, device=device) 
+
+                        flat_cpu = bucket.param_data.view(-1)
+                        local_flat = local_data_view.contiguous().view(-1)
+
+                        for off in range(0, shard_numel, chunk_shard):
+                            n = min(chunk_shard, shard_numel - off)
+                            gs = gs_buf[:n]
+                            gf = gf_buf[: n * world]
+                            gs.copy_(local_flat[off : off + n], non_blocking=False)
+                            torch.distributed.all_gather_into_tensor(
+                                gf,
+                                gs,
+                                group=self.intra_distributed_optimizer_instance_group,
+                            )  # sync
+                            gf_view = gf.view(world, n)
+                            for r in range(world):
+                                dst = r * shard_numel + off
+                                flat_cpu[dst : dst + n].copy_(gf_view[r], non_blocking=False)
+                        gs_buf.data.storage().resize_(0)
+                        gf_buf.data.storage().resize_(0)
+                        del gs_buf, gf_buf
+
             if async_op:
                 self.param_gather_handle = cm
             else:
-                # When using `_coalescing_manager`, even if a synchronous op
-                # (async_op=False) is used, `cm` is not None. Manually set to None for
-                # consistency with prior code.
+                # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
+                # `cm` is not None, which is different from when `_coalescing_manager` is not used in
+                # which case the torch.distributed._all_gather_base() will return None. In order to
+                # maintain consistency with prior code, we need to manually set communication handle to
+                # None.
                 self.param_gather_handle = None
         self.param_gather_dispatched = True
 
@@ -809,6 +886,11 @@ class _ParamAndGradBuffer:
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
 
+        # CPU weight
+        self.use_cpu_param_data = False
+        if self.params[0].device == torch.device("cpu"):
+            self.use_cpu_param_data = True
+
         # Check that params are unique.
         unique_params = set()
         for param, _ in params_with_names:
@@ -998,7 +1080,8 @@ class _ParamAndGradBuffer:
                     self.param_data = torch.zeros(
                         self.numel,
                         dtype=self.param_dtype,
-                        device=torch.cuda.current_device(),
+                        device="cpu" if self.use_cpu_param_data else torch.cuda.current_device(),
+                        pin_memory=self.use_cpu_param_data,
                         requires_grad=False,
                     )
                 self.grad_data = torch.zeros(

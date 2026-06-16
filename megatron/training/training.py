@@ -193,6 +193,9 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.experts_offloading_fp8_util import (
+    FP8ExpertsParameterManager,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -254,6 +257,7 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+import matplotlib.pyplot as plt
 
 
 def destroy_global_state():
@@ -986,6 +990,16 @@ def pretrain(
 
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
+
+    # Print model parallel ranks.
+    global_rank = torch.distributed.get_rank()                         
+    tp  = mpu.get_tensor_model_parallel_rank()                         
+    ep  = mpu.get_expert_model_parallel_rank()                         
+    dp  = mpu.get_data_parallel_rank(with_context_parallel=False)
+    edp = mpu.get_expert_data_parallel_rank() if hasattr(mpu,          
+    "get_expert_data_parallel_rank") else None                         
+    pp  = mpu.get_pipeline_model_parallel_rank()
+    print(f"[rank={global_rank}] tp={tp} ep={ep} dp={dp} edp={edp} pp={pp}", flush=True)
 
     # Context used for persisting some state between checkpoint saves.
     if args.non_persistent_ckpt_type == 'local':
@@ -1826,6 +1840,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
+        if args.moe_use_offloading_experts and args.moe_use_inplace_fp8_param:
+            FP8ExpertsParameterManager.create_instance(config)
+            FP8ExpertsParameterManager.mark_first_microbatch()
+
+
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
@@ -2052,6 +2071,11 @@ def training_log(
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
+            wandb_writer.log({
+                'consumed-samples': args.consumed_train_samples,
+                'consumed-tokens': args.consumed_train_samples * args.seq_length ,
+                },
+                iteration)
         if learning_rate is not None:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
@@ -2194,9 +2218,19 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        flops = num_floating_point_operations(args, batch_size)
+        total_flops = (flops) * iteration
+        throughput = flops / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
+
+        # Calculate MFU: 990 TFLOPs for GH200
+        mfu = throughput / (990) * 100
+
+        # Calculate tokens per second
+        tokens_per_iteration = args.global_batch_size * args.seq_length
+        tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+        tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2211,6 +2245,8 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        consumed_tokens = args.consumed_train_samples * args.seq_length / 1e9
+        log_string += ' consumed tokens: {:.3f}B |'.format(consumed_tokens)
         if has_rl_utils and args.rl_use_sequence_packing:
             log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
@@ -2219,12 +2255,19 @@ def training_log(
             elapsed_time_per_iteration * 1000.0
         )
         if args.log_throughput:
+            log_string += f' tokens per sec per GPU: {tokens_per_sec_per_gpu:.2f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            log_string += f' MFU: {mfu:.2f}% |'
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
+                    wandb_writer.log({'flops': total_flops}, iteration)
                     wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_writer.log({
+                        'iteration-time': elapsed_time_per_iteration,
+                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu
+                    }, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -2474,7 +2517,7 @@ def post_training_step_callbacks(
         and (len(args.profile_ranks) == 0 or
              torch.distributed.get_rank() in args.profile_ranks)
     ):
-        if args.use_pytorch_profiler:
+        if args.use_pytorch_profiler and iteration == args.profile_step_end:
             assert prof is not None
             prof.stop()
             if prof.execution_trace_observer is not None:
@@ -2488,6 +2531,7 @@ def post_training_step_callbacks(
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
+            torch.cuda.empty_cache()
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
@@ -2601,6 +2645,11 @@ def checkpoint_and_decide_exit(
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
+
+    if saved_checkpoint:
+        # checkpointing can sometimes bring extra memory consumption
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return False
 
@@ -2859,6 +2908,7 @@ def train(
             record_shapes=args.pytorch_profiler_collect_shapes,
             with_stack=args.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
+            activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]
         )
         prof.start()
 
@@ -2899,7 +2949,7 @@ def train(
                  torch.distributed.get_rank() in args.profile_ranks)):
             if args.use_pytorch_profiler:
                 prof.step()
-            elif iteration == args.profile_step_start:
+            if iteration == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()

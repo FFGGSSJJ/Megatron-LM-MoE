@@ -55,7 +55,6 @@ else:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
-
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
@@ -722,6 +721,7 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
