@@ -2973,6 +2973,14 @@ def _add_data_args(parser):
                        help='FIM PAD token')
     group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
                        help='FIM EOD token')
+    group.add_argument('--pretraining-packing-strategy', type=str, default='greedy',
+                       choices=['greedy', 'bfd'],
+                       help='Packing strategy for pre-training. '
+                            '"greedy" packs documents in shuffled order (current default). '
+                            '"bfd" (Best-Fit Decreasing) sorts by length for higher packing '
+                            'efficiency and don\'t cut the samples if < sequence_length.')
+    group.add_argument('--max-docs-per-bin', type=int, default=0,
+                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
     return parser
 
 

@@ -320,6 +320,8 @@ def core_gpt_dataset_config_from_args(args):
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
+        "pretraining_packing_strategy": args.pretraining_packing_strategy,
+        "max_docs_per_bin": args.max_docs_per_bin,
     }
 
     # add FIM args to the config
