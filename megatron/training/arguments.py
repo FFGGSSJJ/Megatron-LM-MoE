@@ -2027,6 +2027,7 @@ def _add_network_size_args(parser):
         "apply_rope_fusion",
         # defined explicitly as CLI arguments below
         "gpn",
+        "gpn_fusion",
         "sandwich_norm",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
@@ -2098,9 +2099,14 @@ def _add_network_size_args(parser):
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--gpn', action='store_true',
-                       help='Replace the SiLU gate of SwiGLU with a learnable Gated PolyNorm: '
-                       'gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). Implies gated linear units. '
-                       'Each MoE expert gets its own GatedPolyNorm coefficients.')
+                       help='Replace the SiLU gate of SwiGLU with a learnable 3rd-order Gated '
+                       'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3). '
+                       'Implies gated linear units. Each MoE expert gets its own GatedPolyNorm '
+                       'coefficients.')
+    group.add_argument('--no-gpn-fusion', action='store_false', dest='gpn_fusion',
+                       help='Disable the fused Triton kernel for --gpn and use the torch '
+                       'implementation instead (e.g. for debugging). The fused path is on by '
+                       'default and auto-falls-back on CPU / TP-sharded layers / missing Triton.')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
     group.add_argument('--sandwich-norm', action='store_true',

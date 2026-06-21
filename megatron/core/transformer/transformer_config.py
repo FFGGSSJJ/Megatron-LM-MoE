@@ -202,15 +202,24 @@ class TransformerConfig(ModelParallelConfig):
 
     gpn: bool = False
     """If True, replace the gate of the gated linear unit (e.g. SiLU in SwiGLU) with a learnable
-    Gated PolyNorm: ``GatedPolyNorm(x_glu) * x_linear`` where
-    ``GatedPolyNorm(x) = |a1| * RMSNorm(x) + |a2| * RMSNorm(x**2)``. Requires
-    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own ``(a1, a2)``
+    3rd-order Gated PolyNorm: ``GatedPolyNorm(x_glu) * x_linear`` where
+    ``GatedPolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3)``. Requires
+    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own ``(a1, a2, a3)``
     coefficients. The RMSNorm reduces over the ffn feature dimension and is made TP/ETP-invariant
     by all-reducing the feature statistics and the alpha gradients across the relevant
     tensor-parallel group, so any TP/ETP degree is supported. Not compatible with
     ``bias_activation_fusion``, ``use_te_activation_func``, fp8/fp4, the offloading-experts path,
     or ``transformer_impl='inference_optimized'`` (these assume the built-in fused SwiGLU/SiLU
     kernels)."""
+
+    gpn_fusion: bool = True
+    """If True (default), use the fused Triton kernel for Gated PolyNorm (``gpn=True``) — it fuses
+    the gate, the ``* x_linear`` and the optional ``* score`` (MoE probs / per-token scale) multiplies
+    into one pass, running close to SwiGLU speed and shape-agnostic over the MoE token count. The
+    fused path is used only on CUDA when the local ffn feature dim is whole on the rank
+    (``tp_size == 1``, e.g. ETP=1 experts); TP/ETP-sharded layers, CPU, or missing Triton fall back
+    to the torch implementation automatically regardless of this flag. Set False to force the torch
+    path (e.g. for debugging or bitwise comparison)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None

@@ -359,25 +359,37 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel, permuted_probs
             )
         else:
-            if self.config.gated_linear_unit:
+            # When GatedPolyNorm fuses the permuted_probs multiply into its kernel we skip the
+            # eager post-multiply below.
+            probs_fused = False
+            if self.config.gated_linear_unit and self.config.gpn:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.gated_polynorm(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit:
 
                 def glu(x):
                     x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    if self.config.gpn:
-                        gate = self.gated_polynorm(x_glu, tokens_per_expert)
-                    else:
-                        gate = self.config.activation_func(x_glu)
+                    gate = self.config.activation_func(x_glu)
                     return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
-            original_dtype = intermediate_parallel.dtype
-            intermediate_parallel = intermediate_parallel * permuted_probs
-            intermediate_parallel = intermediate_parallel.to(original_dtype)
+            if not probs_fused:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
         return intermediate_parallel
 
     def forward(
