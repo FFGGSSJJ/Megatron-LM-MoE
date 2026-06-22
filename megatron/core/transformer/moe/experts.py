@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import GatedPolyNorm, squared_relu
+from megatron.core.activations import PolyNorm, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -238,12 +238,12 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # Gated PolyNorm replaces the GLU gate with a learnable module. The grouped path runs
+        # PolyNorm GLU replaces the GLU gate with a learnable module. The grouped path runs
         # all local experts in one call, so we hold one coefficient pair per local expert and
-        # expand them per-token via tokens_per_expert (see GatedPolyNorm). tp_group is the
+        # expand them per-token via tokens_per_expert (see PolyNorm). tp_group is the
         # expert-TP group, over which each expert's ffn is sharded when ETP > 1.
-        if self.config.gpn:
-            self.gated_polynorm = GatedPolyNorm(
+        if self.config.pnglu:
+            self.polynorm_glu = PolyNorm(
                 num_local_experts=self.num_local_experts,
                 config=self.config,
                 tp_group=self.tp_group,
@@ -323,7 +323,7 @@ class TEGroupedMLP(MegatronModule):
         Applies bias and activation function to the output of linear_fc1.
 
         ``tokens_per_expert`` (the per-local-expert token counts of ``intermediate_parallel``)
-        is only used when ``config.gpn`` is set, to map each expert's GatedPolyNorm
+        is only used when ``config.pnglu`` is set, to map each expert's PolyNorm
         coefficients onto its tokens.
         """
         if self.config.use_te_activation_func:
@@ -360,25 +360,37 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel, permuted_probs
             )
         else:
-            if self.config.gated_linear_unit:
+            # When PolyNorm fuses the permuted_probs multiply into its kernel we skip the
+            # eager post-multiply below.
+            probs_fused = False
+            if self.config.gated_linear_unit and self.config.pnglu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.polynorm_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit:
 
                 def glu(x):
                     x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    if self.config.gpn:
-                        gate = self.gated_polynorm(x_glu, tokens_per_expert)
-                    else:
-                        gate = self.config.activation_func(x_glu)
+                    gate = self.config.activation_func(x_glu)
                     return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
-            original_dtype = intermediate_parallel.dtype
-            intermediate_parallel = intermediate_parallel * permuted_probs
-            intermediate_parallel = intermediate_parallel.to(original_dtype)
+            if not probs_fused:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
         return intermediate_parallel
 
     def forward(
@@ -482,8 +494,8 @@ class TEGroupedMLP(MegatronModule):
         sharded_state_dict = {}
         for name, module in self._modules.items():
             module_sharded_offsets = sharded_offsets
-            if name == 'gated_polynorm' and not singleton_local_shards:
-                # The GatedPolyNorm coefficients are stored as a single (num_local_experts,)
+            if name == 'polynorm_glu' and not singleton_local_shards:
+                # The PolyNorm coefficients are stored as a single (num_local_experts,)
                 # tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
                 # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
                 # mirroring how the expert weights are mapped to global experts. Without this,

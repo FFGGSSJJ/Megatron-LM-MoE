@@ -23,7 +23,7 @@ from megatron.core.fusions.fused_bias_geglu import (
     quick_gelu,
     weighted_bias_quick_geglu_impl,
 )
-from megatron.core.activations import GatedPolyNorm
+from megatron.core.activations import PolyNorm
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -229,12 +229,12 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # Gated PolyNorm replaces the GLU gate with a learnable module. A dense MLP (and each
+        # PolyNorm GLU replaces the GLU gate with a learnable module. A dense MLP (and each
         # SequentialMLP / shared expert, which are themselves MLPs) owns a single coefficient
         # pair, so num_local_experts=1 here. tp_group is the group over which this MLP's ffn is
         # sharded, so the norm can reduce feature statistics across it when TP > 1.
-        if self.config.gpn:
-            self.gated_polynorm = GatedPolyNorm(
+        if self.config.pnglu:
+            self.polynorm_glu = PolyNorm(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
             )
 
@@ -317,24 +317,34 @@ class MLP(MegatronModule):
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
-            if self.config.gated_linear_unit:
+            # When PolyNorm fuses the per_token_scale multiply into its kernel we skip the
+            # eager post-multiply below (the fc2-bias scaling further down still uses per_token_scale).
+            scale_fused = False
+            if self.config.gated_linear_unit and self.config.pnglu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.polynorm_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit:
 
                 def glu(x):
                     x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    if self.config.gpn:
-                        gate = self.gated_polynorm(x_glu)
-                    else:
-                        gate = self.config.activation_func(x_glu)
+                    gate = self.config.activation_func(x_glu)
                     return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
-            if per_token_scale is not None:
+            if per_token_scale is not None and not scale_fused:
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)

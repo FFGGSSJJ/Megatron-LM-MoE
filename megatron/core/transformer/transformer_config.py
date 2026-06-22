@@ -200,10 +200,10 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu."""
 
-    gpn: bool = False
+    pnglu: bool = False
     """If True, replace the gate of the gated linear unit (e.g. SiLU in SwiGLU) with a learnable
-    Gated PolyNorm: ``GatedPolyNorm(x_glu) * x_linear`` where
-    ``GatedPolyNorm(x) = |a1| * RMSNorm(x) + |a2| * RMSNorm(x**2)``. Requires
+    2nd-order PolyNorm GLU: ``PolyNorm(x_glu) * x_linear`` where
+    ``PolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2)``. Requires
     ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own ``(a1, a2)``
     coefficients. The RMSNorm reduces over the ffn feature dimension and is made TP/ETP-invariant
     by all-reducing the feature statistics and the alpha gradients across the relevant
@@ -211,6 +211,15 @@ class TransformerConfig(ModelParallelConfig):
     ``bias_activation_fusion``, ``use_te_activation_func``, fp8/fp4, the offloading-experts path,
     or ``transformer_impl='inference_optimized'`` (these assume the built-in fused SwiGLU/SiLU
     kernels)."""
+
+    pnglu_fusion: bool = True
+    """If True (default), use the fused Triton kernel for PolyNorm GLU (``pnglu=True``) — it fuses
+    the gate, the ``* x_linear`` and the optional ``* score`` (MoE probs / per-token scale) multiplies
+    into one pass, running close to SwiGLU speed and shape-agnostic over the MoE token count. The
+    fused path is used only on CUDA when the local ffn feature dim is whole on the rank
+    (``tp_size == 1``, e.g. ETP=1 experts); TP/ETP-sharded layers, CPU, or missing Triton fall back
+    to the torch implementation automatically regardless of this flag. Set False to force the torch
+    path (e.g. for debugging or bitwise comparison)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -1235,39 +1244,39 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        # Gated PolyNorm (gpn): the GLU gate becomes a small learnable module, so the fused /
+        # PolyNorm GLU (pnglu): the GLU gate becomes a small learnable module, so the fused /
         # TE / quantized activation kernels (which hardcode SiLU/GELU) cannot be used.
-        if self.gpn:
+        if self.pnglu:
             if not self.gated_linear_unit:
                 raise ValueError(
-                    "gpn=True requires gated_linear_unit=True (it replaces the GLU gate)."
+                    "pnglu=True requires gated_linear_unit=True (it replaces the GLU gate)."
                 )
             if self.bias_activation_fusion:
                 raise ValueError(
-                    "gpn=True is incompatible with bias_activation_fusion: the fused SwiGLU/GeGLU "
+                    "pnglu=True is incompatible with bias_activation_fusion: the fused SwiGLU/GeGLU "
                     "kernel hardcodes the activation. Disable bias-activation fusion "
                     "(e.g. --no-bias-swiglu-fusion)."
                 )
             if self.use_te_activation_func:
-                raise ValueError("gpn=True is incompatible with use_te_activation_func.")
+                raise ValueError("pnglu=True is incompatible with use_te_activation_func.")
             if self.fp8 is not None or self.fp4 is not None:
                 raise ValueError(
-                    "gpn=True is not supported with fp8/fp4: the quantized grouped-expert path "
+                    "pnglu=True is not supported with fp8/fp4: the quantized grouped-expert path "
                     "pads tokens_per_expert and applies fused activation kernels."
                 )
             if self.use_fused_weighted_squared_relu:
-                raise ValueError("gpn=True is incompatible with use_fused_weighted_squared_relu.")
+                raise ValueError("pnglu=True is incompatible with use_fused_weighted_squared_relu.")
             if self.moe_use_offloading_experts:
                 raise ValueError(
-                    "gpn=True is not supported with moe_use_offloading_experts (the offloading "
+                    "pnglu=True is not supported with moe_use_offloading_experts (the offloading "
                     "experts use custom fused SwiGLU CUDA kernels)."
                 )
             if self.transformer_impl == "inference_optimized":
                 raise ValueError(
-                    "gpn=True is not supported with transformer_impl='inference_optimized' "
+                    "pnglu=True is not supported with transformer_impl='inference_optimized' "
                     "(the FlashInfer / mcore fused MoE kernels hardcode the activation type)."
                 )
-            # NOTE: GatedPolyNorm reduces over the (TP/ETP-sharded) ffn feature dimension, but it
+            # NOTE: PolyNorm reduces over the (TP/ETP-sharded) ffn feature dimension, but it
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
