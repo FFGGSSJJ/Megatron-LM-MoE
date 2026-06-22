@@ -202,9 +202,9 @@ class TransformerConfig(ModelParallelConfig):
 
     pnglu: bool = False
     """If True, replace the gate of the gated linear unit (e.g. SiLU in SwiGLU) with a learnable
-    3rd-order PolyNorm GLU: ``PolyNorm(x_glu) * x_linear`` where
-    ``PolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3)``. Requires
-    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own ``(a1, a2, a3)``
+    2nd-order PolyNorm GLU: ``PolyNorm(x_glu) * x_linear`` where
+    ``PolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2)``. Requires
+    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own ``(a1, a2)``
     coefficients. The RMSNorm reduces over the ffn feature dimension and is made TP/ETP-invariant
     by all-reducing the feature statistics and the alpha gradients across the relevant
     tensor-parallel group, so any TP/ETP degree is supported. Not compatible with

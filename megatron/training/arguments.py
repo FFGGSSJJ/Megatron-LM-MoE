@@ -2099,8 +2099,8 @@ def _add_network_size_args(parser):
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--pnglu', action='store_true',
-                       help='Replace the SiLU gate of SwiGLU with a learnable 3rd-order Gated '
-                       'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3). '
+                       help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
+                       'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '
                        'Implies gated linear units. Each MoE expert gets its own PolyNorm '
                        'coefficients.')
     group.add_argument('--no-pnglu-fusion', action='store_false', dest='pnglu_fusion',

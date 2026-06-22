@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""Tests for the fused 3rd-order PolyNorm GLU Triton kernel.
+"""Tests for the fused 2nd-order PolyNorm GLU Triton kernel.
 
 Validates the fused forward + backward against an independent torch-autograd reference (dense and
 grouped/per-expert), and independently checks the backward with finite differences. Requires CUDA +
@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 EPS = 1e-6
 
 
-def _ref(x_glu, x_linear, a1, a2, a3, eps=EPS, score=None):
+def _ref(x_glu, x_linear, a1, a2, eps=EPS, score=None):
     """Pure-torch reference: gate(x_glu) * x_linear * [score], fp32 math cast to input dtype."""
 
     def col(a):
@@ -34,7 +34,7 @@ def _ref(x_glu, x_linear, a1, a2, a3, eps=EPS, score=None):
         return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
 
     xf = x_glu.float()
-    gate = col(a1) * norm(xf) + col(a2) * norm(xf * xf) + col(a3) * norm(xf * xf * xf)
+    gate = col(a1) * norm(xf) + col(a2) * norm(xf * xf)
     out = gate * x_linear.float()
     if score is not None:
         out = out * score.float().reshape(-1, 1)
@@ -50,24 +50,23 @@ def _tols(dtype):
 @pytest.mark.parametrize("use_score", [False, True])
 @pytest.mark.parametrize("shape", [(16, 64), (128, 1024), (37, 257)])
 def test_fused_matches_reference(dtype, use_score, shape):
-    """Dense case: fused fwd + grads (dX, dM, dα1/2/3, dscore) match the torch reference."""
+    """Dense case: fused fwd + grads (dX, dM, dα1/2, dscore) match the torch reference."""
     M, D = shape
     torch.manual_seed(0)
     x = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
     m = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
     a1 = torch.rand(1, device="cuda", requires_grad=True)
     a2 = torch.rand(1, device="cuda", requires_grad=True)
-    a3 = torch.rand(1, device="cuda", requires_grad=True)
     score = torch.rand(M, 1, device="cuda", requires_grad=True) if use_score else None
     g = torch.randn(M, D, dtype=dtype, device="cuda")
 
     def clones(*ts):
         return [t.detach().clone().requires_grad_(t.requires_grad) if t is not None else None for t in ts]
 
-    xf, mf, a1f, a2f, a3f, scf = clones(x, m, a1, a2, a3, score)
+    xf, mf, a1f, a2f, scf = clones(x, m, a1, a2, score)
 
-    y_fused = fused_polynorm_glu_impl(x, m, a1, a2, a3, EPS, score)
-    y_ref = _ref(xf, mf, a1f, a2f, a3f, score=scf)
+    y_fused = fused_polynorm_glu_impl(x, m, a1, a2, EPS, score)
+    y_ref = _ref(xf, mf, a1f, a2f, score=scf)
 
     tols = _tols(dtype)
     assert y_fused.dtype == y_ref.dtype
@@ -82,7 +81,6 @@ def test_fused_matches_reference(dtype, use_score, shape):
     atol_a = dict(rtol=1e-4, atol=1e-4) if dtype == torch.float32 else dict(rtol=3e-2, atol=3e-2)
     assert torch.allclose(a1.grad, a1f.grad, **atol_a), ("dA1", a1.grad, a1f.grad)
     assert torch.allclose(a2.grad, a2f.grad, **atol_a), ("dA2", a2.grad, a2f.grad)
-    assert torch.allclose(a3.grad, a3f.grad, **atol_a), ("dA3", a3.grad, a3f.grad)
     if use_score:
         assert torch.allclose(score.grad, scf.grad, **tols), ("dS", (score.grad - scf.grad).abs().max())
 
@@ -94,20 +92,20 @@ def test_fused_backward_finite_difference():
     M, D = 4, 16
     x = torch.randn(M, D, dtype=torch.float64, device="cuda")
     m = torch.randn(M, D, dtype=torch.float64, device="cuda")
-    a = [torch.rand(1, dtype=torch.float64, device="cuda") for _ in range(3)]
+    a = [torch.rand(1, dtype=torch.float64, device="cuda") for _ in range(2)]
     score = torch.rand(M, 1, dtype=torch.float64, device="cuda")
 
     # The kernel runs in fp32; compute fp32 analytic grads and compare to fp32-input finite diffs.
     def fwd(x_, m_, a_, s_):
         return fused_polynorm_glu_impl(
-            x_.float(), m_.float(), a_[0].float(), a_[1].float(), a_[2].float(), EPS, s_.float()
+            x_.float(), m_.float(), a_[0].float(), a_[1].float(), EPS, s_.float()
         )
 
     xv = x.float().requires_grad_(True)
     mv = m.float().requires_grad_(True)
     av = [ai.float().requires_grad_(True) for ai in a]
     sv = score.float().requires_grad_(True)
-    out = fused_polynorm_glu_impl(xv, mv, av[0], av[1], av[2], EPS, sv)
+    out = fused_polynorm_glu_impl(xv, mv, av[0], av[1], EPS, sv)
     gout = torch.randn_like(out)
     out.backward(gout)
 
@@ -133,13 +131,13 @@ def test_fused_backward_finite_difference():
     dX_fd = fd_tensor(x, lambda: loss(x, m, a, score).item())
     dM_fd = fd_tensor(m, lambda: loss(x, m, a, score).item())
     dS_fd = fd_tensor(score, lambda: loss(x, m, a, score).item())
-    dA_fd = [fd_tensor(a[k], lambda: loss(x, m, a, score).item()) for k in range(3)]
+    dA_fd = [fd_tensor(a[k], lambda: loss(x, m, a, score).item()) for k in range(2)]
 
     fd_tol = dict(rtol=2e-2, atol=2e-3)
     assert torch.allclose(xv.grad.double(), dX_fd, **fd_tol), (xv.grad.double() - dX_fd).abs().max()
     assert torch.allclose(mv.grad.double(), dM_fd, **fd_tol), (mv.grad.double() - dM_fd).abs().max()
     assert torch.allclose(sv.grad.double(), dS_fd, **fd_tol), (sv.grad.double() - dS_fd).abs().max()
-    for k in range(3):
+    for k in range(2):
         assert torch.allclose(av[k].grad.double(), dA_fd[k], **fd_tol), (k, av[k].grad, dA_fd[k])
 
 
@@ -153,11 +151,10 @@ def test_module_dense_uses_fused(dtype):
     m = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
     mod = PolyNorm(num_local_experts=1, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
     out = mod(x, m)
-    a = mod.alpha1.detach().abs()
-    ref = _ref(x.detach(), m.detach(), a, mod.alpha2.detach().abs(), mod.alpha3.detach().abs())
+    ref = _ref(x.detach(), m.detach(), mod.alpha_1.detach().abs(), mod.alpha_2.detach().abs())
     assert torch.allclose(out, ref, **_tols(dtype)), (out - ref).abs().max()
     out.sum().backward()
-    assert x.grad is not None and mod.alpha1.grad is not None
+    assert x.grad is not None and mod.alpha_1.grad is not None
 
 
 @pytest.mark.internal
@@ -173,17 +170,15 @@ def test_module_grouped_matches_reference(dtype):
     probs = torch.rand(Mt, 1, device="cuda", requires_grad=True)
     mod = PolyNorm(num_local_experts=E, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
     with torch.no_grad():
-        mod.alpha1.copy_(torch.tensor([0.1, 0.3, 0.5], device="cuda").to(dtype))
-        mod.alpha2.copy_(torch.tensor([0.2, 0.4, 0.6], device="cuda").to(dtype))
-        mod.alpha3.copy_(torch.tensor([0.15, 0.25, 0.35], device="cuda").to(dtype))
+        mod.alpha_1.copy_(torch.tensor([0.1, 0.3, 0.5], device="cuda").to(dtype))
+        mod.alpha_2.copy_(torch.tensor([0.2, 0.4, 0.6], device="cuda").to(dtype))
     out = mod(x, m, tokens_per_expert=tpe, scores=probs)
 
     tpe_t = torch.tensor(tpe, device="cuda")
-    a1 = torch.repeat_interleave(mod.alpha1.detach().abs(), tpe_t)
-    a2 = torch.repeat_interleave(mod.alpha2.detach().abs(), tpe_t)
-    a3 = torch.repeat_interleave(mod.alpha3.detach().abs(), tpe_t)
-    ref = _ref(x.detach(), m.detach(), a1, a2, a3, score=probs.detach())
+    a1 = torch.repeat_interleave(mod.alpha_1.detach().abs(), tpe_t)
+    a2 = torch.repeat_interleave(mod.alpha_2.detach().abs(), tpe_t)
+    ref = _ref(x.detach(), m.detach(), a1, a2, score=probs.detach())
     assert torch.allclose(out, ref, **_tols(dtype)), (out - ref).abs().max()
     out.sum().backward()
-    assert mod.alpha1.grad.shape == (E,)
+    assert mod.alpha_1.grad.shape == (E,)
     assert x.grad is not None and probs.grad is not None
