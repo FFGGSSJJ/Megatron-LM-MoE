@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""Fused Triton kernels for the 3rd-order Gated PolyNorm GLU activation.
+"""Fused Triton kernels for the 3rd-order PolyNorm GLU activation.
 
 For a token row ``x`` (the GLU gate half) and ``m`` (the GLU linear half ``x_linear``) this computes,
 in a single pass over the ffn feature dimension ``D``::
@@ -10,12 +10,12 @@ in a single pass over the ffn feature dimension ``D``::
 
 It fuses the gate (a feature-wise RMS-style reduction), the GLU multiply by ``x_linear`` and the
 optional per-token ``score`` (MoE router probs / per-token scale) multiply into one kernel, mirroring
-the SwiGLU fusion in ``fused_bias_swiglu.py`` so Gated PolyNorm runs close to SwiGLU throughput. The
+the SwiGLU fusion in ``fused_bias_swiglu.py`` so PolyNorm GLU runs close to SwiGLU throughput. The
 grid is over token rows, so the kernel is shape-agnostic in the token count (no torch.compile-style
 recompiles on the variable-token MoE path).
 
 The coefficients ``a1/a2/a3`` are passed *per token* (shape ``(M,)``, contiguous); the owning module
-(:class:`~megatron.core.activations.GatedPolyNorm`) expands its per-expert coefficients to per-token
+(:class:`~megatron.core.activations.PolyNorm`) expands its per-expert coefficients to per-token
 before calling, so this kernel serves both the dense and the grouped-expert paths with one code path.
 ``abs()`` on the coefficients is applied by the module *outside* the autograd Function, so the
 gradients returned here are w.r.t. the already-positive coefficients (torch's ``abs`` backward then
@@ -33,7 +33,7 @@ try:
     import triton.language as tl
 
     # Triton requires a CUDA device; on CPU-only boxes we keep the module importable but route all
-    # real work to the torch fallback in GatedPolyNorm.
+    # real work to the torch fallback in PolyNorm.
     HAVE_TRITON = torch.cuda.is_available()
 except ImportError:
     HAVE_TRITON = False
@@ -63,7 +63,7 @@ def _num_warps_for(block_size: int) -> int:
 
 
 @triton.jit
-def _gated_polynorm_glu_fwd_kernel(
+def _polynorm_glu_fwd_kernel(
     out_ptr,  # (M, D) output
     inv_ptr,  # (M, 3) fp32, saved inverse-RMS per order for backward
     x_ptr,  # (M, D) gate half (x_glu)
@@ -118,7 +118,7 @@ def _gated_polynorm_glu_fwd_kernel(
 
 
 @triton.jit
-def _gated_polynorm_glu_bwd_kernel(
+def _polynorm_glu_bwd_kernel(
     dx_ptr,  # (M, D) grad w.r.t. x_glu
     dm_ptr,  # (M, D) grad w.r.t. x_linear
     da1_ptr,  # (M,) fp32 per-token grad for a1
@@ -207,8 +207,8 @@ def _gated_polynorm_glu_bwd_kernel(
         tl.store(dscore_ptr + row, tl.sum(dout * gate * m, axis=0))
 
 
-class FusedGatedPolyNormFunction(torch.autograd.Function):
-    """Autograd wrapper around the fused 3rd-order Gated PolyNorm GLU Triton kernels.
+class FusedPolyNormGLUFunction(torch.autograd.Function):
+    """Autograd wrapper around the fused 3rd-order PolyNorm GLU Triton kernels.
 
     Inputs are 2D ``(M, D)`` (the caller flattens leading dims). ``a1/a2/a3`` are positive per-token
     coefficients of shape ``(M,)``; ``score`` is an optional per-token multiplier of shape ``(M,)``.
@@ -223,7 +223,7 @@ class FusedGatedPolyNormFunction(torch.autograd.Function):
         score_arg = score if has_score else x_glu  # dummy pointer when unused
 
         block = triton.next_power_of_2(D)
-        _gated_polynorm_glu_fwd_kernel[(M,)](
+        _polynorm_glu_fwd_kernel[(M,)](
             out,
             inv,
             x_glu,
@@ -278,7 +278,7 @@ class FusedGatedPolyNormFunction(torch.autograd.Function):
             score_arg = x_glu  # dummy pointer
 
         block = triton.next_power_of_2(D)
-        _gated_polynorm_glu_bwd_kernel[(M,)](
+        _polynorm_glu_bwd_kernel[(M,)](
             dx,
             dm,
             da1,
@@ -314,7 +314,7 @@ class FusedGatedPolyNormFunction(torch.autograd.Function):
         return dx, dm, da1, da2, da3, None, (dscore if has_score else None)
 
 
-def fused_gated_polynorm_glu_impl(
+def fused_polynorm_glu_impl(
     x_glu: torch.Tensor,
     x_linear: torch.Tensor,
     a1: torch.Tensor,
@@ -323,7 +323,7 @@ def fused_gated_polynorm_glu_impl(
     eps: float,
     score: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused 3rd-order Gated PolyNorm GLU: ``gate(x_glu) * x_linear * [score]``.
+    """Fused 3rd-order PolyNorm GLU: ``gate(x_glu) * x_linear * [score]``.
 
     Args:
         x_glu, x_linear: ``(..., D)`` gate / linear halves of the fc1 output (same shape & dtype).
@@ -356,5 +356,5 @@ def fused_gated_polynorm_glu_impl(
     if score is not None:
         score2 = score.reshape(-1)
 
-    out = FusedGatedPolyNormFunction.apply(x2, m2, a1, a2, a3, eps, score2)
+    out = FusedPolyNormGLUFunction.apply(x2, m2, a1, a2, a3, eps, score2)
     return out.reshape(ori_shape)

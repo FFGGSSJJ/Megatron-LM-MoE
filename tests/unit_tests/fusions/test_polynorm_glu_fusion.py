@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""Tests for the fused 3rd-order Gated PolyNorm GLU Triton kernel.
+"""Tests for the fused 3rd-order PolyNorm GLU Triton kernel.
 
 Validates the fused forward + backward against an independent torch-autograd reference (dense and
 grouped/per-expert), and independently checks the backward with finite differences. Requires CUDA +
@@ -9,11 +9,11 @@ cluster GPU.
 import pytest
 import torch
 
-from megatron.core.activations import GatedPolyNorm
-from megatron.core.fusions.fused_gated_polynorm import (
+from megatron.core.activations import PolyNorm
+from megatron.core.fusions.fused_polynorm_glu import (
     HAVE_TRITON,
-    FusedGatedPolyNormFunction,
-    fused_gated_polynorm_glu_impl,
+    FusedPolyNormGLUFunction,
+    fused_polynorm_glu_impl,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -66,7 +66,7 @@ def test_fused_matches_reference(dtype, use_score, shape):
 
     xf, mf, a1f, a2f, a3f, scf = clones(x, m, a1, a2, a3, score)
 
-    y_fused = fused_gated_polynorm_glu_impl(x, m, a1, a2, a3, EPS, score)
+    y_fused = fused_polynorm_glu_impl(x, m, a1, a2, a3, EPS, score)
     y_ref = _ref(xf, mf, a1f, a2f, a3f, score=scf)
 
     tols = _tols(dtype)
@@ -99,7 +99,7 @@ def test_fused_backward_finite_difference():
 
     # The kernel runs in fp32; compute fp32 analytic grads and compare to fp32-input finite diffs.
     def fwd(x_, m_, a_, s_):
-        return fused_gated_polynorm_glu_impl(
+        return fused_polynorm_glu_impl(
             x_.float(), m_.float(), a_[0].float(), a_[1].float(), a_[2].float(), EPS, s_.float()
         )
 
@@ -107,7 +107,7 @@ def test_fused_backward_finite_difference():
     mv = m.float().requires_grad_(True)
     av = [ai.float().requires_grad_(True) for ai in a]
     sv = score.float().requires_grad_(True)
-    out = fused_gated_polynorm_glu_impl(xv, mv, av[0], av[1], av[2], EPS, sv)
+    out = fused_polynorm_glu_impl(xv, mv, av[0], av[1], av[2], EPS, sv)
     gout = torch.randn_like(out)
     out.backward(gout)
 
@@ -146,24 +146,24 @@ def test_fused_backward_finite_difference():
 @pytest.mark.internal
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_module_dense_uses_fused(dtype):
-    """GatedPolyNorm module (dense) on CUDA matches the reference and routes to the fused path."""
+    """PolyNorm module (dense) on CUDA matches the reference and routes to the fused path."""
     M, D = 64, 256
     torch.manual_seed(2)
     x = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
     m = torch.randn(M, D, dtype=dtype, device="cuda", requires_grad=True)
-    mod = GatedPolyNorm(num_local_experts=1, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
+    mod = PolyNorm(num_local_experts=1, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
     out = mod(x, m)
-    a = mod.alpha_p1.detach().abs()
-    ref = _ref(x.detach(), m.detach(), a, mod.alpha_p2.detach().abs(), mod.alpha_p3.detach().abs())
+    a = mod.alpha1.detach().abs()
+    ref = _ref(x.detach(), m.detach(), a, mod.alpha2.detach().abs(), mod.alpha3.detach().abs())
     assert torch.allclose(out, ref, **_tols(dtype)), (out - ref).abs().max()
     out.sum().backward()
-    assert x.grad is not None and mod.alpha_p1.grad is not None
+    assert x.grad is not None and mod.alpha1.grad is not None
 
 
 @pytest.mark.internal
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_module_grouped_matches_reference(dtype):
-    """GatedPolyNorm module (grouped, per-expert coeffs + probs) matches the reference."""
+    """PolyNorm module (grouped, per-expert coeffs + probs) matches the reference."""
     E = 3
     tpe = [5, 0, 11]  # include an empty expert
     Mt, D = sum(tpe), 128
@@ -171,19 +171,19 @@ def test_module_grouped_matches_reference(dtype):
     x = torch.randn(Mt, D, dtype=dtype, device="cuda", requires_grad=True)
     m = torch.randn(Mt, D, dtype=dtype, device="cuda", requires_grad=True)
     probs = torch.rand(Mt, 1, device="cuda", requires_grad=True)
-    mod = GatedPolyNorm(num_local_experts=E, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
+    mod = PolyNorm(num_local_experts=E, config=None, alpha_init=0.2, eps=EPS).cuda().to(dtype)
     with torch.no_grad():
-        mod.alpha_p1.copy_(torch.tensor([0.1, 0.3, 0.5], device="cuda").to(dtype))
-        mod.alpha_p2.copy_(torch.tensor([0.2, 0.4, 0.6], device="cuda").to(dtype))
-        mod.alpha_p3.copy_(torch.tensor([0.15, 0.25, 0.35], device="cuda").to(dtype))
+        mod.alpha1.copy_(torch.tensor([0.1, 0.3, 0.5], device="cuda").to(dtype))
+        mod.alpha2.copy_(torch.tensor([0.2, 0.4, 0.6], device="cuda").to(dtype))
+        mod.alpha3.copy_(torch.tensor([0.15, 0.25, 0.35], device="cuda").to(dtype))
     out = mod(x, m, tokens_per_expert=tpe, scores=probs)
 
     tpe_t = torch.tensor(tpe, device="cuda")
-    a1 = torch.repeat_interleave(mod.alpha_p1.detach().abs(), tpe_t)
-    a2 = torch.repeat_interleave(mod.alpha_p2.detach().abs(), tpe_t)
-    a3 = torch.repeat_interleave(mod.alpha_p3.detach().abs(), tpe_t)
+    a1 = torch.repeat_interleave(mod.alpha1.detach().abs(), tpe_t)
+    a2 = torch.repeat_interleave(mod.alpha2.detach().abs(), tpe_t)
+    a3 = torch.repeat_interleave(mod.alpha3.detach().abs(), tpe_t)
     ref = _ref(x.detach(), m.detach(), a1, a2, a3, score=probs.detach())
     assert torch.allclose(out, ref, **_tols(dtype)), (out - ref).abs().max()
     out.sum().backward()
-    assert mod.alpha_p1.grad.shape == (E,)
+    assert mod.alpha1.grad.shape == (E,)
     assert x.grad is not None and probs.grad is not None

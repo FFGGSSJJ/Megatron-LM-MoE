@@ -1086,7 +1086,7 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        if args.swiglu or args.gpn:
+        if args.swiglu or args.pnglu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -1687,15 +1687,15 @@ def core_transformer_config_from_args(args, config_class=None):
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
-    if args.gpn:
-        # Gated PolyNorm replaces the gate of a gated linear unit; it is itself a (learnable)
+    if args.pnglu:
+        # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
-        assert not args.squared_relu, '--gpn is a gated unit and is incompatible with --squared-relu.'
+        assert not args.squared_relu, '--pnglu is a gated unit and is incompatible with --squared-relu.'
         kw_args['gated_linear_unit'] = True
-        # The gate is computed by the GatedPolyNorm module. Keep SiLU as a harmless placeholder
-        # activation_func for the (unused) non-gpn code paths and width-doubling assumptions.
+        # The gate is computed by the PolyNorm module. Keep SiLU as a harmless placeholder
+        # activation_func for the (unused) non-pnglu code paths and width-doubling assumptions.
         kw_args['activation_func'] = F.silu
-        # Fused bias+activation kernels hardcode SiLU/GELU and cannot run GatedPolyNorm.
+        # Fused bias+activation kernels hardcode SiLU/GELU and cannot run PolyNorm.
         kw_args['bias_activation_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
@@ -2026,8 +2026,8 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         # defined explicitly as CLI arguments below
-        "gpn",
-        "gpn_fusion",
+        "pnglu",
+        "pnglu_fusion",
         "sandwich_norm",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
@@ -2098,13 +2098,13 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
-    group.add_argument('--gpn', action='store_true',
+    group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 3rd-order Gated '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3). '
-                       'Implies gated linear units. Each MoE expert gets its own GatedPolyNorm '
+                       'Implies gated linear units. Each MoE expert gets its own PolyNorm '
                        'coefficients.')
-    group.add_argument('--no-gpn-fusion', action='store_false', dest='gpn_fusion',
-                       help='Disable the fused Triton kernel for --gpn and use the torch '
+    group.add_argument('--no-pnglu-fusion', action='store_false', dest='pnglu_fusion',
+                       help='Disable the fused Triton kernel for --pnglu and use the torch '
                        'implementation instead (e.g. for debugging). The fused path is on by '
                        'default and auto-falls-back on CPU / TP-sharded layers / missing Triton.')
     group.add_argument('--quick-geglu', action='store_true',
