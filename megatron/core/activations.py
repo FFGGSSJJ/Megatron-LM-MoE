@@ -125,7 +125,7 @@ class PolyNorm(MegatronModule):
         self,
         num_local_experts: int = 1,
         config=None,
-        alpha_init: float = 0.2,
+        alpha_init: float = 0.133,
         eps: float = 1e-6,
         tp_group: "torch.distributed.ProcessGroup | None" = None,
     ):
