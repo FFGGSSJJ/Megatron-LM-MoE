@@ -195,6 +195,7 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
+    OffloadingFP8Config,
 )
 from megatron.core.transformer.moe.experts_fp8_util import (
     FP8GPUExpertsParameterManager,
@@ -1848,7 +1849,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             and args.moe_use_inplace_fp8_param
             and not config.moe_offloading_experts_debug_mode
         ):
-            FP8ExpertsParameterManager.create_instance(config)
+            FP8ExpertsParameterManager.create_instance(OffloadingFP8Config.from_transformer_config(config))
             FP8ExpertsParameterManager.mark_first_microbatch()
 
         if (
