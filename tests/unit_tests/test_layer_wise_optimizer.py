@@ -471,6 +471,24 @@ class TestLayerWiseOptimizer:
         """
         self._run_parameter_update_test(model_class=TinyModel)
 
+    def test_cpu_expert_allgather_with_empty_local_shards(self):
+        """CPU expert gather works when only one expert-DP rank owns parameters."""
+        _, optimizer, pg_collection = self.create_model_and_optimizer(model_class=TinyModel)
+        expt_dp_size = get_pg_size(pg_collection.expt_dp)
+        if expt_dp_size < 2:
+            pytest.skip("Test requires at least two expert-DP ranks")
+
+        expt_dp_rank = get_pg_rank(pg_collection.expt_dp)
+        cpu_param = nn.Parameter(
+            torch.full((4,), float(expt_dp_rank), dtype=torch.bfloat16, device='cpu')
+        )
+        optimizer.dp_cp_params_list = None
+        optimizer.expt_dp_params_list = [[cpu_param]] + [[] for _ in range(expt_dp_size - 1)]
+
+        optimizer.allgather_params()
+
+        torch.testing.assert_close(cpu_param, torch.zeros_like(cpu_param), rtol=0, atol=0)
+
     def test_broadcast_vs_allgather(self):
         """Test LayerWiseDistributedOptimizer allgather code agains broadcast code."""
         model, optimizer, pg_collection = self.create_model_and_optimizer(model_class=SimpleModel)
