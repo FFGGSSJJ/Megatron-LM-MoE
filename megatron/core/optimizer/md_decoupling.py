@@ -2,20 +2,19 @@
 
 """MDDecoupling optimizer (magnitude-direction decoupling).
 
-Ported and slimmed from the ``master`` optimizer in the megatron-muonmd-tp fork. The
-optimizer decouples a 2D weight into a *direction* (hypersphere-normalized weight) and a
-*magnitude* (learnable per-axis gains), with an optional Muon-style orthogonalized update on
-the direction. 1D params (biases / norms) and (optionally) embedding/output params are routed
-to a chained external AdamW by :func:`get_megatron_mddecoupling_optimizer` — the MDDecoupling
-class itself only ever steps on 2D params.
+Decouples a 2D weight into a *direction* (hypersphere-normalized weight) and a *magnitude*
+(learnable per-axis gains), with an optional Muon-style orthogonalized update on the direction:
 
-Slim cut relative to the source ``master``:
-  - L2 hypersphere clipping (post-step only, no update normalization). Modes: row, col, flat, embed.
-  - Gains are an optional fused reparameterization (p = normalized_w * phi(gains)).
-  - ``gain_parametrization`` is ``direct`` or ``softplus`` (no ``offset``).
-  - No AdEMAMix (alpha / beta3 / warmups) and no NorMuon.
-  - ``MDDecoupling`` also handles the no-gains case (hypersphere_gains_mode=None), so a single
-    class covers both.
+  - Direction: post-step L2-sphere projection of the weight (modes: row, col, flat, embed),
+    optionally per-class for embedding/output and router weights.
+  - Magnitude: optional learnable per-axis gains as a fused reparameterization
+    (p = normalized_w * phi(gains)); ``gain_parametrization`` selects phi ∈ {direct, softplus}.
+  - Update: AdamW by default, or Muon orthogonalized updates (``use_orthogonal_updates``).
+
+1D params (biases / norms) and (optionally) embedding/output params are routed to a chained
+external AdamW by :func:`get_megatron_mddecoupling_optimizer` — the ``MDDecoupling`` class itself
+only ever steps on 2D params. Setting ``hypersphere_gains_mode=None`` disables the gain
+machinery, so a single class covers both the gains and no-gains cases.
 """
 
 import logging
@@ -29,7 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
 
-# NOTE: these package-level imports are safe because mddecoupling is only imported lazily from
+# NOTE: these package-level imports are safe because this module is only imported lazily from
 # megatron.training.training (never from this package's __init__), so megatron.core.optimizer is
 # fully initialized by the time this module loads — same pattern as muon.py.
 from . import (
@@ -63,8 +62,8 @@ logger = logging.getLogger(__name__)
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
-    ``shape_up`` is master-specific (= max(d_out/d_in, d_in/d_out)**0.5); other modes delegate
-    to the emerging_optimizers implementation.
+    ``shape_up`` (= max(d_out/d_in, d_in/d_out)**0.5) and ``none`` (= 1.0) are handled here;
+    all other modes delegate to the emerging_optimizers implementation.
     """
     if mode == "shape_up":
         return max(size_out / size_in, size_in / size_out) ** 0.5
@@ -90,7 +89,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
         hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
         hypersphere_eps: float = 1e-8,
-        # Muown-style options (off by default).
+        # Tangential-gradient / preserve-init options (off by default).
         hypersphere_tangential_grad: bool = False,
         hypersphere_preserve_init: bool = False,
         # When True, scale the hypersphere target radius for is_out_proj params (linear_proj,
@@ -457,8 +456,8 @@ class MDDecoupling(_MDDecouplingBase):
         gains_eps: float = 1e-8,
         gains_weight_decay: float = 0.0,
         # Reparametrize the per-axis gain: the stored state tensor is `g`, the effective
-        # multiplier applied to `p` is `phi(g)`. "direct" reproduces the original behavior
-        # (phi(g)=g). Applied uniformly to row/col/flat.
+        # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
+        # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
         **kwargs,
     ):
@@ -846,7 +845,7 @@ def _mddecoupling_config_overrides(
     config: OptimizerConfig, base_overrides: Dict[ParamKey, ParamGroupOverride]
 ) -> Dict[ParamKey, ParamGroupOverride]:
     """Build the config_overrides for MDDecoupling: matrix / embedding / output / router LR
-    groups and per-group use_orthogonal_updates routing. Ported from the source 'master' block.
+    groups and per-group use_orthogonal_updates routing.
 
     Starts from ``base_overrides`` (the standard wd-skip + decoupled-LR overrides) and adds the
     MDDecoupling-specific entries on top. Returned dict is passed to BOTH the MDDecoupling param
