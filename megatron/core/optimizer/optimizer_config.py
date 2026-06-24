@@ -327,17 +327,17 @@ class OptimizerConfig:
     muon_lr_factor: float = 1.0
     """When --matrix-lr is unset, matrix-param LR for md_decoupling is muon_lr_factor * lr."""
 
-    hypersphere_mode: Optional[str] = None
+    hypersphere_mode: Optional[str] = 'flat'
     """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
     'row'/'col'/'flat'/'embed'. Applied post-step to project the weight onto the L2 sphere.
     None = off."""
 
-    hypersphere_embedding_mode: Optional[str] = None
+    hypersphere_embedding_mode: Optional[str] = 'row'
     """Hypersphere mode override for embedding + LM head. When set, those params stay in
     MDDecoupling (Adam branch) and get post-step normalization. When None, they route to the
     chained external Adam with no hypersphere. One of 'row'/'col'/'flat'/'embed'/'none'."""
 
-    hypersphere_router_mode: Optional[str] = None
+    hypersphere_router_mode: Optional[str] = 'row'
     """Hypersphere mode override for MoE router weights. One of 'row'/'col'/'flat'/'embed'/'none'.
     None disables router-specific normalization."""
 
@@ -348,19 +348,19 @@ class OptimizerConfig:
     """Skip init-time hypersphere projection so the model init magnitude survives into training.
     When gains are configured (single-axis), gains absorb the per-axis init magnitude."""
 
-    hypersphere_scale_out_proj_init: bool = False
+    hypersphere_scale_out_proj_init: bool = True
     """Scale the hypersphere target radius for is_out_proj params (linear_proj, linear_fc2) by
     1/sqrt(2 * num_layers), matching scaled_init_method_normal."""
 
-    md_router_use_orthogonal_updates: Optional[bool] = None
+    md_router_use_orthogonal_updates: Optional[bool] = True
     """Per-param-group override for use_orthogonal_updates on MoE router weights. True forces
     Muon for routers, False forces the Adam branch, None follows --use-orthogonal-updates."""
 
-    use_orthogonal_updates: bool = False
+    use_orthogonal_updates: bool = True
     """Use Muon-style orthogonalized updates for matrix params under md_decoupling. Embedding +
     LM head ALWAYS use the Adam branch regardless of this flag."""
 
-    hypersphere_gains_mode: Optional[str] = None
+    hypersphere_gains_mode: Optional[str] = 'rowcol'
     """Learnable per-axis gains for matrix params. One of 'row'/'col'/'rowcol'/'flat'/'embed'."""
 
     hypersphere_gains_mode_output: Optional[str] = None
@@ -373,7 +373,7 @@ class OptimizerConfig:
     """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks
     the schedule shape of the main LR)."""
 
-    gain_parametrization: str = 'direct'
+    gain_parametrization: str = 'softplus'
     """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
     'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""
 

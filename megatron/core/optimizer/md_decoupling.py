@@ -452,6 +452,7 @@ class MDDecoupling(_MDDecouplingBase):
         hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
         hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
         gains_lr: Optional[float] = None,
+        gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
         gains_eps: float = 1e-8,
         gains_weight_decay: float = 0.0,
@@ -465,6 +466,7 @@ class MDDecoupling(_MDDecouplingBase):
         self.hypersphere_gains_mode_output = hypersphere_gains_mode_output
         self.hypersphere_gains_mode_embedding = hypersphere_gains_mode_embedding
         self.gains_lr = gains_lr  # None → follow group["lr"] verbatim
+        self.gains_min_lr = gains_min_lr  # gains LR floor (matches the group's min_lr policy)
         self.gains_betas = gains_betas
         self.gains_eps = gains_eps
         self.gains_weight_decay = gains_weight_decay
@@ -711,14 +713,24 @@ class MDDecoupling(_MDDecouplingBase):
         wd = self.gains_weight_decay
 
         # Gains follow the param-group LR. If gains_lr is unset, use group["lr"] verbatim (so the
-        # param scheduler drives gains too). Otherwise treat gains_lr as a base LR and apply the
-        # param schedule shape on top.
+        # param scheduler drives gains too — already floored at the group's min_lr). Otherwise
+        # schedule gains on their OWN [gains_min_lr, gains_lr] band using the scheduler's shared
+        # decay coefficient, recovered from the group's lr:
+        #     group["lr"] = min_lr + coeff * (max_lr - min_lr)   (OptimizerParamScheduler)
+        #  => coeff = (group["lr"] - min_lr) / (max_lr - min_lr)
+        # so gains decay gains_lr -> gains_min_lr exactly like a real param group (and honour
+        # --min-lr-mode absolute, i.e. a fixed gains_min_lr floor — NOT the gains_lr * lr/max_lr
+        # rescaling, which would floor at gains_lr * min_lr/max_lr and ignore min_lr).
         if self.gains_lr is None:
             lr = group["lr"]
         else:
-            max_lr = group.get("max_lr", group["lr"])
-            schedule_mult = (group["lr"] / max_lr) if max_lr > 0 else 1.0
-            lr = self.gains_lr * schedule_mult
+            gmax = group.get("max_lr", group["lr"])
+            gmin = group.get("min_lr", 0.0)
+            denom = gmax - gmin
+            coeff = ((group["lr"] - gmin) / denom) if denom > 0 else 1.0
+            coeff = min(1.0, max(0.0, coeff))
+            gains_floor = self.gains_min_lr if self.gains_min_lr is not None else 0.0
+            lr = gains_floor + coeff * (self.gains_lr - gains_floor)
 
         bias_correction1 = 1.0 - beta1 ** step
         bias_correction2 = 1.0 - beta2 ** step
@@ -1004,6 +1016,11 @@ def get_megatron_mddecoupling_optimizer(
         hypersphere_gains_mode_output=config.hypersphere_gains_mode_output,
         hypersphere_gains_mode_embedding=config.hypersphere_gains_mode_embedding,
         gains_lr=config.gains_lr if config.gains_lr is not None else config.lr,
+        # Gains decay on their own band down to this floor, honouring --min-lr-mode
+        # (absolute → gains_min_lr = min(config.min_lr, gains_base) = config.min_lr).
+        gains_min_lr=_group_min_lr(
+            config, config.gains_lr if config.gains_lr is not None else config.lr
+        ),
         gains_betas=(config.adam_beta1, config.adam_beta2),
         gains_eps=config.adam_eps,
         gains_weight_decay=config.weight_decay,
