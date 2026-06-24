@@ -2248,6 +2248,9 @@ def training_log(
         tokens_per_iteration = args.global_batch_size * args.seq_length
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+        iterations_remaining = max(args.train_iters - iteration, 0)
+        eta_seconds = iterations_remaining * elapsed_time_per_iteration
+        eta = str(timedelta(seconds=int(eta_seconds)))
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2257,8 +2260,12 @@ def training_log(
         if args.log_timers_to_tensorboard and not is_first_iteration:
             if writer:
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
+                writer.add_scalar('eta-seconds', eta_seconds, iteration)
             if wandb_writer:
-                wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
+                wandb_writer.log(
+                    {'iteration-time': elapsed_time_per_iteration, 'eta-seconds': eta_seconds},
+                    iteration,
+                )
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
@@ -2271,6 +2278,7 @@ def training_log(
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
+        log_string += f' eta: {eta} |'
         if args.log_throughput:
             log_string += f' tokens per sec per GPU: {tokens_per_sec_per_gpu:.2f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
