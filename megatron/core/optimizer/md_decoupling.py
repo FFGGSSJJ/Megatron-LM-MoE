@@ -735,16 +735,27 @@ class MDDecoupling(_MDDecouplingBase):
         bias_correction1 = 1.0 - beta1 ** step
         bias_correction2 = 1.0 - beta2 ** step
 
+        # Persistent 0-dim fp32 scalar buffers (gain state is fp32), updated in
+        # place each step. Reusing the same tensors keeps the compiled kernel's
+        # guards stable across steps; updating via fill_ avoids per-step H2D copies.
+        dev = p.device
+        if getattr(self, "_gain_lr_buf", None) is None or self._gain_lr_buf.device != dev:
+            self._gain_lr_buf = torch.zeros((), dtype=torch.float32, device=dev)
+            self._gain_bc1_buf = torch.zeros((), dtype=torch.float32, device=dev)
+            self._gain_bc2_buf = torch.zeros((), dtype=torch.float32, device=dev)
+        self._gain_lr_buf.fill_(lr)
+        self._gain_bc1_buf.fill_(bias_correction1)
+        self._gain_bc2_buf.fill_(bias_correction2)
+
         for name, grad in gain_grads.items():
             gain = state[name]
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
-            if wd != 0.0:
-                gain.mul_(1.0 - lr * wd)
-            m.mul_(beta1).add_(grad, alpha=1 - beta1)
-            v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-            denom = (v.sqrt() / math.sqrt(bias_correction2)).add_(eps)
-            gain.addcdiv_(m, denom, value=-lr / bias_correction1)
+            _fused_gain_adam(
+                gain, m, v, grad,
+                self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
+                beta1, beta2, eps, wd,
+            )
 
     @torch.no_grad()
     def _apply_gains(self, p):
@@ -767,6 +778,27 @@ class MDDecoupling(_MDDecouplingBase):
         if is_embedding and self.hypersphere_gains_mode_embedding is not None:
             return self.hypersphere_gains_mode_embedding
         return self.hypersphere_gains_mode
+
+
+@torch.compile(dynamic=True)
+def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
+    """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
+
+    lr / bc1 / bc2 are 0-dim tensors (they change every step, so passing them as
+    tensors instead of Python floats avoids per-step recompilation); beta1, beta2,
+    eps and wd are run constants. `dynamic=True` shares one graph across the
+    differently shaped gain tensors. Equivalent to the eager update:
+        if wd: gain *= 1 - lr*wd
+        m  = beta1*m + (1-beta1)*grad
+        v  = beta2*v + (1-beta2)*grad^2
+        gain -= (lr/bc1) * m / (v.sqrt()/bc2.sqrt() + eps)
+    """
+    if wd != 0.0:
+        gain.mul_(1.0 - lr * wd)
+    m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+    v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+    denom = (v.sqrt() / bc2.sqrt()).add_(eps)
+    gain.sub_((lr / bc1) * (m / denom))
 
 
 def _split_qkv(x, shapes: tuple[int, int, int]) -> list[torch.Tensor]:
