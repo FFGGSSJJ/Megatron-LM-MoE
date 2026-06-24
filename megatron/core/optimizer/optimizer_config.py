@@ -302,6 +302,86 @@ class OptimizerConfig:
     """Second beta coefficient for Lion optimizer (used in momentum EMA update).
     Defaults to 0.98."""
 
+    ###################################################################################
+    # MDDecoupling (magnitude-direction decoupling: hypersphere normalization + learnable
+    # per-axis gains + optional Muon orthogonalized updates). Reuses the muon_* / adam_* /
+    # weight_decay fields above for shared knobs. All defaults are off; existing runs unaffected.
+    ###################################################################################
+    matrix_lr: Optional[float] = None
+    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling.
+    Overrides muon_lr_factor * lr."""
+
+    embedding_lr_multiplier: Optional[float] = None
+    """LR multiplier for embedding (and tied LM-head) params under md_decoupling. Final
+    max_lr = embedding_lr_multiplier * lr. When unset, those params use the base --lr."""
+
+    output_lr: Optional[float] = None
+    """Absolute LR for the (untied) output LM-head params under md_decoupling. When unset, the
+    output layer uses the base --lr."""
+
+    min_lr_mode: str = 'relative'
+    """How per-group min_lr is set for any group with a custom max_lr. 'relative' (default):
+    every group decays by the same fraction (config.min_lr / config.lr). 'absolute': every group
+    decays to the same floor (config.min_lr)."""
+
+    muon_lr_factor: float = 1.0
+    """When --matrix-lr is unset, matrix-param LR for md_decoupling is muon_lr_factor * lr."""
+
+    hypersphere_mode: Optional[str] = None
+    """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
+    'row'/'col'/'flat'/'embed'. Applied post-step to project the weight onto the L2 sphere.
+    None = off."""
+
+    hypersphere_embedding_mode: Optional[str] = None
+    """Hypersphere mode override for embedding + LM head. When set, those params stay in
+    MDDecoupling (Adam branch) and get post-step normalization. When None, they route to the
+    chained external Adam with no hypersphere. One of 'row'/'col'/'flat'/'embed'/'none'."""
+
+    hypersphere_router_mode: Optional[str] = None
+    """Hypersphere mode override for MoE router weights. One of 'row'/'col'/'flat'/'embed'/'none'.
+    None disables router-specific normalization."""
+
+    hypersphere_tangential_grad: bool = False
+    """Project p.grad onto the hypersphere tangent space before the update."""
+
+    hypersphere_preserve_init: bool = False
+    """Skip init-time hypersphere projection so the model init magnitude survives into training.
+    When gains are configured (single-axis), gains absorb the per-axis init magnitude."""
+
+    hypersphere_scale_out_proj_init: bool = False
+    """Scale the hypersphere target radius for is_out_proj params (linear_proj, linear_fc2) by
+    1/sqrt(2 * num_layers), matching scaled_init_method_normal."""
+
+    md_router_use_orthogonal_updates: Optional[bool] = None
+    """Per-param-group override for use_orthogonal_updates on MoE router weights. True forces
+    Muon for routers, False forces the Adam branch, None follows --use-orthogonal-updates."""
+
+    use_orthogonal_updates: bool = False
+    """Use Muon-style orthogonalized updates for matrix params under md_decoupling. Embedding +
+    LM head ALWAYS use the Adam branch regardless of this flag."""
+
+    hypersphere_gains_mode: Optional[str] = None
+    """Learnable per-axis gains for matrix params. One of 'row'/'col'/'rowcol'/'flat'/'embed'."""
+
+    hypersphere_gains_mode_output: Optional[str] = None
+    """Gains mode override for the LM head. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
+
+    hypersphere_gains_mode_embedding: Optional[str] = None
+    """Gains mode override for the embedding. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
+
+    gains_lr: Optional[float] = None
+    """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks
+    the schedule shape of the main LR)."""
+
+    gain_parametrization: str = 'direct'
+    """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
+    'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""
+
+    use_layer_wise_distributed_optimizer: bool = False
+    """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
+    over the data-parallel group (used by md_decoupling instead of the standard distributed
+    optimizer, which is incompatible with 2D hypersphere/Muon math)."""
+
     #######################
     # Distributed optimizer
     #######################

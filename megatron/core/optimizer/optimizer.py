@@ -96,6 +96,26 @@ def _multi_tensor_copy_this_to_that(
 
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
+# Parameter routing attributes that param-group-aware optimizers (e.g. MDDecoupling) read off the
+# params they step on, but which are NOT covered by copy_tensor_model_parallel_attributes (that
+# only handles expert_tp / is_qkv / tensor_model_parallel / partition_dim / partition_stride).
+# These must be explicitly propagated from the model param onto the fp32 main/shard param,
+# otherwise the optimizer silently sees them as False on the main params it actually optimizes.
+_MAIN_PARAM_ROUTING_ATTRS = (
+    'is_out_proj',
+    'is_router',
+    'is_embedding_or_output_parameter',
+    'is_embedding_parameter',
+    'is_output_parameter',
+)
+
+
+def _propagate_routing_attrs(main_param, model_param):
+    """Copy MDDecoupling routing attributes from a model param onto its fp32 main/shard copy."""
+    for _attr in _MAIN_PARAM_ROUTING_ATTRS:
+        if hasattr(model_param, _attr):
+            setattr(main_param, _attr, getattr(model_param, _attr))
+
 
 class MegatronOptimizer(ABC):
     """
@@ -680,6 +700,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
+                            # Propagate MDDecoupling routing attrs (is_router / is_out_proj /
+                            # is_embedding_or_output_parameter / ...) not covered above.
+                            _propagate_routing_attrs(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
