@@ -4,7 +4,16 @@ import triton
 import triton.language as tl
 from typing import Tuple
 
-from deep_gemm.utils.math import align, pack_ue8m0_to_int
+try:
+    from deep_gemm.utils.math import align, pack_ue8m0_to_int
+except ImportError:
+    # deep_gemm is only needed for the FP8 quantization paths in this module
+    # (align / pack_ue8m0_to_int are used solely inside FP8 helper functions).
+    # Guard the import so the MoE stack is importable without deep_gemm when FP8
+    # is disabled — mirrors the `try: import deep_gemm` guard in fp8_utils.py.
+    # Any FP8 path that calls these will fail loudly at call time if deep_gemm
+    # is missing.
+    align = pack_ue8m0_to_int = None
 
 # referred from DeepGEMM utils
 def per_block_cast_to_fp8_cpu(x: torch.Tensor, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:

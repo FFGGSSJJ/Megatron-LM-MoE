@@ -802,7 +802,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # sum(output_splits) == received tokens dim0. A mismatch ("Split sizes doesn't match
         # total dim 0 size") means input_splits/output_splits are inconsistent with the
         # permuted tensor (stale state, wrong routing_map, or unsynced DtoH copy).
-        if int(self.input_splits.sum()) != permutated_local_input_tokens.shape[0]:
+        if self.input_splits is not None and int(self.input_splits.sum()) != permutated_local_input_tokens.shape[0]:
             import torch.distributed as _dist
 
             raise RuntimeError(
