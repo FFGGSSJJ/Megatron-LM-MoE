@@ -75,6 +75,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: tuple[int, int, int] | None = None,
+        is_kv_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
+        kv_up_proj_split_shapes: tuple[int, int] | None = None,
+        is_qkv_down_proj_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_down_proj_split_shapes: tuple[int, int] | None = None,
+        split_mla_per_head: bool = False,
+        is_q_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
+        q_up_proj_head_dim: int | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -118,6 +125,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self.is_kv_up_proj_fn = is_kv_up_proj_fn
+        self.kv_up_proj_split_shapes = kv_up_proj_split_shapes
+        self.is_qkv_down_proj_fn = is_qkv_down_proj_fn
+        self.qkv_down_proj_split_shapes = qkv_down_proj_split_shapes
+        self.split_mla_per_head = split_mla_per_head
+        self.is_q_up_proj_fn = is_q_up_proj_fn
+        self.q_up_proj_head_dim = q_up_proj_head_dim
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         nesterov_kwarg = (
@@ -160,7 +174,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # emerging-optimizers use None instead of -1 to indicate no tensor parallel
             partition_dim = None
 
-        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+        if self.split_qkv and self.is_qkv_fn is not None and self.is_qkv_fn(p):
             # split grouped attention parameters (e.g., QKV, GQA, etc.)
             grad_shape = grad.shape
             log_single_rank(
@@ -168,6 +182,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 logging.DEBUG,
                 f'qkv split grad shape {grad_shape}, split shapes {self.qkv_split_shapes}',
             )
+            assert self.qkv_split_shapes is not None
             num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
             qkv_grads = torch.split(
                 grad.view(num_query_groups, sum(self.qkv_split_shapes), -1),
@@ -184,6 +199,91 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+        elif (
+            self.split_qkv
+            and self.is_qkv_down_proj_fn is not None
+            and self.is_qkv_down_proj_fn(p)
+        ):
+            # MLA fused path: split linear_qkv_down_proj into Q and KV/RoPE blocks.
+            # TODO: Validate whether this down-projection split is the right Muon
+            # treatment for fused MLA.
+            grad_shape = grad.shape
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'qkv_down_proj split grad shape {grad_shape}, '
+                f'split shapes {self.qkv_down_proj_split_shapes}',
+            )
+            assert self.qkv_down_proj_split_shapes is not None
+            qkv_down_grads = torch.split(grad, self.qkv_down_proj_split_shapes, dim=0)
+            qkv_down_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim)
+                for g in qkv_down_grads
+            ]
+            grad = torch.cat(qkv_down_grads, dim=0)
+        elif (
+            self.split_qkv
+            and self.is_kv_up_proj_fn is not None
+            and self.is_kv_up_proj_fn(p)
+        ):
+            grad_shape = grad.shape
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'kv_up_proj split grad shape {grad_shape}, '
+                f'split shapes {self.kv_up_proj_split_shapes}',
+            )
+            assert self.kv_up_proj_split_shapes is not None
+            if self.split_mla_per_head:
+                num_heads = grad_shape[0] // sum(self.kv_up_proj_split_shapes)
+                kv_grads = torch.split(
+                    grad.view(num_heads, sum(self.kv_up_proj_split_shapes), -1),
+                    self.kv_up_proj_split_shapes,
+                    dim=1,
+                )
+                kv_grads = [g.reshape(-1, grad_shape[-1]) for g in kv_grads]
+                kv_grads = [
+                    self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                        num_heads, -1, grad_shape[-1]
+                    )
+                    for g in kv_grads
+                ]
+                grad = torch.cat(kv_grads, dim=1).view(grad_shape)
+            else:
+                num_groups = grad_shape[0] // sum(self.kv_up_proj_split_shapes)
+                kv_grads = torch.split(
+                    grad.view(num_groups, sum(self.kv_up_proj_split_shapes), -1),
+                    self.kv_up_proj_split_shapes,
+                    dim=1,
+                )
+                kv_grads = [g.reshape(-1, grad_shape[-1]) for g in kv_grads]
+                kv_grads = [
+                    self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                        num_groups, -1, grad_shape[-1]
+                    )
+                    for g in kv_grads
+                ]
+                grad = torch.cat(kv_grads, dim=1).view(grad_shape)
+        elif (
+            self.split_qkv
+            and self.split_mla_per_head
+            and self.is_q_up_proj_fn is not None
+            and self.is_q_up_proj_fn(p)
+        ):
+            grad_shape = grad.shape
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'q_up_proj per-head split grad shape {grad_shape}, '
+                f'head dim {self.q_up_proj_head_dim}',
+            )
+            assert self.q_up_proj_head_dim is not None
+            num_heads = grad_shape[0] // self.q_up_proj_head_dim
+            q_grads = grad.view(num_heads, self.q_up_proj_head_dim, -1).unbind(0)
+            q_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in q_grads
+            ]
+            grad = torch.stack(q_grads, dim=0).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
@@ -280,6 +380,26 @@ def get_megatron_muon_optimizer(
             kv_channels,
             kv_channels,
         ]
+        mla_config = model_chunk.config
+        is_mla = getattr(mla_config, 'multi_latent_attention', False)
+        if is_mla and config.muon_split_mla_per_head:
+            kv_up_proj_split_shapes = (mla_config.qk_head_dim, mla_config.v_head_dim)
+            q_up_proj_head_dim = mla_config.qk_head_dim + mla_config.qk_pos_emb_head_dim
+        elif is_mla:
+            kv_up_proj_split_shapes = (
+                num_attention_heads * mla_config.qk_head_dim,
+                num_attention_heads * mla_config.v_head_dim,
+            )
+            q_up_proj_head_dim = None
+        else:
+            kv_up_proj_split_shapes = None
+            q_up_proj_head_dim = None
+
+        qkv_down_proj_split_shapes = (
+            mla_config.q_lora_rank,
+            mla_config.kv_lora_rank + mla_config.qk_pos_emb_head_dim,
+        ) if is_mla and getattr(mla_config, 'q_lora_rank', None) is not None else None
+
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -288,10 +408,15 @@ def get_megatron_muon_optimizer(
             # change in optimizer
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # add flag for qkv parameter
-            # TODO(deyuf): support MLA
+            # add flags for grouped QKV and MLA projection parameters
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
+            if 'linear_kv_up_proj.weight' in name and len(param.shape) == 2:
+                param.is_kv_up_proj = True
+            if 'linear_q_up_proj.weight' in name and len(param.shape) == 2:
+                param.is_q_up_proj = True
+            if 'linear_qkv_down_proj.weight' in name and len(param.shape) == 2:
+                param.is_qkv_down_proj = True
             # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
             if (
                 not getattr(param, 'is_embedding_or_output_parameter', False)
@@ -313,6 +438,13 @@ def get_megatron_muon_optimizer(
         "split_qkv": config.muon_split_qkv,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
         "qkv_split_shapes": qkv_split_shapes,
+        "is_kv_up_proj_fn": lambda p: getattr(p, "is_kv_up_proj", False),
+        "kv_up_proj_split_shapes": kv_up_proj_split_shapes,
+        "is_qkv_down_proj_fn": lambda p: getattr(p, "is_qkv_down_proj", False),
+        "qkv_down_proj_split_shapes": qkv_down_proj_split_shapes,
+        "split_mla_per_head": config.muon_split_mla_per_head,
+        "is_q_up_proj_fn": lambda p: getattr(p, "is_q_up_proj", False),
+        "q_up_proj_head_dim": q_up_proj_head_dim,
         "extra_scale_factor": config.muon_extra_scale_factor,
         "pg_collection": pg_collection,
         "mode": config.muon_tp_mode,
