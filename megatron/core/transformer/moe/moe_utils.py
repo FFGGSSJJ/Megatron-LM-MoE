@@ -940,6 +940,35 @@ def apply_router_token_dropping(
     return final_probs, final_map
 
 
+def expert_load_violation_batchwise(
+    tokens_per_expert: torch.Tensor,
+    num_experts: int,
+    total_num_tokens: int,
+    topk: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute max, min, and avg expert load violation relative to perfect balance."""
+    effective_total_tokens = total_num_tokens * topk
+    ideal_tokens_per_expert = effective_total_tokens / num_experts
+    violation_ratios = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
+    return violation_ratios.max(), violation_ratios.min(), violation_ratios.mean()
+
+
+def expert_max_violation_batchwise(
+    tokens_per_expert: torch.Tensor,
+    num_experts: int,
+    total_num_tokens: int,
+    topk: int,
+) -> torch.Tensor:
+    """Compute the max expert load violation relative to perfect balance."""
+    max_violation, _, _ = expert_load_violation_batchwise(
+        tokens_per_expert=tokens_per_expert,
+        num_experts=num_experts,
+        total_num_tokens=total_num_tokens,
+        topk=topk,
+    )
+    return max_violation
+
+
 def save_to_aux_losses_tracker(
     name: str,
     loss: torch.Tensor,

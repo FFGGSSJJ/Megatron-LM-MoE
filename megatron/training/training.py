@@ -2189,6 +2189,12 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
+        track_names.append("expert_max_violation")
+        track_names.append("expert_min_violation")
+        track_names.append("expert_avg_violation")
+        track_names.append("global_expert_max_violation")
+        track_names.append("global_expert_min_violation")
+        track_names.append("global_expert_avg_violation")
 
         if is_hybrid_model(args):
             from operator import itemgetter
