@@ -305,7 +305,7 @@ class TopKRouter(Router):
         return scores, map
 
     def quantile_balancing(self, logits: torch.Tensor):
-        """Apply quantile-balancing (QB) routing to the logits tensor."""
+        """Apply quantile-balancing (QB) routing to the logits tensor (from https://github.com/NVIDIA/Megatron-LM/pull/5349)."""
         assert (
             not self.config.moe_router_fusion
         ), "Quantile balancing routing does not support moe_router_fusion."
