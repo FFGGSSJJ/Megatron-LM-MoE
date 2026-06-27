@@ -11,12 +11,93 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
+    _update_router_qb_beta,
+    reset_model_temporary_tensors,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+class _RouterQBBetaModel(torch.nn.Module):
+    def __init__(self, config, qb_beta, qb_beta_accum, qb_beta_count):
+        super().__init__()
+        self.config = config
+        self.ddp_config = DistributedDataParallelConfig()
+        self.router = torch.nn.Module()
+        self.router.register_buffer("qb_beta", qb_beta.clone())
+        self.router.register_buffer("qb_beta_accum", qb_beta_accum.clone())
+        self.router.register_buffer("qb_beta_count", qb_beta_count.clone())
+
+
+def _router_qb_config(ema=0.25):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_router_quantile_balancing_ema=ema,
+    )
+
+
+class TestUpdateRouterQBBeta:
+    def test_update_router_qb_beta_ema_centers_and_resets(self, monkeypatch):
+        config = _router_qb_config(ema=0.25)
+        model = _RouterQBBetaModel(
+            config,
+            qb_beta=torch.tensor([1.0, -1.0, 0.0]),
+            qb_beta_accum=torch.tensor([4.0, 2.0, 0.0]),
+            qb_beta_count=torch.tensor(2, dtype=torch.long),
+        )
+        dp_cp_group = object()
+        all_reduce_args = {}
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            all_reduce_args["value"] = tensor.clone()
+            all_reduce_args["op"] = op
+            all_reduce_args["group"] = group
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        _update_router_qb_beta([model], config, dp_cp_group=dp_cp_group)
+
+        local_avg = torch.tensor([2.0, 1.0, 0.0])
+        expected = 0.25 * torch.tensor([1.0, -1.0, 0.0]) + 0.75 * local_avg
+        expected = expected - expected.mean()
+        torch.testing.assert_close(all_reduce_args["value"], local_avg.unsqueeze(0))
+        assert all_reduce_args["op"] == torch.distributed.ReduceOp.AVG
+        assert all_reduce_args["group"] is dp_cp_group
+        torch.testing.assert_close(model.router.qb_beta, expected)
+        torch.testing.assert_close(model.router.qb_beta.mean(), torch.zeros(()))
+
+        reset_model_temporary_tensors(config, [model])
+        torch.testing.assert_close(
+            model.router.qb_beta_accum, torch.zeros_like(model.router.qb_beta_accum)
+        )
+        assert model.router.qb_beta_count.item() == 0
+
+    def test_update_router_qb_beta_skips_eval_modules(self, monkeypatch):
+        config = _router_qb_config(ema=0.0)
+        model = _RouterQBBetaModel(
+            config,
+            qb_beta=torch.tensor([1.0, -1.0, 0.0]),
+            qb_beta_accum=torch.tensor([4.0, 2.0, 0.0]),
+            qb_beta_count=torch.tensor(1, dtype=torch.long),
+        )
+        model.router.eval()
+        before = model.router.qb_beta.clone()
+
+        def fail_all_reduce(*args, **kwargs):
+            raise AssertionError("all_reduce should not run for eval QB routers")
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fail_all_reduce)
+
+        _update_router_qb_beta([model], config, dp_cp_group=object())
+
+        torch.testing.assert_close(model.router.qb_beta, before)
 
 
 class TestAllReduceLNGrads:
