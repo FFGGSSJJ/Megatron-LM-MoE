@@ -2191,10 +2191,10 @@ def training_log(
             track_names.append("z_loss")
         track_names.append("expert_max_violation")
         track_names.append("expert_min_violation")
-        track_names.append("expert_avg_violation")
+        track_names.append("expert_median_violation")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
-        track_names.append("global_expert_avg_violation")
+        track_names.append("global_expert_median_violation")
 
         if is_hybrid_model(args):
             from operator import itemgetter

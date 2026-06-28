@@ -330,7 +330,7 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
     with torch.no_grad():
         for module, global_tokens_per_expert in zip(router_modules, stacked):
             total_num_tokens = int(global_tokens_per_expert.sum().item()) // module.topk
-            max_violation, min_violation, avg_violation = expert_load_violation_batchwise(
+            max_violation, min_violation, median_violation = expert_load_violation_batchwise(
                 tokens_per_expert=global_tokens_per_expert,
                 num_experts=global_tokens_per_expert.shape[0],
                 total_num_tokens=total_num_tokens,
@@ -339,7 +339,7 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
             for name, value in (
                 ("global_expert_max_violation", max_violation),
                 ("global_expert_min_violation", min_violation),
-                ("global_expert_avg_violation", avg_violation),
+                ("global_expert_median_violation", median_violation),
             ):
                 save_to_aux_losses_tracker(
                     name,
