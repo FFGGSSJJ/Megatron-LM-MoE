@@ -671,10 +671,10 @@ class TransformerConfig(ModelParallelConfig):
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
     - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
-    handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
-    (`moe_aux_loss_coeff` = 0) when QB is selected.
+    handled by an internal per-expert bias update. It can be combined with "seq_aux_loss" by
+    passing a list of load balancing types.
     - "none": No load balancing.
-    A list of strings can be provided to combine multiple aux-loss load balancing types.
+    A list of strings can be provided to combine multiple load-balancing terms.
     The default is "aux_loss".
     """
 
@@ -1391,6 +1391,14 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+            if "quantile_balancing" in self.moe_router_load_balancing_type:
+                if any(
+                    load_balancing_type not in ["quantile_balancing", "seq_aux_loss"]
+                    for load_balancing_type in self.moe_router_load_balancing_type
+                ):
+                    raise ValueError(
+                        "quantile_balancing can only be combined with seq_aux_loss"
+                    )
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:

@@ -5,9 +5,14 @@ from typing import cast
 import pytest
 import torch
 
+import megatron.core.transformer.moe.router as router_module
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import qb_dual_update
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+    qb_dual_update,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -57,6 +62,28 @@ class TestQBDualUpdate:
         assert imbalance1 < imbalance0
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "load_balancing_type",
+    [
+        ["quantile_balancing", "aux_loss"],
+        ["quantile_balancing", "global_aux_loss"],
+        ["quantile_balancing", "none"],
+    ],
+)
+def test_qb_only_combines_with_seq_aux_loss(load_balancing_type):
+    with pytest.raises(ValueError, match="quantile_balancing can only be combined"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type=load_balancing_type,
+            moe_aux_loss_coeff=[0, 0],
+        )
+
+
 class TestQuantileBalancingRouter:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -95,6 +122,69 @@ class TestQuantileBalancingRouter:
         assert self.router.qb_beta.dtype == torch.float32
         assert self.router.qb_beta_accum is not None
         assert self.router.qb_beta_count is not None
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qb_seq_aux_loss_uses_qb_dispatch_and_raw_aux_map(self, monkeypatch):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=self.num_moe_experts,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type=["quantile_balancing", "seq_aux_loss"],
+            moe_router_score_function="softmax",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=[0, 0.5],
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        router = cast(Router, MoELayer(config, self.submodules).router).cuda()
+        router.set_layer_number(1)
+        clear_aux_losses_tracker()
+
+        raw_topk_experts = [0, 1]
+        qb_experts = [6, 7]
+
+        def fake_qb_dual_update(scores, topk, beta, update_beta=True):
+            assert topk == 2
+            indices = torch.tensor(qb_experts, device=scores.device).expand(scores.shape[0], -1)
+            return indices, torch.zeros_like(beta)
+
+        captured = {}
+        original_compute_aux = router_module.compute_routing_scores_for_aux_loss
+
+        def capture_compute_aux(*args, **kwargs):
+            aux_routing_map, aux_scores = original_compute_aux(*args, **kwargs)
+            captured["routing_map"] = aux_routing_map.detach().clone()
+            return aux_routing_map, aux_scores
+
+        monkeypatch.setattr(router_module, "qb_dual_update", fake_qb_dual_update)
+        monkeypatch.setattr(
+            router_module, "compute_routing_scores_for_aux_loss", capture_compute_aux
+        )
+
+        logits = torch.zeros((4, 2, self.num_moe_experts), device="cuda", dtype=torch.bfloat16)
+        logits[..., raw_topk_experts[0]] = 6.0
+        logits[..., raw_topk_experts[1]] = 5.0
+        logits.requires_grad_()
+
+        probs, routing_map = router.routing(logits)
+
+        expected_qb_routing_map = torch.zeros_like(routing_map)
+        expected_qb_routing_map[:, qb_experts] = True
+        expected_aux_routing_map = torch.zeros_like(routing_map)
+        expected_aux_routing_map[:, raw_topk_experts] = True
+
+        assert torch.equal(routing_map, expected_qb_routing_map)
+        assert torch.equal(captured["routing_map"], expected_aux_routing_map)
+        assert not torch.equal(captured["routing_map"], routing_map)
+        assert "seq_load_balancing_loss" in get_moe_layer_wise_logging_tracker()
+
+        probs.sum().mul(0).backward()
+        assert logits.grad is not None
+        assert logits.grad.abs().sum() > 0
 
     @pytest.mark.internal
     def test_non_qb_router_has_no_qb_buffers(self):

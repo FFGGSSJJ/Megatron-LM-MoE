@@ -214,14 +214,11 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
+        # Quantile balancing uses a per-expert bias `qb_beta`; it may be combined with
+        # sequence-level aux loss through the load-balancing type list.
         # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
         # and reset each global batch.
-        if self.routing_type == "quantile_balancing":
-            assert not self.is_aux_loss_enabled(), (
-                "Quantile balancing handles load balance via the bias update; "
-                "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
-            )
+        if "quantile_balancing" in self.routing_type:
             self.register_buffer(
                 'qb_beta',
                 torch.zeros(
@@ -718,7 +715,7 @@ class TopKRouter(Router):
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
-        elif self.routing_type == "quantile_balancing":
+        elif "quantile_balancing" in self.routing_type:
             probs, routing_map = self.quantile_balancing(logits)
         else:
             probs, routing_map = topk_routing_with_score_function(

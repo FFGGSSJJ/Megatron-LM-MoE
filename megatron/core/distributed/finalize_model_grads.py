@@ -583,7 +583,7 @@ def finalize_model_grads(
 
     _log_global_router_metrics(model, config)
 
-    if config.moe_router_load_balancing_type == "quantile_balancing":
+    if "quantile_balancing" in config.moe_router_load_balancing_type:
         _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
