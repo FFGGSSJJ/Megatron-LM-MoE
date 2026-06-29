@@ -53,12 +53,21 @@ class TestUpdateRouterQBBeta:
             qb_beta_count=torch.tensor(2, dtype=torch.long),
         )
         dp_cp_group = object()
-        all_reduce_args = {}
+        all_reduce_calls = []
+        waits = []
 
-        def fake_all_reduce(tensor, op=None, group=None):
-            all_reduce_args["value"] = tensor.clone()
-            all_reduce_args["op"] = op
-            all_reduce_args["group"] = group
+        class FakeWork:
+            def __init__(self, index):
+                self.index = index
+
+            def wait(self):
+                waits.append(self.index)
+
+        def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+            all_reduce_calls.append(
+                {"value": tensor.clone(), "op": op, "group": group, "async_op": async_op}
+            )
+            return FakeWork(len(all_reduce_calls) - 1)
 
         monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
@@ -67,9 +76,15 @@ class TestUpdateRouterQBBeta:
         local_avg = torch.tensor([2.0, 1.0, 0.0])
         expected = 0.25 * torch.tensor([1.0, -1.0, 0.0]) + 0.75 * local_avg
         expected = expected - expected.mean()
-        torch.testing.assert_close(all_reduce_args["value"], local_avg.unsqueeze(0))
-        assert all_reduce_args["op"] == torch.distributed.ReduceOp.AVG
-        assert all_reduce_args["group"] is dp_cp_group
+        torch.testing.assert_close(all_reduce_calls[0]["value"], torch.tensor([[4.0, 2.0, 0.0]]))
+        torch.testing.assert_close(all_reduce_calls[1]["value"], torch.tensor([2]))
+        assert all_reduce_calls[0]["op"] == torch.distributed.ReduceOp.SUM
+        assert all_reduce_calls[1]["op"] == torch.distributed.ReduceOp.SUM
+        assert all_reduce_calls[0]["group"] is dp_cp_group
+        assert all_reduce_calls[1]["group"] is dp_cp_group
+        assert all_reduce_calls[0]["async_op"] is True
+        assert all_reduce_calls[1]["async_op"] is True
+        assert waits == [0, 1]
         torch.testing.assert_close(model.router.qb_beta, expected)
         torch.testing.assert_close(model.router.qb_beta.mean(), torch.zeros(()))
 
@@ -98,6 +113,29 @@ class TestUpdateRouterQBBeta:
         _update_router_qb_beta([model], config, dp_cp_group=object())
 
         torch.testing.assert_close(model.router.qb_beta, before)
+
+    def test_update_router_qb_beta_preserves_beta_without_observations(self, monkeypatch):
+        config = _router_qb_config(ema=0.0)
+        model = _RouterQBBetaModel(
+            config,
+            qb_beta=torch.tensor([2.0, -1.0, -1.0]),
+            qb_beta_accum=torch.tensor([0.0, 0.0, 0.0]),
+            qb_beta_count=torch.tensor(0, dtype=torch.long),
+        )
+
+        class FakeWork:
+            def wait(self):
+                pass
+
+        def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+            del tensor, op, group, async_op
+            return FakeWork()
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        _update_router_qb_beta([model], config, dp_cp_group=object())
+
+        torch.testing.assert_close(model.router.qb_beta, torch.tensor([2.0, -1.0, -1.0]))
 
 
 class TestAllReduceLNGrads:

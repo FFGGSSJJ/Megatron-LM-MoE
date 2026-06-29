@@ -402,18 +402,27 @@ def _update_router_qb_beta(
         return
 
     stacked_beta = torch.stack(qb_beta_list, dim=0)
-    local_avg_list = [
-        accum / count.clamp(min=1).to(accum.dtype)
-        for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
-    ]
-    stacked_local_avg = torch.stack(local_avg_list, dim=0)
+    stacked_accum = torch.stack(qb_beta_accum_list, dim=0)
+    stacked_count = torch.stack(qb_beta_count_list, dim=0)
 
-    torch.distributed.all_reduce(
-        stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
+    # Use async op to enqueue both collectives so as to reduce CPU overhead of the calls.
+    accum_reduce = torch.distributed.all_reduce(
+        stacked_accum, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group, async_op=True
+    )
+    count_reduce = torch.distributed.all_reduce(
+        stacked_count, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group, async_op=True
+    )
+
+    accum_reduce.wait()
+    count_reduce.wait()
+
+    count = stacked_count.clamp(min=1).to(stacked_accum.dtype).unsqueeze(-1)
+    stacked_global_avg = torch.where(
+        stacked_count.unsqueeze(-1) > 0, stacked_accum / count, stacked_beta
     )
 
     ema = config.moe_router_quantile_balancing_ema
-    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_local_avg
+    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_global_avg
     stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
 
     for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):

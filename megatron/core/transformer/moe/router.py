@@ -301,7 +301,9 @@ class TopKRouter(Router):
         scores = logits * map
         return scores, map
 
-    def quantile_balancing(self, logits: torch.Tensor):
+    def quantile_balancing(
+        self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
         """Apply quantile-balancing (QB) routing to the logits tensor (from https://github.com/NVIDIA/Megatron-LM/pull/5349)."""
         assert (
             not self.config.moe_router_fusion
@@ -311,9 +313,8 @@ class TopKRouter(Router):
         ), "Quantile balancing routing does not support group-limited routing."
 
         local_num_tokens = logits.shape[0]
-        # Gather logits across TP/CP so the quantile sees a whole sequence's tokens.
-        # The DP reduction and qb_beta update run at the global-batch boundary in
-        # finalize_model_grads._update_router_qb_beta.
+        # Gather logits across TP/CP only for the beta quantile update. Routing itself is
+        # per-token and can use the local logits with the previous global-batch qb_beta.
         gather_group = self.tp_cp_group
         gather_size = gather_group.size() if gather_group is not None else 1
 
@@ -321,37 +322,53 @@ class TopKRouter(Router):
 
         with torch.no_grad():
             logits_fp32 = logits.detach().to(dtype=torch.float32)
+            indices = (logits_fp32 - self.qb_beta).topk(self.topk, dim=1).indices
 
-            if gather_size > 1:
-                full_logits = torch.empty(
-                    (local_num_tokens * gather_size, self.config.num_moe_experts),
-                    dtype=logits_fp32.dtype,
-                    device=logits_fp32.device,
-                )
-                torch.distributed.all_gather_into_tensor(
-                    full_logits, logits_fp32.contiguous(), group=gather_group
-                )
-                gather_rank = torch.distributed.get_rank(group=gather_group)
-            else:
-                full_logits = logits_fp32
-                gather_rank = 0
-
-            # Route with the previous batch's qb_beta; in training, accumulate this
-            # microbatch's quantile for the next update.
-            full_indices, beta_local = qb_dual_update(
-                full_logits, self.topk, self.qb_beta, update_beta=should_update_beta
-            )
             if should_update_beta:
-                self.qb_beta_accum.add_(beta_local)
-                self.qb_beta_count.add_(1)
+                beta_logits = logits_fp32
+                beta_padding_mask = padding_mask
+                if gather_size > 1:
+                    beta_logits = torch.empty(
+                        (local_num_tokens * gather_size, self.config.num_moe_experts),
+                        dtype=logits_fp32.dtype,
+                        device=logits_fp32.device,
+                    )
+                    logits_work = torch.distributed.all_gather_into_tensor(
+                        beta_logits,
+                        logits_fp32.contiguous(),
+                        group=gather_group,
+                        async_op=True,
+                    )
+                    mask_work = None
+                    if padding_mask is not None:
+                        local_padding_mask = padding_mask.to(dtype=torch.uint8)
+                        beta_padding_mask = torch.empty(
+                            local_num_tokens * gather_size,
+                            dtype=local_padding_mask.dtype,
+                            device=local_padding_mask.device,
+                        )
+                        mask_work = torch.distributed.all_gather_into_tensor(
+                            beta_padding_mask,
+                            local_padding_mask,
+                            group=gather_group,
+                            async_op=True,
+                        )
 
-            # Take this rank's rows (all_gather orders rows by rank).
-            if gather_size > 1:
-                indices = full_indices[
-                    gather_rank * local_num_tokens : (gather_rank + 1) * local_num_tokens
-                ].contiguous()
-            else:
-                indices = full_indices
+                    logits_work.wait()
+                    if mask_work is not None:
+                        mask_work.wait()
+
+                    if padding_mask is not None:
+                        beta_padding_mask = beta_padding_mask.bool()
+
+                if beta_padding_mask is not None:
+                    beta_logits = beta_logits[~beta_padding_mask]
+                if beta_logits.numel() > 0:
+                    _, beta_local = qb_dual_update(
+                        beta_logits, self.topk, self.qb_beta, update_beta=True
+                    )
+                    self.qb_beta_accum.add_(beta_local)
+                    self.qb_beta_count.add_(1)
 
         # QB only picks the experts; reuse the shared score function for the probs.
         return topk_routing_with_score_function(
@@ -716,7 +733,7 @@ class TopKRouter(Router):
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif "quantile_balancing" in self.routing_type:
-            probs, routing_map = self.quantile_balancing(logits)
+            probs, routing_map = self.quantile_balancing(logits, padding_mask=padding_mask)
         else:
             probs, routing_map = topk_routing_with_score_function(
                 logits,

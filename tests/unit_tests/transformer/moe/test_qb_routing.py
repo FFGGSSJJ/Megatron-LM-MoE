@@ -147,11 +147,6 @@ class TestQuantileBalancingRouter:
         raw_topk_experts = [0, 1]
         qb_experts = [6, 7]
 
-        def fake_qb_dual_update(scores, topk, beta, update_beta=True):
-            assert topk == 2
-            indices = torch.tensor(qb_experts, device=scores.device).expand(scores.shape[0], -1)
-            return indices, torch.zeros_like(beta)
-
         captured = {}
         original_compute_aux = router_module.compute_routing_scores_for_aux_loss
 
@@ -160,7 +155,6 @@ class TestQuantileBalancingRouter:
             captured["routing_map"] = aux_routing_map.detach().clone()
             return aux_routing_map, aux_scores
 
-        monkeypatch.setattr(router_module, "qb_dual_update", fake_qb_dual_update)
         monkeypatch.setattr(
             router_module, "compute_routing_scores_for_aux_loss", capture_compute_aux
         )
@@ -169,6 +163,9 @@ class TestQuantileBalancingRouter:
         logits[..., raw_topk_experts[0]] = 6.0
         logits[..., raw_topk_experts[1]] = 5.0
         logits.requires_grad_()
+        with torch.no_grad():
+            router.qb_beta.zero_()
+            router.qb_beta[qb_experts] = -10.0
 
         probs, routing_map = router.routing(logits)
 
@@ -185,6 +182,54 @@ class TestQuantileBalancingRouter:
         probs.sum().mul(0).backward()
         assert logits.grad is not None
         assert logits.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qb_beta_update_ignores_padding_logits(self, monkeypatch):
+        self.router = self.router.cuda()
+        self.router.train()
+
+        seq_len = 4
+        batch_size = 2
+        logits = torch.arange(
+            seq_len * batch_size * self.num_moe_experts, dtype=torch.float32, device="cuda"
+        ).reshape(seq_len, batch_size, self.num_moe_experts)
+        padding_mask = torch.tensor(
+            [
+                [False, False],
+                [True, False],
+                [True, True],
+                [False, True],
+            ],
+            dtype=torch.bool,
+            device="cuda",
+        )
+        expected_valid_logits = logits.reshape(-1, self.num_moe_experts)[
+            ~padding_mask.reshape(-1)
+        ]
+
+        calls = []
+
+        def fake_qb_dual_update(scores, topk, beta, update_beta=True):
+            calls.append(
+                {
+                    "scores": scores.detach().clone(),
+                    "update_beta": update_beta,
+                }
+            )
+            indices = torch.arange(topk, device=scores.device).expand(scores.shape[0], -1)
+            return indices, scores.mean(dim=0)
+
+        monkeypatch.setattr(router_module, "qb_dual_update", fake_qb_dual_update)
+
+        _, routing_map = self.router.routing(logits.to(torch.bfloat16), padding_mask=padding_mask)
+
+        assert len(calls) == 1
+        assert calls[0]["update_beta"] is True
+        torch.testing.assert_close(calls[0]["scores"], expected_valid_logits)
+        torch.testing.assert_close(self.router.qb_beta_accum, expected_valid_logits.mean(dim=0))
+        assert self.router.qb_beta_count.item() == 1
+        assert routing_map.shape == (seq_len * batch_size, self.num_moe_experts)
 
     @pytest.mark.internal
     def test_non_qb_router_has_no_qb_buffers(self):
