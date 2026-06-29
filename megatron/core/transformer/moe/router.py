@@ -328,6 +328,7 @@ class TopKRouter(Router):
                 beta_logits = logits_fp32
                 beta_padding_mask = padding_mask
                 if gather_size > 1:
+                    # TODO: we could cache a reusable gather buffer sized for the max token count.
                     beta_logits = torch.empty(
                         (local_num_tokens * gather_size, self.config.num_moe_experts),
                         dtype=logits_fp32.dtype,
@@ -377,7 +378,7 @@ class TopKRouter(Router):
             use_pre_softmax=self.config.moe_router_pre_softmax,
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
-            fused=self.config.moe_router_fusion,
+            fused=False,
             precomputed_indices=indices,
         )
 

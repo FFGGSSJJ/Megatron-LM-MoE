@@ -26,15 +26,15 @@ class TestQBDualUpdate:
     @pytest.mark.internal
     @pytest.mark.parametrize("m,n,k", [(64, 8, 2), (40, 8, 1), (10, 4, 1)])
     def test_column_quantile_contract(self, m, n, k):
-        """qb_beta_local is the (col_target+1)-th largest of (S - alpha) per expert."""
+        """qb_beta_local is the (col_target+1)-th largest of (scores - alpha) per expert."""
         torch.manual_seed(1)
-        S = torch.randn(m, n)
+        scores = torch.randn(m, n)
         beta = torch.zeros(n)
 
-        _, beta_local = qb_dual_update(S, k, beta, update_beta=True)
+        _, beta_local = qb_dual_update(scores, k, beta, update_beta=True)
 
-        alpha = (S - beta).topk(k + 1, dim=1).values[:, -1:]
-        adjusted = S - alpha
+        alpha = (scores - beta).topk(k + 1, dim=1).values[:, -1:]
+        adjusted = scores - alpha
         col_target = m * k // n
         expected = adjusted.sort(dim=0, descending=True).values[col_target]
         torch.testing.assert_close(beta_local, expected)
@@ -44,17 +44,17 @@ class TestQBDualUpdate:
         """One bias update corrects a systematic per-expert preference."""
         torch.manual_seed(2)
         m, n, k = 512, 8, 2
-        S = torch.randn(m, n)
+        scores = torch.randn(m, n)
         # Experts 0 and 1 intrinsically attractive -> over-selected at zero bias.
-        S[:, 0] += 4.0
-        S[:, 1] += 2.0
+        scores[:, 0] += 4.0
+        scores[:, 1] += 2.0
         col_target = m * k // n
 
-        idx0, beta_local = qb_dual_update(S, k, torch.zeros(n), update_beta=True)
+        idx0, beta_local = qb_dual_update(scores, k, torch.zeros(n), update_beta=True)
         counts0 = torch.bincount(idx0.flatten(), minlength=n)
 
         beta1 = beta_local - beta_local.mean()  # mirror the caller's re-centering
-        idx1 = (S - beta1).topk(k, dim=1).indices
+        idx1 = (scores - beta1).topk(k, dim=1).indices
         counts1 = torch.bincount(idx1.flatten(), minlength=n)
 
         imbalance0 = (counts0 - col_target).abs().sum()

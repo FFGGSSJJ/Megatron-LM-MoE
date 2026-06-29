@@ -405,6 +405,10 @@ def _update_router_qb_beta(
     stacked_accum = torch.stack(qb_beta_accum_list, dim=0)
     stacked_count = torch.stack(qb_beta_count_list, dim=0)
 
+    # NOTE: quantile_balancing gathers router logits across TP/CP before accumulating beta,
+    # so TP/CP replicas already contribute sequence-wide beta estimates here. Revisit
+    # this reduction if the TP/CP gather is removed or narrowed.
+
     # Use async op to enqueue both collectives so as to reduce CPU overhead of the calls.
     accum_reduce = torch.distributed.all_reduce(
         stacked_accum, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group, async_op=True

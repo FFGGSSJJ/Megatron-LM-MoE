@@ -203,12 +203,12 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
 
 
 def qb_dual_update(
-    S: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
+    scores: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dual coordinate-descent quantile-balancing routing assignment."""
-    m, n = S.shape
+    m, n = scores.shape
 
-    topk_result = (S - beta).topk(k + 1, dim=1)
+    topk_result = (scores - beta).topk(k + 1, dim=1)
     indices = topk_result.indices[:, :-1]
 
     if not update_beta:
@@ -216,7 +216,7 @@ def qb_dual_update(
 
     col_target = m * k // n
     alpha = topk_result.values[:, -1:]
-    beta_local = (S - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
+    beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
     return indices, beta_local
 
 
