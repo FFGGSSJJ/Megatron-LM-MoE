@@ -2061,6 +2061,8 @@ def _add_network_size_args(parser):
         "pnglu",
         "pnglu_fusion",
         "sandwich_norm",
+        "keel",
+        "keel_alpha",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2144,6 +2146,15 @@ def _add_network_size_args(parser):
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
                        'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')
+    group.add_argument('--keel', action='store_true',
+                       help='Use the KEEL Highway-style Post-LN architecture '
+                       '(arXiv:2601.19895): x = LN_post(alpha * x + Sublayer(LN_pre(x))). '
+                       'Stabilizes extreme-depth training. Requires --normalization RMSNorm and '
+                       'is mutually exclusive with --sandwich-norm.')
+    group.add_argument('--keel-alpha', type=float, default=None,
+                       help='Highway residual-scaling factor for --keel. Defaults to the total '
+                       'number of residual sub-layers (2 * num_layers) per the paper; override '
+                       'with a constant > 1 for shallower models.')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')

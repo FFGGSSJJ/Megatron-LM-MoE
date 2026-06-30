@@ -248,6 +248,22 @@ class TransformerConfig(ModelParallelConfig):
     while leaving the residual stream itself untouched, which bounds activation growth in deep
     networks. Applies to the self-attention and MLP sublayers."""
 
+    keel: bool = False
+    """If True, use the KEEL architecture (arXiv:2601.19895): a Highway-style Post-LN Transformer
+    that stabilizes extreme-depth training. Each sub-layer computes
+    `x = LN_post(alpha * x + Sublayer(LN_pre(x)))`, i.e. the residual ("highway") branch is scaled
+    by `alpha` (see `keel_alpha`) and the *summed* output is normalized (Post-LN), while the
+    sub-layer input is still pre-normalized (`LN_pre`, reusing the existing input/pre-mlp norms).
+    The very first attention and MLP sub-layers drop both `alpha` and the Post-LN, degrading to
+    plain Pre-LN to keep signal from the embedding well-conditioned. Requires RMSNorm and is
+    mutually exclusive with `sandwich_norm`."""
+
+    keel_alpha: Optional[float] = None
+    """Highway residual-scaling factor for KEEL. When None (default), `alpha` is set to the total
+    number of residual sub-layers `L = 2 * num_layers` (one attention + one MLP per layer), as
+    prescribed by the paper's gradient analysis for stable deep training. May be overridden with a
+    constant `> 1` (useful for shallower models). Only used when `keel=True`."""
+
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
@@ -1119,6 +1135,25 @@ class TransformerConfig(ModelParallelConfig):
                 "projection, leaving no point at which to normalize the sublayer output before "
                 "the residual add."
             )
+
+        if self.keel:
+            if self.normalization != "RMSNorm":
+                raise ValueError(
+                    f"keel requires --normalization RMSNorm (the KEEL paper defines all of its "
+                    f"normalization layers as RMSNorm with no bias), got {self.normalization}."
+                )
+            if self.sandwich_norm:
+                raise ValueError(
+                    "keel and sandwich_norm both control the post-attention/post-mlp norm slots "
+                    "and place the norm differently (KEEL normalizes the summed residual output, "
+                    "sandwich norm normalizes the sublayer output before the add); enable only one."
+                )
+            if self.inference_fuse_tp_communication:
+                raise ValueError(
+                    "keel is not compatible with inference_fuse_tp_communication: the fused TP "
+                    "inference kernel folds the residual add into the output projection, leaving "
+                    "no point at which to scale the residual and apply the KEEL Post-LN."
+                )
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(
