@@ -17,7 +17,8 @@ framework/
 │   └── dump-args.sh  # print the composed args for a (size,recipe) WITHOUT launching
 ├── clusters/
 │   └── alps3.sh      # GH200 machine knobs (container, mpi, precision, sbatch flags)
-├── sizes/            # model + data scale (270m-moe, 420m-moe, 810m-moe, 150m, ...)
+├── sizes/            # model + data scale (270m-moe, 420m-moe, 810m-moe, 150m,
+│                     #   the 128e scaling ladder *-moe-128e[-mla], ...; 128e-ladder.md)
 └── recipes/
     ├── md_decoupling.sh   # the md-decoupling optimizer recipe (= submit_test.sh)
     └── _template.sh       # copy to add a new optimizer/idea
@@ -87,7 +88,13 @@ A **size** (`sizes/<name>.sh`) MUST set `NUM_LAYERS HIDDEN FFN_HIDDEN NUM_HEADS
 NUM_KV_HEADS SEQ_LEN MBS GBS TRAIN_SAMPLES SAVE_INTERVAL APERTUS_TRACK` and
 `MOE_ARGS=(...)` (empty `()` for dense — only expert *geometry*; the
 DeepSeek-V3 routing policy is invariant and lives in `common.sh`). MAY set
-`TP PP CP EP INIT_STD EXIT_DURATION_MINS DEFAULT_NODES DEFAULT_TIME`.
+`TP PP CP EP INIT_STD EXIT_DURATION_MINS DEFAULT_NODES DEFAULT_TIME` and
+`MLA_ARGS=(...)` (non-empty → `common.sh` emits `--multi-latent-attention` + the
+lora ranks / per-head dims and skips GQA; default is GQA via `NUM_KV_HEADS`).
+
+The `*-moe-128e[-mla].sh` rungs are the fine-grained (128 experts, top-4)
+scaling ladder for the 670B-A40B target — see `sizes/128e-ladder.md`. MLA wiring
+is untested at runtime; smoke-test a small MLA rung before a real launch.
 
 A **recipe** (`recipes/<name>.sh`) MUST set `OPTIMIZER`, `EXP_TAG`,
 `RECIPE_ARGS=(...)`. MAY set `LR MIN_LR KNOB_STR WEIGHT_DECAY ADAM_BETA1

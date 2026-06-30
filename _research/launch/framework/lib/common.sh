@@ -104,6 +104,7 @@ KNOB_STR=${KNOB_STR:-lr${LR}}
 # `("${X[@]:-}")` idiom would inject a phantom empty-string element instead.)
 declare -p RECIPE_ARGS    >/dev/null 2>&1 || RECIPE_ARGS=()
 declare -p MOE_ARGS       >/dev/null 2>&1 || MOE_ARGS=()
+declare -p MLA_ARGS       >/dev/null 2>&1 || MLA_ARGS=()
 declare -p EXTRA_REG_ARGS >/dev/null 2>&1 || EXTRA_REG_ARGS=()
 # Escape hatch for extra architecture/network flags from a size file (appended
 # right after NETWORK_SIZE_ARGS), e.g. --post-norm for arch ablations.
@@ -194,8 +195,16 @@ NETWORK_SIZE_ARGS=(
     --hidden-size "$HIDDEN"
     --ffn-hidden-size "$FFN_HIDDEN"
     --num-attention-heads "$NUM_HEADS"
-    --group-query-attention
-    --num-query-groups "$NUM_KV_HEADS"
+)
+# Attention type: a size file sets MLA_ARGS (non-empty) to use Multi-Latent
+# Attention (DeepSeek-V3 style; the args carry the lora ranks + per-head dims);
+# otherwise the default is GQA via NUM_KV_HEADS.
+if [ "${#MLA_ARGS[@]}" -gt 0 ]; then
+    NETWORK_SIZE_ARGS+=(--multi-latent-attention "${MLA_ARGS[@]}")
+else
+    NETWORK_SIZE_ARGS+=(--group-query-attention --num-query-groups "$NUM_KV_HEADS")
+fi
+NETWORK_SIZE_ARGS+=(
     --max-position-embeddings "$SEQ_LEN"
     --position-embedding-type rope
     --rotary-base 500000
