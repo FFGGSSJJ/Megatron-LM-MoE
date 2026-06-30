@@ -684,7 +684,7 @@ class TopKRouter(Router):
                     total_num_tokens = (~padding_mask).sum().item()
 
                 tokens_per_expert = expert_max_violation_routing_map.sum(dim=0).float()
-                max_violation, min_violation, avg_violation = expert_load_violation_batchwise(
+                max_violation, min_violation, median_violation = expert_load_violation_batchwise(
                     tokens_per_expert=tokens_per_expert,
                     num_experts=self.config.num_moe_experts,
                     total_num_tokens=total_num_tokens,
@@ -693,7 +693,7 @@ class TopKRouter(Router):
                 for name, value in (
                     ("expert_max_violation", max_violation),
                     ("expert_min_violation", min_violation),
-                    ("expert_avg_violation", avg_violation),
+                    ("expert_median_violation", median_violation),
                 ):
                     save_to_aux_losses_tracker(
                         name,

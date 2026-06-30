@@ -946,11 +946,11 @@ def expert_load_violation_batchwise(
     total_num_tokens: int,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute max, min, and avg expert load violation relative to perfect balance."""
+    """Compute max, min, and median expert load violation relative to perfect balance."""
     effective_total_tokens = total_num_tokens * topk
     ideal_tokens_per_expert = effective_total_tokens / num_experts
     violation_ratios = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
-    return violation_ratios.max(), violation_ratios.min(), violation_ratios.mean()
+    return violation_ratios.max(), violation_ratios.min(), violation_ratios.median()
 
 
 def expert_max_violation_batchwise(
