@@ -171,7 +171,7 @@ fi
 # wandb project: WANDB_PROJECT overrides outright; otherwise WANDB_PROJECT_PREFIX
 # (debug.sh sets "debug-") is prepended to the base name so debug runs land in a
 # separate board.
-PROJECT=${WANDB_PROJECT:-${WANDB_PROJECT_PREFIX:-}apertus-moe-optim-baseline}
+PROJECT=${WANDB_PROJECT:-${WANDB_PROJECT_PREFIX:-}apertus-moe-arch-ablations}
 # Run name = size + recipe tag + swept knobs (+ CLUSTER_TAG on non-default
 # clusters) (+ optional RUN_TAG to disambiguate any axis KNOB_STR doesn't cover).
 EXP_NAME=${EXP_NAME:-${SIZE}-${EXP_TAG}-${KNOB_STR}${CLUSTER_TAG:-}${RUN_TAG:+-${RUN_TAG}}}
