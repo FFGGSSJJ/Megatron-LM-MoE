@@ -75,7 +75,11 @@ RECIPE_ARGS=(
     --hypersphere-mode flat
     --hypersphere-embedding-mode none
     --hypersphere-router-mode row
-    --hypersphere-scale-out-proj-init
+    # NOTE: --hypersphere-scale-out-proj-init (1/sqrt(2*num_layers) on the out-proj
+    # weight-norm/gain) is intentionally NOT set: common.sh enables
+    # --residual-output-scaling, whose forward multiplier alpha=1/sqrt(2*num_layers)
+    # is the single depth-scaling mechanism. Enabling both double-counts (the two are
+    # mutually exclusive and asserted against in arguments.py validation).
     "${RADIUS_FROM_INIT_ARGS[@]}"
     # Router uses the Muon branch.
     --md-router-use-orthogonal-updates True

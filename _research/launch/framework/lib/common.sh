@@ -183,7 +183,7 @@ fi
 # separate board.
 PROJECT=${WANDB_PROJECT:-${WANDB_PROJECT_PREFIX:-}apertus-moe-arch-ablations}
 # wandb entity (team/org board). WANDB_ENTITY overrides; default = the shared org.
-ENTITY=${WANDB_ENTITY:-apertus-org}
+ENTITY=${WANDB_ENTITY:-apertus}
 # Run name = size + recipe tag + swept knobs (+ CLUSTER_TAG on non-default
 # clusters) (+ optional RUN_TAG to disambiguate any axis KNOB_STR doesn't cover).
 EXP_NAME=${EXP_NAME:-${SIZE}-${EXP_TAG}-${KNOB_STR}${CLUSTER_TAG:-}${RUN_TAG:+-${RUN_TAG}}}

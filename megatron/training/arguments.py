@@ -1525,6 +1525,11 @@ def validate_args(args, defaults={}):
             assert args.ckpt_format == "torch", (
                 "md_decoupling with learnable gains requires --ckpt-format torch (gain state "
                 "tensors differ in shape from their parameter, which torch_dist cannot round-trip).")
+        assert not (args.hypersphere_scale_out_proj_init and args.residual_output_scaling), (
+            "--hypersphere-scale-out-proj-init and --residual-output-scaling both apply the "
+            "1/sqrt(2*num_layers) residual-branch depth scaling to the out-projections (the first "
+            "on the weight-norm/gain, the second as a forward multiplier); enabling both "
+            "double-counts and over-suppresses the residual branches. Enable exactly one.")
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
