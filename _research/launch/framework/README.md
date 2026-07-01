@@ -33,6 +33,10 @@ bash _research/launch/framework/submit.sh --size 420m-moe --recipe md_decoupling
 # sweep a knob (any recipe var can be set from the env)
 MLR=8e-3 bash _research/launch/framework/submit.sh --size 420m-moe --recipe md_decoupling
 
+# enable the extra per-step diagnostics (act/grad/neuron stats, ~20% slower; off
+# by default) for a diagnostic run
+EXTRA_LOGGING=1 bash _research/launch/framework/submit.sh --size 420m-moe --recipe md_decoupling
+
 # override nodes/time, chain jobs until TRAIN_SAMPLES is reached
 bash _research/launch/framework/submit.sh --size 810m-moe --recipe md_decoupling --nodes 4 --auto-requeue
 

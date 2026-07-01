@@ -182,13 +182,19 @@ export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=${APERTUS_FEATURE:-transformer-pp}
 export APERTUS_TRACK=${APERTUS_TRACK:-$SIZE}
 export APERTUS_RUN_NAME=$EXP_NAME-${SLURM_JOB_ID:-interactive}
-export APERTUS_LOG_ACT_STATS=1
-export APERTUS_LOG_TOP1_ACC=1
-export APERTUS_LOG_ROW_CV=1
-export APERTUS_LOG_NEURON_STATS=1
-export APERTUS_LOG_NEURON_INTERVAL=50
-export APERTUS_LOG_PER_LAYER_GRADS=1
-export APERTUS_LOG_LOSS_SPIKES=1
+# Extra per-step diagnostics (activation / gradient / neuron stats, top-1 acc,
+# router row-CV, loss-spike detection). These cost ~20% throughput, so they are
+# OFF by default; set EXTRA_LOGGING=1 to enable the suite (e.g. a diagnostic run).
+# Individual APERTUS_LOG_* vars set in the env are still honoured independently.
+if [ -n "${EXTRA_LOGGING:-}" ]; then
+    export APERTUS_LOG_ACT_STATS=1
+    export APERTUS_LOG_TOP1_ACC=1
+    export APERTUS_LOG_ROW_CV=1
+    export APERTUS_LOG_NEURON_STATS=1
+    export APERTUS_LOG_NEURON_INTERVAL=${APERTUS_LOG_NEURON_INTERVAL:-50}
+    export APERTUS_LOG_PER_LAYER_GRADS=1
+    export APERTUS_LOG_LOSS_SPIKES=1
+fi
 
 # ── invariant arg groups ─────────────────────────────────────────────────────
 TRANSFORMER_ENGINE_ARGS=(
