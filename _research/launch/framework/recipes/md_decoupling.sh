@@ -18,6 +18,9 @@
 #   MLR       matrix LR — the 2D / Muon param group; tune independently of LR
 #   GAINS_LR  absolute LR for the per-axis gains AdamW (unset → falls back to LR)
 #   MIN_LR    LR floor; --min-lr-mode absolute floors EVERY group at MIN_LR
+#   RADIUS_FROM_INIT  1 → put each flat matrix sphere at its init Frobenius norm
+#             (sqrt(min/hidden) rescale) instead of sqrt(max); keeps narrow
+#             matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere
 
 OPTIMIZER=md_decoupling
 EXP_TAG=md
@@ -28,6 +31,13 @@ GAINS_LR=${GAINS_LR:-1e-3}
 MIN_LR=${MIN_LR:-1e-4}
 KNOB_STR=lr${LR}-mlr${MLR}
 [ "$GAINS_LR" != "$LR" ] && KNOB_STR=${KNOB_STR}-glr${GAINS_LR}
+
+# Put narrow flat matrices on their init sphere instead of sqrt(max).
+RADIUS_FROM_INIT=${RADIUS_FROM_INIT:-1}
+RADIUS_FROM_INIT_ARGS=()
+if [ "$RADIUS_FROM_INIT" = 1 ]; then
+    RADIUS_FROM_INIT_ARGS=(--hypersphere-radius-from-init)
+fi
 
 # md_decoupling's canonical regularization (no weight decay; Adam betas reused
 # by the Adam branch + the gains AdamW).
@@ -66,6 +76,7 @@ RECIPE_ARGS=(
     --hypersphere-embedding-mode none
     --hypersphere-router-mode row
     --hypersphere-scale-out-proj-init
+    "${RADIUS_FROM_INIT_ARGS[@]}"
     # Router uses the Muon branch.
     --md-router-use-orthogonal-updates True
     # Learnable per-axis gains (magnitude), softplus-parametrized (positive).

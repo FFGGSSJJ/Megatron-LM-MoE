@@ -2600,6 +2600,11 @@ def _add_training_args(parser):
                        help='Scale the hypersphere target radius for is_out_proj params '
                        '(linear_proj, linear_fc2) by 1/sqrt(2 * num_layers), matching '
                        'scaled_init_method_normal.')
+    group.add_argument('--hypersphere-radius-from-init', action='store_true', default=False,
+                       help='Place each flat-mode matrix sphere at its init Frobenius norm '
+                       '(init_std=1/sqrt(hidden)) instead of sqrt(max(d_out,d_in)), rescaling both '
+                       'the projection target and the Muon update by sqrt(min(d_out,d_in)/hidden). '
+                       'Keeps narrow matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere.')
     group.add_argument('--md-router-use-orthogonal-updates',
                        type=lambda s: {'true': True, 'false': False}[s.lower()],
                        default=None, choices=[True, False],

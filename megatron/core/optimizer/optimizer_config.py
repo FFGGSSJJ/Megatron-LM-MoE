@@ -354,6 +354,12 @@ class OptimizerConfig:
     """Scale the hypersphere target radius for is_out_proj params (linear_proj, linear_fc2) by
     1/sqrt(2 * num_layers), matching scaled_init_method_normal."""
 
+    hypersphere_radius_from_init: bool = False
+    """Place each flat-mode matrix's sphere at its init Frobenius norm (init_std=1/sqrt(hidden))
+    instead of the shape-native sqrt(max(d_out,d_in)). Rescales both the projection target and the
+    Muon update by sqrt(min(d_out,d_in)/hidden), so narrow matrices (MLA lora, MoE fc2, GQA K/V)
+    stay on their init sphere. No-op for matrices whose smaller dim already equals hidden."""
+
     md_router_use_orthogonal_updates: Optional[bool] = True
     """Per-param-group override for use_orthogonal_updates on MoE router weights. True forces
     Muon for routers, False forces the Adam branch, None follows --use-orthogonal-updates."""
