@@ -13,8 +13,8 @@ NUM_KV_HEADS=5                 # unused under MLA
 SEQ_LEN=8192
 
 MBS=${MBS:-2}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-9412992}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+GBS=${GBS:-256}               # ≥ MBS×DP (128 GPU) and caps the run at ≤60k steps
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-9413120}  # ~100 tok/active-param (active from GQA twin, ÷GBS=256)
 SAVE_INTERVAL=7400
 
 APERTUS_TRACK=5a-moe-128e-mla
@@ -39,5 +39,6 @@ MOE_ARGS=(
 )
 EP=${EP:-1}
 
-DEFAULT_NODES=4
+# Sized to finish in one ~9h allocation (<12h); see the GQA twin for the rationale.
+DEFAULT_NODES=32
 DEFAULT_TIME=12:00:00

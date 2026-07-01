@@ -35,5 +35,7 @@ MOE_ARGS=(
 )
 EP=${EP:-1}                    # default pure DP (128 experts replicated per GPU)
 
-DEFAULT_NODES=2
+# Sized to finish TRAIN_SAMPLES in one ~9h allocation (<12h). ~9% MFU calibration
+# (7b/810m-active/EP4 anchor: 32 nodes for 100B tok in 12h → GPU-hours ∝ active²).
+DEFAULT_NODES=8
 DEFAULT_TIME=12:00:00

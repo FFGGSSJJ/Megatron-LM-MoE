@@ -12,16 +12,16 @@ Distinct from the 64e/top-2 ladder (`*-moe.sh`).
 
 ## Rungs (GQA)
 
-| size file | L | hidden | heads/kv | aspect | dense | moe_ffn=shared | total | active | NE-sp | MoE layers | tokens (100/act) | iters (GBS=128) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `1.5b-moe-128e` | 10 | 768  | 6/3   | 77 | 1 | 448  | 1.53B  | 0.38B | 5.69% | 9  | 38B  | 35,929  |
-| `3b-moe-128e`   | 12 | 1024 | 8/4   | 85 | 1 | 576  | 2.97B  | 0.55B | 5.64% | 11 | 55B  | 52,844  |
-| `5b-moe-128e`   | 14 | 1280 | 10/5  | 91 | 1 | 704  | 5.13B  | 0.77B | 5.61% | 13 | 77B  | 73,539  |
-| `9.3b-moe-128e` | 17 | 1536 | 12/6  | 90 | 1 | 896  | 9.28B  | 1.09B | 5.44% | 16 | 109B | 103,574 |
-| `14b-moe-128e`  | 20 | 1792 | 14/7  | 90 | 1 | 1024 | 14.43B | 1.46B | 5.43% | 19 | 146B | 139,343 |
-| `22b-moe-128e`  | 24 | 2048 | 16/8  | 85 | 1 | 1152 | 22.16B | 1.97B | 5.41% | 23 | 197B | 188,150 |
-| `120b-moe-128e` | 42 | 3584 | 28/14 | 85 | 1 | 2048 | 119.6B | 7.68B | 5.29% | 41 | 768B | 732,594 |
-| _target_        | 60 | 7168 | 128/MLA | 119 | 3 | 4096 | ~663B | ~40B | 5.85% | 57 | — | — |
+| size file | L | hidden | heads/kv | aspect | dense | moe_ffn=shared | total | active | NE-sp | MoE layers | tokens (100/act) | GBS | iters |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `1.5b-moe-128e` | 10 | 768  | 6/3   | 77 | 1 | 448  | 1.53B  | 0.38B | 5.69% | 9  | 38B  | 128  | 35,929 |
+| `3b-moe-128e`   | 12 | 1024 | 8/4   | 85 | 1 | 576  | 2.97B  | 0.55B | 5.64% | 11 | 55B  | 128  | 52,844 |
+| `5b-moe-128e`   | 14 | 1280 | 10/5  | 91 | 1 | 704  | 5.13B  | 0.77B | 5.61% | 13 | 77B  | 256  | 36,770 |
+| `9.3b-moe-128e` | 17 | 1536 | 12/6  | 90 | 1 | 896  | 9.28B  | 1.09B | 5.44% | 16 | 109B | 256  | 51,787 |
+| `14b-moe-128e`  | 20 | 1792 | 14/7  | 90 | 1 | 1024 | 14.43B | 1.46B | 5.43% | 19 | 146B | 512  | 34,836 |
+| `22b-moe-128e`  | 24 | 2048 | 16/8  | 85 | 1 | 1152 | 22.16B | 1.97B | 5.41% | 23 | 197B | 768  | 31,358 |
+| `120b-moe-128e` | 42 | 3584 | 28/14 | 85 | 1 | 2048 | 119.6B | 7.68B | 5.29% | 41 | 768B | 2048 | 45,787 |
+| _target_        | 60 | 7168 | 128/MLA | 119 | 3 | 4096 | ~663B | ~40B | 5.85% | 57 | — | — | — |
 
 Named by total params, computed for the apertus `preliminary_mul_200k` (~200k)
 vocab — the embedding + untied LM-head slabs (`2 × vocab × hidden`) are the
@@ -57,9 +57,13 @@ never reaches its target and chain-requeues). Active **includes** the embedding 
 LM-head, so the ~200k vocab raises the budget most at the small rungs (1.5b:
 27B→38B tokens vs a ~131k vocab). Override for 50 tok/active etc.
 
-**Batch:** `GBS = 128` samples × 8192 = **1.05M tokens/step**. Iters = TRAIN_SAMPLES
-/ GBS (column above). `MBS` defaults are ≤2 for the 2× activation memory at
-seq_len 8192 (override with `MBS=`).
+**Batch:** `GBS` rises with scale (128 → 2048, column above) so every rung caps
+at **≤60k steps** and stays ≥ `MBS×DP` at the (large) node counts below — bigger
+GBS is also physically apt as critical batch size grows with scale. Iters =
+TRAIN_SAMPLES / GBS. `TRAIN_SAMPLES` is nudged <0.01% on some rungs to stay an
+exact multiple of the new GBS (else the run never reaches target and chain-
+requeues). `MBS` defaults are ≤2 for the 2× activation memory at seq_len 8192
+(override with `MBS=`).
 
 ## MLA variant (`-mla`)
 
@@ -90,10 +94,31 @@ for MLA rungs (FFN+experts identical to the GQA twin; MLA attention differs by a
 few %); MLA `TRAIN_SAMPLES` reuse the GQA twin's active. MLA wiring is **untested
 at runtime** — smoke-test one small MLA rung before launching.
 
-## Parallelism
+## Parallelism & node counts
 
-**EP defaults to 1 (pure DP)** — overridable via `EP=...`. The 9.3b+ rungs
-replicate all 128 experts per GPU and will likely need `EP>1` (or more nodes,
-which shards the distributed-optimizer state) to fit memory. The **120b** anchor
-**cannot** run pure DP — it needs `EP>1` and likely TP/PP; it's mainly a config
-reference / extrapolation anchor (a 768B-token run at 100 tok/active is large).
+`DEFAULT_NODES` / `EP` / `GBS` per rung are sized from a **~9% MFU** calibration
+(a 7b/810m-active run with **EP=4** needed 32 nodes for 100B tokens in 12h on
+GH200; the ~9% MFU already includes that EP=4 all-to-all overhead). Since the
+budget is 100 tok/active, **tokens = 100 × active**, so **GPU-hours ∝ active²** —
+node counts climb fast up the ladder.
+
+| rung | nodes | GPUs | EP | GBS | MBS | est. wall @9% MFU |
+|---|---|---|---|---|---|---|
+| 1.5b | 8   | 32  | 1 | 128  | 2 | ~8.6h |
+| 3b   | 16  | 64  | 1 | 128  | 2 | ~9.0h |
+| 5b   | 32  | 128 | 1 | 256  | 2 | ~8.8h |
+| 9.3b | 64  | 256 | 1 | 256  | 1 | ~8.8h |
+| 14b  | 64  | 256 | 4 | 512  | 1 | ~16h  |
+| 22b  | 96  | 384 | 4 | 768  | 1 | ~19h  |
+| 120b | 128 | 512 | 8 | 2048 | 1 | ~9 days |
+
+- **≤9b rungs finish in one ~9h allocation** (comfortably under the ~9.9h
+  `EXIT_DURATION_MINS`) — the hard 12h target.
+- **14b/22b/120b exceed 12h**; run them with `submit.sh --auto-requeue` to chain
+  allocations until TRAIN_SAMPLES. Node count trades wall-clock, not GPU-hours,
+  so it can be raised/lowered freely (subject to memory + `GBS ≥ MBS×DP`).
+- **EP:** ≤9.3b fit at EP1 (≤~18.5GB bf16 params+grads replicated per GPU); 14b/22b
+  need EP4; 120b needs EP8 (and likely TP/PP) — a config-reference anchor.
+- These are **estimates off a single 9% MFU point**. Higher MFU (FP8 blockwise +
+  grouped-GEMM, plausibly ~25–30% on Hopper) would cut every node count ~3×;
+  measure real MFU per rung with a short profiling run and rescale.

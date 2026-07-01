@@ -39,5 +39,6 @@ MOE_ARGS=(
 )
 EP=${EP:-1}
 
-DEFAULT_NODES=4
+# Sized to finish in one ~9h allocation (<12h); see the GQA twin for the rationale.
+DEFAULT_NODES=16
 DEFAULT_TIME=12:00:00

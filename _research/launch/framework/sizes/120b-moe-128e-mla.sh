@@ -15,8 +15,8 @@ NUM_KV_HEADS=14                # unused under MLA
 SEQ_LEN=8192
 
 MBS=${MBS:-1}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-93772032}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+GBS=${GBS:-2048}             # ≥ MBS×DP (512 GPU) and caps the run at ≤60k steps
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-93771776}  # ~100 tok/active-param (active from GQA twin, ÷GBS=2048)
 SAVE_INTERVAL=73000
 
 APERTUS_TRACK=120a-moe-128e-mla
@@ -39,7 +39,9 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 2048
     --moe-layer-freq "([0]*1+[1]*41)"
 )
-EP=${EP:-1}                    # CANNOT run pure DP at this scale — set EP>1 (and likely TP/PP)
+EP=${EP:-8}                    # CANNOT run pure DP; EP8 shards experts, may still need TP/PP
 
-DEFAULT_NODES=64
+# 128 nodes is the stated upper bound for this anchor. ~9 days at ~9% MFU → many
+# chained allocations (`submit.sh --auto-requeue`), or cut tokens / raise MFU.
+DEFAULT_NODES=128
 DEFAULT_TIME=12:00:00

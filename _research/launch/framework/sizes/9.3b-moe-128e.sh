@@ -14,9 +14,9 @@ NUM_HEADS=12                   # head_dim = hidden/heads = 128
 NUM_KV_HEADS=6                 # heads/2 (constant 2:1 GQA ratio across the ladder)
 SEQ_LEN=8192
 
-MBS=${MBS:-2}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-13257472}  # ~108.6B tokens = 100 tok/active-param (÷GBS)
+MBS=${MBS:-1}                 # MBS 1 so GBS=256 = MBS×DP (256 GPU) with no grad-acc
+GBS=${GBS:-256}               # ≥ MBS×DP and caps the run at ≤60k steps (51,787 iters)
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-13257472}  # ~108.6B tokens = 100 tok/active-param (÷GBS=256)
 SAVE_INTERVAL=10400           # ~10 saves over the run
 
 APERTUS_TRACK=9.3a-moe-128e
@@ -33,6 +33,10 @@ MOE_ARGS=(
     --moe-layer-freq "([0]*1+[1]*16)"
 )
 EP=${EP:-1}                    # default pure DP; env EP>1 shards experts if memory tight
+                               # (~18.5GB bf16 params + grads replicated fits 96GB at EP1)
 
-DEFAULT_NODES=8
+# Sized to finish TRAIN_SAMPLES in one ~9h allocation (<12h) — last rung with a
+# hard 12h target. ~9% MFU calibration (7b/810m-active/EP4 anchor: 32 nodes for
+# 100B tok in 12h → GPU-hours ∝ active²).
+DEFAULT_NODES=64
 DEFAULT_TIME=12:00:00

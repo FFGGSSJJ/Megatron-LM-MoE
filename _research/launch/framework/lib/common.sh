@@ -128,6 +128,16 @@ declare -p DIST_OPT_ARGS >/dev/null 2>&1 || DIST_OPT_ARGS=(
 declare -p SRUN_EXTRA_ARGS      >/dev/null 2>&1 || SRUN_EXTRA_ARGS=(--network=disable_rdzv_get)
 declare -p CLUSTER_TRAIN_ARGS   >/dev/null 2>&1 || CLUSTER_TRAIN_ARGS=()
 declare -p MIXED_PRECISION_ARGS >/dev/null 2>&1 || MIXED_PRECISION_ARGS=(--bf16)
+# FP8 appends the DeepSeek-V3 blockwise FP8 recipe (Hopper/GH200) onto the resolved
+# MIXED_PRECISION_ARGS (bf16 base kept; FP8 only affects the fwd/bwd GEMMs). On by default;
+# FP8=0 falls back to plain bf16. NOTE: untested with the custom md_decoupling / muon optimizer
+# path — the orthogonalization and hypersphere projection stay in fp32, but smoke-test the loss
+# before trusting it on a real run.
+FP8=${FP8:-1}
+if [ "$FP8" = 1 ]; then
+    MIXED_PRECISION_ARGS+=(--fp8-format e4m3 --fp8-recipe blockwise)
+    KNOB_STR="${KNOB_STR}-fp8"
+fi
 # Container: absolute path used as-is; bare filename resolved under
 # _research/launch/. Default = gfu's deep_gemm image (see clusters/alps3.sh).
 CONTAINER=${CONTAINER:-/capstor/store/cscs/swissai/infra01/users/gfu/img/alps-pytorch2512-a139.toml}
@@ -172,6 +182,8 @@ fi
 # (debug.sh sets "debug-") is prepended to the base name so debug runs land in a
 # separate board.
 PROJECT=${WANDB_PROJECT:-${WANDB_PROJECT_PREFIX:-}apertus-moe-arch-ablations}
+# wandb entity (team/org board). WANDB_ENTITY overrides; default = the shared org.
+ENTITY=${WANDB_ENTITY:-apertus-org}
 # Run name = size + recipe tag + swept knobs (+ CLUSTER_TAG on non-default
 # clusters) (+ optional RUN_TAG to disambiguate any axis KNOB_STR doesn't cover).
 EXP_NAME=${EXP_NAME:-${SIZE}-${EXP_TAG}-${KNOB_STR}${CLUSTER_TAG:-}${RUN_TAG:+-${RUN_TAG}}}
@@ -238,6 +250,12 @@ NETWORK_SIZE_ARGS+=(
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length "$SEQ_LEN"
+    # Scaling defaults for the ladder (both fixed, non-learnable multipliers):
+    #  - upscale the embedding by sqrt(hidden); with INIT_STD=1/sqrt(hidden) the RMS entering
+    #    the network is ~1.
+    #  - scale every sublayer output by 1/sqrt(2*num_layers), i.e. x = x + alpha*f(x).
+    --scale-embeddings-by-sqrt-hidden
+    --residual-output-scaling
 )
 
 TRAINING_ARGS=(
@@ -420,9 +438,11 @@ MEGATRON_ARGS+=(
 
 if [ -n "${WANDB_API_KEY:-}" ]; then
     export WANDB_PROJECT=$PROJECT
+    export WANDB_ENTITY=$ENTITY
     export WANDB_NAME=$EXP_NAME-${SLURM_JOB_ID:-interactive}
     MEGATRON_ARGS+=(
         --wandb-project "$PROJECT"
+        --wandb-entity "$ENTITY"
         --wandb-exp-name "$EXP_NAME-${SLURM_JOB_ID:-interactive}"
         --wandb-save-dir "$WORKDIR/_research/results/runs"
     )

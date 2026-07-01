@@ -14,8 +14,8 @@ NUM_KV_HEADS=7                 # unused under MLA
 SEQ_LEN=8192
 
 MBS=${MBS:-1}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-17835904}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+GBS=${GBS:-512}               # ≥ MBS×DP (256 GPU) and caps the run at ≤60k steps
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-17836032}  # ~100 tok/active-param (active from GQA twin, ÷GBS=512)
 SAVE_INTERVAL=14000
 
 APERTUS_TRACK=14a-moe-128e-mla
@@ -38,7 +38,9 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 1024
     --moe-layer-freq "([0]*1+[1]*19)"
 )
-EP=${EP:-1}
+EP=${EP:-4}                    # shard experts across 4 ranks (matches calibration anchor)
 
-DEFAULT_NODES=8
+# No hard 12h cap (12h is a must only up to 9b). ~16h at ~9% MFU → chain with
+# `submit.sh --auto-requeue`. See the GQA twin for the rationale.
+DEFAULT_NODES=64
 DEFAULT_TIME=12:00:00

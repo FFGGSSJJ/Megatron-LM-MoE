@@ -13,9 +13,9 @@ NUM_HEADS=12                   # attention-out = heads*v_head_dim = hidden
 NUM_KV_HEADS=6                 # unused under MLA
 SEQ_LEN=8192
 
-MBS=${MBS:-2}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-13257472}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+MBS=${MBS:-1}                 # MBS 1 so GBS=256 = MBS×DP (256 GPU) with no grad-acc
+GBS=${GBS:-256}               # ≥ MBS×DP and caps the run at ≤60k steps (51,787 iters)
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-13257472}  # ~100 tok/active-param (active from GQA twin, ÷GBS=256)
 SAVE_INTERVAL=10400
 
 APERTUS_TRACK=9.3a-moe-128e-mla
@@ -40,5 +40,7 @@ MOE_ARGS=(
 )
 EP=${EP:-1}
 
-DEFAULT_NODES=8
+# Sized to finish in one ~9h allocation (<12h) — last rung with a hard 12h target.
+# See the GQA twin for the rationale.
+DEFAULT_NODES=64
 DEFAULT_TIME=12:00:00

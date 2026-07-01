@@ -14,8 +14,8 @@ NUM_KV_HEADS=5                 # heads/2 (constant 2:1 GQA ratio across the ladd
 SEQ_LEN=8192
 
 MBS=${MBS:-2}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-9412992}  # ~77.1B tokens = 100 tok/active-param (÷GBS)
+GBS=${GBS:-256}                # ≥ MBS×DP (128 GPU) and caps the run at ≤60k steps
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-9413120}  # ~77.1B tokens = 100 tok/active-param (÷GBS=256 → 36,770 iters)
 SAVE_INTERVAL=7400           # ~10 saves over the run
 
 APERTUS_TRACK=5a-moe-128e
@@ -33,5 +33,7 @@ MOE_ARGS=(
 )
 EP=${EP:-1}                    # default pure DP
 
-DEFAULT_NODES=4
+# Sized to finish TRAIN_SAMPLES in one ~9h allocation (<12h). ~9% MFU calibration
+# (7b/810m-active/EP4 anchor: 32 nodes for 100B tok in 12h → GPU-hours ∝ active²).
+DEFAULT_NODES=32
 DEFAULT_TIME=12:00:00

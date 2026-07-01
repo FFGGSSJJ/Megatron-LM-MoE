@@ -19,8 +19,8 @@ NUM_KV_HEADS=14                # heads/2 (constant 2:1 GQA ratio across the ladd
 SEQ_LEN=8192
 
 MBS=${MBS:-1}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-93772032}  # ~768B tokens = 100 tok/active-param (÷GBS)
+GBS=${GBS:-2048}              # ≥ MBS×DP (512 GPU) and caps the run at ≤60k steps
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-93771776}  # ~768B tokens = 100 tok/active-param (÷GBS=2048 → 45,787 iters)
 SAVE_INTERVAL=73000           # ~10 saves over the run
 
 APERTUS_TRACK=120a-moe-128e
@@ -36,8 +36,12 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 2048
     --moe-layer-freq "([0]*1+[1]*41)"
 )
-EP=${EP:-1}                    # CANNOT run pure DP at this scale — set EP>1 (and
-                               # likely TP/PP) to fit; 128 experts replicated won't fit a GPU
+EP=${EP:-8}                    # CANNOT run pure DP at this scale; EP8 shards experts.
+                               # May still need TP/PP to fit — this rung is an anchor.
 
-DEFAULT_NODES=64
+# 128 nodes is the stated upper bound for this anchor. At ~9% MFU the 768B-token
+# budget still needs ~9 days here → many chained allocations (launch with
+# `submit.sh --auto-requeue`), or cut the token budget / raise MFU (FP8). Mainly
+# a config-reference / extrapolation point, not a routine run.
+DEFAULT_NODES=128
 DEFAULT_TIME=12:00:00

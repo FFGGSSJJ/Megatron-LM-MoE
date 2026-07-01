@@ -15,8 +15,8 @@ NUM_KV_HEADS=7                 # heads/2 (constant 2:1 GQA ratio across the ladd
 SEQ_LEN=8192
 
 MBS=${MBS:-1}
-GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-17835904}  # ~146.1B tokens = 100 tok/active-param (÷GBS)
+GBS=${GBS:-512}               # ≥ MBS×DP (256 GPU) and caps the run at ≤60k steps
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-17836032}  # ~146.1B tokens = 100 tok/active-param (÷GBS=512 → 34,836 iters)
 SAVE_INTERVAL=14000           # ~10 saves over the run
 
 APERTUS_TRACK=14a-moe-128e
@@ -32,7 +32,11 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 1024
     --moe-layer-freq "([0]*1+[1]*19)"
 )
-EP=${EP:-1}                    # default pure DP; env EP>1 shards experts (likely needed)
+EP=${EP:-4}                    # shard experts across 4 ranks (matches the calibration
+                               # anchor's EP=4; needed to fit ~29GB bf16 params+grads)
 
-DEFAULT_NODES=8
+# No hard 12h cap here (you flagged 12h as a must only up to 9b). At ~9% MFU this
+# needs ~16h → runs across ≥2 allocations; launch with `submit.sh --auto-requeue`
+# to chain until TRAIN_SAMPLES. Fewer/more nodes trade wall-clock, not GPU-hours.
+DEFAULT_NODES=64
 DEFAULT_TIME=12:00:00
