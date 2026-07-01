@@ -12,7 +12,7 @@ NUM_HEADS=8                    # attention-out = heads*v_head_dim = hidden
 NUM_KV_HEADS=4                 # unused under MLA
 SEQ_LEN=8192
 
-MBS=${MBS:-4}
+MBS=${MBS:-2}
 GBS=${GBS:-128}
 TRAIN_SAMPLES=${TRAIN_SAMPLES:-5039232}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
 SAVE_INTERVAL=3900

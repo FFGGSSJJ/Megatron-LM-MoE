@@ -13,7 +13,7 @@ NUM_HEADS=8                    # head_dim = hidden/heads = 128
 NUM_KV_HEADS=4                 # heads/2 (constant 2:1 GQA ratio across the ladder)
 SEQ_LEN=8192
 
-MBS=${MBS:-4}
+MBS=${MBS:-2}
 GBS=${GBS:-128}
 TRAIN_SAMPLES=${TRAIN_SAMPLES:-5039232}  # ~41.3B tokens = 100 tok/active-param (÷GBS)
 SAVE_INTERVAL=3900            # ~10 saves over the run
