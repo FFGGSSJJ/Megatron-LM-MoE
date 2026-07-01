@@ -32,8 +32,10 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 896
     --moe-layer-freq "([0]*1+[1]*16)"
 )
-EP=${EP:-1}                    # default pure DP; env EP>1 shards experts if memory tight
-                               # (~18.5GB bf16 params + grads replicated fits 96GB at EP1)
+EP=${EP:-4}                    # shard 128 experts 4-ways (alltoall auto) for ~9% MFU / on-target
+                               # wall-clock; EP1 fits memory (~18.5GB bf16 params+grads) but runs
+                               # this fine-grained MoE at ~4% (~2x slower). NB: GBS=256/DP=256 = 1
+                               # seq/GPU/step here — the thinnest per-GPU batch; smoke-test the MFU.
 
 # Sized to finish TRAIN_SAMPLES in one ~9h allocation (<12h) — last rung with a
 # hard 12h target. ~9% MFU calibration (7b/810m-active/EP4 anchor: 32 nodes for

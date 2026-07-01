@@ -13,7 +13,7 @@ NUM_HEADS=6                    # attention-out = heads*v_head_dim = hidden
 NUM_KV_HEADS=3                 # unused under MLA
 SEQ_LEN=8192
 
-MBS=${MBS:-2}
+MBS=${MBS:-2}                 # measured good on 8 nodes w/ EP=4/alltoall/fp8 (~8h); max 4 (GBS>=MBS*DP)
 GBS=${GBS:-128}
 TRAIN_SAMPLES=${TRAIN_SAMPLES:-4598912}   # ~100 tok/active-param (active from GQA twin, ÷GBS)
 SAVE_INTERVAL=3600
@@ -38,7 +38,8 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 448
     --moe-layer-freq "([0]*1+[1]*9)"
 )
-EP=${EP:-1}
+EP=${EP:-4}                    # shard 128 experts 4-ways over intra-node NVLink (throughput);
+                               # requires DP % 4 == 0; try MOE_DISPATCHER=alltoall if it doesn't pay off.
 
 # Sized to finish in one ~9h allocation (<12h); see the GQA twin for the rationale.
 DEFAULT_NODES=8

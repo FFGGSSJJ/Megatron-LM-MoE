@@ -37,7 +37,7 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 576
     --moe-layer-freq "([0]*1+[1]*11)"
 )
-EP=${EP:-1}
+EP=${EP:-4}                    # shard 128 experts 4-ways (alltoall auto) for ~9% MFU; EP1 ~2x slower
 
 # Sized to finish in one ~9h allocation (<12h); see the GQA twin for the rationale.
 DEFAULT_NODES=16

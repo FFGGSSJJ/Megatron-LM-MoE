@@ -23,7 +23,7 @@ NUM_HEADS=6                    # head_dim = hidden/heads = 128
 NUM_KV_HEADS=3                 # heads/2 (constant 2:1 GQA ratio across the ladder)
 SEQ_LEN=8192
 
-MBS=${MBS:-2}
+MBS=${MBS:-2}                 # measured good on 8 nodes w/ EP=4/alltoall/fp8 (~8h); max 4 (GBS>=MBS*DP)
 GBS=${GBS:-128}
 TRAIN_SAMPLES=${TRAIN_SAMPLES:-4598912}   # ~37.7B tokens = 100 tok/active-param (÷GBS)
 SAVE_INTERVAL=3600            # ~10 saves over the run
@@ -41,7 +41,8 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 448
     --moe-layer-freq "([0]*1+[1]*9)"
 )
-EP=${EP:-1}                    # default pure DP (128 experts replicated per GPU)
+EP=${EP:-4}                    # shard 128 experts 4-ways over intra-node NVLink (throughput);
+                               # requires DP % 4 == 0; try MOE_DISPATCHER=alltoall if it doesn't pay off.
 
 # Sandwich/post-norm residual variant. Appended after NETWORK_SIZE_ARGS via the
 # common.sh escape hatch; alpha comes from --residual-output-scaling (see above).

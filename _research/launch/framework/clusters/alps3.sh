@@ -35,7 +35,16 @@ declare -p SRUN_EXTRA_ARGS >/dev/null 2>&1 || SRUN_EXTRA_ARGS=(--network=disable
 declare -p MIXED_PRECISION_ARGS >/dev/null 2>&1 || MIXED_PRECISION_ARGS=(
     --bf16
 )
-MOE_DISPATCHER=${MOE_DISPATCHER:-allgather}
+# Dispatcher default is EP-aware (EP is set by the size file, sourced before this):
+# the allgather dispatcher materializes every EP-group rank's tokens on each rank
+# (OOMs at EP>1, e.g. EP=4 = 4x the token buffer), so default to alltoall — which
+# routes each token only to its expert's rank — whenever experts are sharded.
+# EP=1 keeps allgather (cheapest with no expert sharding). Env/size still overrides.
+if [ "${EP:-1}" -gt 1 ]; then
+    MOE_DISPATCHER=${MOE_DISPATCHER:-alltoall}
+else
+    MOE_DISPATCHER=${MOE_DISPATCHER:-allgather}
+fi
 MOE_PERMUTE_FUSION=${MOE_PERMUTE_FUSION:-1}
 declare -p CLUSTER_TRAIN_ARGS >/dev/null 2>&1 || CLUSTER_TRAIN_ARGS=()
 ARCH_TAG=${ARCH_TAG:-}

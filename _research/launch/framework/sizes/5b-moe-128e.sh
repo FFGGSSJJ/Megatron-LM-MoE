@@ -31,7 +31,8 @@ MOE_ARGS=(
     --moe-shared-expert-intermediate-size 704
     --moe-layer-freq "([0]*1+[1]*13)"
 )
-EP=${EP:-1}                    # default pure DP
+EP=${EP:-4}                    # shard 128 experts 4-ways (alltoall auto) for ~9% MFU / on-target
+                               # wall-clock; EP1 runs this fine-grained MoE at ~4% (~2x slower)
 
 # Sized to finish TRAIN_SAMPLES in one ~9h allocation (<12h). ~9% MFU calibration
 # (7b/810m-active/EP4 anchor: 32 nodes for 100B tok in 12h → GPU-hours ∝ active²).

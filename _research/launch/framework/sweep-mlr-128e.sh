@@ -15,11 +15,20 @@
 # Grid: CENTER * sqrt(2)^k for k = -STEPS..STEPS  (default 1e-2, +/-3 -> 7 points,
 # spanning ~3.5e-3 .. ~2.8e-2, an 8x range).
 #
+# A second axis can be swept alongside MLR with `--vary NAME=v1,v2,...`: each value
+# is passed to submit.sh as the env var NAME. Combined with the parametrized
+# width/depth size files (which read WIDTH / DEPTH and encode it in the run name),
+# this gives the muP matrix-LR transfer sweeps:
+#   width:  --sizes 1.5b-moe-128e-width --vary WIDTH=512,768,1024,1536
+#   depth:  --sizes 1.5b-moe-128e-depth --vary DEPTH=6,10,14,20
+#
 # Usage:
-#   bash sweep-mlr-128e.sh                          # full sweep (3 sizes x 7 MLR), submit
+#   bash sweep-mlr-128e.sh                          # 1 size x 7 MLR, submit
 #   bash sweep-mlr-128e.sh --dry-run                # print the submits, launch nothing
-#   bash sweep-mlr-128e.sh --sizes 1.5b-moe-128e    # one variant only
+#   bash sweep-mlr-128e.sh --sizes 1.5b-moe-128e    # a specific variant
 #   CENTER=1e-2 STEPS=2 bash sweep-mlr-128e.sh      # narrower 5-point grid
+#   bash sweep-mlr-128e.sh --sizes 1.5b-moe-128e-width --vary WIDTH=512,768,1024,1536  # width transfer
+#   bash sweep-mlr-128e.sh --sizes 1.5b-moe-128e-depth --vary DEPTH=6,10,14,20         # depth transfer
 #   bash sweep-mlr-128e.sh --reservation            # run on the apertus 1-5 reservation (no name needed)
 #   RESERVATION=SD-OTHER-... bash sweep-mlr-128e.sh  # or a different reservation, by name
 #   TRAIN_SAMPLES=1150000 bash sweep-mlr-128e.sh    # cheaper probe budget (env passes through)
@@ -36,6 +45,7 @@ RECIPE=${RECIPE:-md_decoupling}
 SIZES=${SIZES:-"1.5b-moe-128e"}
 RESERVATION=${RESERVATION:-}   # empty = none; --reservation sets the apertus 1-5 one, or set a name here
 
+VARY_NAME=""; VARY_VALS=("")   # optional second axis (--vary NAME=v1,v2,...); default: none
 PASS=()   # flags forwarded verbatim to submit.sh
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,10 +53,11 @@ while [ $# -gt 0 ]; do
         --steps)   STEPS="$2"; shift 2 ;;
         --sizes)   SIZES="$2"; shift 2 ;;
         --recipe)  RECIPE="$2"; shift 2 ;;
+        --vary)    VARY_NAME="${2%%=*}"; IFS=',' read -r -a VARY_VALS <<<"${2#*=}"; shift 2 ;;
         --reservation) RESERVATION=$APERTUS_RESERVATION; shift ;;   # bare flag: the apertus 1-5 reservation
         --dry-run|--auto-requeue) PASS+=("$1"); shift ;;
         --nodes|--time|--cluster) PASS+=("$1" "$2"); shift 2 ;;
-        *) echo "unknown arg: $1 (sweep flags: --center --steps --sizes --recipe --reservation; rest forwarded to submit.sh)" >&2; exit 1 ;;
+        *) echo "unknown arg: $1 (sweep flags: --center --steps --sizes --recipe --vary --reservation; rest forwarded to submit.sh)" >&2; exit 1 ;;
     esac
 done
 # Forward the reservation (from the --reservation flag or a RESERVATION=... env override).
@@ -61,14 +72,19 @@ done
 echo ">>> MLR sweep (md_decoupling matrix-lr)"
 echo ">>> center=$CENTER  steps=+/-$STEPS  grid: ${MLRS[*]}"
 echo ">>> sizes: $SIZES"
+[ -n "$VARY_NAME" ] && echo ">>> vary: $VARY_NAME = ${VARY_VALS[*]}"
 echo ">>> recipe: $RECIPE${PASS[*]+  forwarded: ${PASS[*]}}"
 echo
 
 for size in $SIZES; do
-    for mlr in "${MLRS[@]}"; do
-        echo ">>> size=$size  MLR=$mlr"
-        MLR="$mlr" bash "$FRAMEWORK_DIR/submit.sh" \
-            --size "$size" --recipe "$RECIPE" \
-            ${PASS[@]+"${PASS[@]}"}
+    for vv in "${VARY_VALS[@]}"; do
+        for mlr in "${MLRS[@]}"; do
+            env_prefix=(MLR="$mlr")
+            [ -n "$VARY_NAME" ] && env_prefix+=("$VARY_NAME=$vv")
+            echo ">>> size=$size  ${VARY_NAME:+$VARY_NAME=$vv  }MLR=$mlr"
+            env "${env_prefix[@]}" bash "$FRAMEWORK_DIR/submit.sh" \
+                --size "$size" --recipe "$RECIPE" \
+                ${PASS[@]+"${PASS[@]}"}
+        done
     done
 done

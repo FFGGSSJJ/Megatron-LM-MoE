@@ -96,29 +96,42 @@ at runtime** — smoke-test one small MLA rung before launching.
 
 ## Parallelism & node counts
 
-`DEFAULT_NODES` / `EP` / `GBS` per rung are sized from a **~9% MFU** calibration
-(a 7b/810m-active run with **EP=4** needed 32 nodes for 100B tokens in 12h on
-GH200; the ~9% MFU already includes that EP=4 all-to-all overhead). Since the
-budget is 100 tok/active, **tokens = 100 × active**, so **GPU-hours ∝ active²** —
-node counts climb fast up the ladder.
+Every rung defaults to **EP=4** (`EP=8` for 120b) with the **alltoall** dispatcher
+(auto-selected for EP>1 in `clusters/alps3.sh`) and **fp8** (default on). EP=4 is
+what makes the fine-grained 128-expert MoE efficient: it shards the experts 4-ways
+over intra-node NVLink so each rank's grouped GEMM sees ~4× the tokens. **At EP=1
+these rungs run at ~4% MFU (~2× slower)** — that's a config bug, not the target.
+(EP also *lowers* memory, and is mandatory for 14b+.)
 
-| rung | nodes | GPUs | EP | GBS | MBS | est. wall @9% MFU |
-|---|---|---|---|---|---|---|
-| 1.5b | 8   | 32  | 1 | 128  | 2 | ~8.6h |
-| 3b   | 16  | 64  | 1 | 128  | 2 | ~9.0h |
-| 5b   | 32  | 128 | 1 | 256  | 2 | ~8.8h |
-| 9.3b | 64  | 256 | 1 | 256  | 1 | ~8.8h |
-| 14b  | 64  | 256 | 4 | 512  | 1 | ~16h  |
-| 22b  | 96  | 384 | 4 | 768  | 1 | ~19h  |
-| 120b | 128 | 512 | 8 | 2048 | 1 | ~9 days |
+Node counts are **measured**, not just modelled: the 1.5b at EP=4 / MBS=2 / fp8 /
+8 nodes finishes its 38B tokens in **~8 h → ~9.5% MFU (~41k tok/s/GPU, ~94
+TFLOP/s/GPU)**, matching the ~9% the ladder was sized for. Since the budget is 100
+tok/active (**tokens = 100 × active**), **GPU-hours ∝ active²**, so node counts
+climb fast up the ladder.
 
-- **≤9b rungs finish in one ~9h allocation** (comfortably under the ~9.9h
-  `EXIT_DURATION_MINS`) — the hard 12h target.
+| rung | nodes | GPUs | EP | GBS | MBS | seq/GPU·step | est. wall (~9.5% MFU) |
+|---|---|---|---|---|---|---|---|
+| 1.5b | 8   | 32  | 4 | 128  | 2 | 4 | **~8h (measured)** |
+| 3b   | 16  | 64  | 4 | 128  | 2 | 2 | ~8.4h |
+| 5b   | 32  | 128 | 4 | 256  | 2 | 2 | ~8.2h |
+| 9.3b | 64  | 256 | 4 | 256  | 1 | 1 | ~8.2h |
+| 14b  | 64  | 256 | 4 | 512  | 1 | 2 | ~15h  |
+| 22b  | 96  | 384 | 4 | 768  | 1 | 2 | ~18h  |
+| 120b | 128 | 512 | 8 | 2048 | 1 | 4 | ~8.5 days |
+
+- **≤9b rungs finish in one ~8h allocation** (under the ~9.9h `EXIT_DURATION_MINS`)
+  — the hard 12h target, now with measured headroom.
 - **14b/22b/120b exceed 12h**; run them with `submit.sh --auto-requeue` to chain
   allocations until TRAIN_SAMPLES. Node count trades wall-clock, not GPU-hours,
   so it can be raised/lowered freely (subject to memory + `GBS ≥ MBS×DP`).
-- **EP:** ≤9.3b fit at EP1 (≤~18.5GB bf16 params+grads replicated per GPU); 14b/22b
-  need EP4; 120b needs EP8 (and likely TP/PP) — a config-reference anchor.
-- These are **estimates off a single 9% MFU point**. Higher MFU (FP8 blockwise +
-  grouped-GEMM, plausibly ~25–30% on Hopper) would cut every node count ~3×;
-  measure real MFU per rung with a short profiling run and rescale.
+- **Thin per-GPU batches:** the aggressive node counts leave only 1–4 sequences per
+  GPU per step (9.3b is thinnest at 1). The ~9.5% MFU is measured at the 1.5b's 4
+  seq/GPU·step; rungs at 1–2 may sag lower, so **smoke-test each rung's throughput
+  before trusting its wall-clock** (esp. 9.3b). If one is MFU-starved, bumping its
+  GBS (fewer, fatter steps) is the lever — it doesn't change total tokens.
+- **EP likely grows for the larger rungs.** EP=4 is the **intra-node NVLink sweet
+  spot** (4 GPUs/node), so its all-to-all never leaves the node — that's why even the
+  1.5b already wins at EP=4. The bigger rungs may want EP=8/16 for memory headroom
+  and larger per-expert GEMMs, but **EP>4 crosses node boundaries** (inter-node
+  all-to-all over the slower fabric), so it's a per-rung measurement, not an
+  assumption: weigh the GEMM/memory gain against the slower dispatch.
