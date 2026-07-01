@@ -304,17 +304,44 @@ LOGGING_ARGS=(
 # with LR_DECAY_SAMPLES to anneal over just the continuation. Not crash-resume-safe.
 [ -n "${NO_LOAD_OPTIM:-}" ] && LOGGING_ARGS+=(--no-load-optim)
 
+# The apertus multilingual 200k tokenizer, as raw HF json (tokenizer.json +
+# tokenizer_config.json + special_tokens_map.json) vendored under _research/data/
+# from swiss-ai/apertus-tokenizer-development (preliminary_mul_200k). A local dir
+# is passed straight to AutoTokenizer.from_pretrained, so no HF-hub/LFS access is
+# needed at runtime. Override with TOKENIZER_MODEL (a local dir or a hub id).
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model "${TOKENIZER_MODEL:-alehc/swissai-tokenizer}"
+    --tokenizer-model "${TOKENIZER_MODEL:-$WORKDIR/_research/data/apertus-mul-200k-tokenizer}"
 )
 
-# Dataset: a blend of swissai sources under DATA_ROOT. Each source dir holds many
-# dump-N-merged.{bin,idx} shards; we glob every shard prefix and hand the flat
-# list to --train-data-path, letting Megatron infer blend weights from the shard
-# lengths (so the mixture is token-proportional across sources). Override the
-# mixture with DATA_ROOT / DATA_SOURCES, or set MEGATRON_DATA_PATH to fall back
-# to a single --data-path prefix (e.g. the GPT2BPE climbmix debug set).
+# Named data presets: a size file sets DATA_PRESET to pick a pre-tokenized blend
+# without hardcoding the (long) paths in every rung. Explicit DATA_ROOT /
+# DATA_SOURCES / MEGATRON_DATA_PATH from the env or a size file still win (the
+# preset only fills what's unset). Add a new blend by adding a case arm here.
+case "${DATA_PRESET:-}" in
+    fineweb2hq-mul200k)
+        # fineweb-2-hq mmbert quality_10, tokenized with the apertus
+        # preliminary_mul_200k tokenizer (apertus_v2). Used by the 128e ladder.
+        # Default = the fwedu SPP-annotated split. Set INCLUDE_DCLM=1 to switch to
+        # the dclm-edu SPP-annotated split instead (the two are alternatives, not
+        # blended).
+        : "${DATA_ROOT:=/capstor/store/cscs/swissai/infra01/datasets_tokenized}"
+        if [ -n "${INCLUDE_DCLM:-}" ]; then
+            _fw2hq_split=dclm
+        else
+            _fw2hq_split=fwedu
+        fi
+        : "${DATA_SOURCES:=swissai-fineweb-2-hq-mmbert-full-quality_10-filterrobots-${_fw2hq_split}_spp_annotated_apertus_v2/preliminary_mul_200k/swissai-fineweb-2-hq-mmbert-full-quality_10-filterrobots-${_fw2hq_split}_spp_annotated}" ;;
+    "") : ;;   # no preset — fall through to the default swissai blend below
+    *) echo "unknown DATA_PRESET: $DATA_PRESET (see lib/common.sh)" >&2; exit 1 ;;
+esac
+
+# Dataset: a blend of sources under DATA_ROOT. Each source dir holds many
+# {bin,idx} shards (possibly nested, e.g. dump-N/00000_tokens.*); we glob every
+# shard prefix and hand the flat list to --train-data-path, letting Megatron
+# infer blend weights from the shard lengths (so the mixture is token-proportional
+# across sources). Override the mixture with DATA_PRESET, DATA_ROOT / DATA_SOURCES,
+# or set MEGATRON_DATA_PATH to fall back to a single --data-path prefix.
 DATA_ROOT=${DATA_ROOT:-/iopsstor/scratch/cscs/jpcoles/a06}
 DATA_SOURCES=${DATA_SOURCES:-"
     swissai-dclm-edu-filterrobots_fine-merge

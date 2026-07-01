@@ -20,6 +20,9 @@ SAVE_INTERVAL=16100
 
 APERTUS_TRACK=22a-moe-128e-mla
 
+# 128e ladder trains on the fineweb-2-hq mul_200k blend (see lib/common.sh).
+DATA_PRESET=${DATA_PRESET:-fineweb2hq-mul200k}
+
 MLA_ARGS=(
     --q-lora-rank 480
     --kv-lora-rank 160

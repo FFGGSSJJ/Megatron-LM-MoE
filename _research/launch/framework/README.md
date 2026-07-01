@@ -64,13 +64,26 @@ code's flag names (`--muon-use-nesterov`, `--md-router-use-orthogonal-updates`).
 
 ## Data & tokenizer
 
-Default data is the swissai blend under `/iopsstor/scratch/cscs/jpcoles/a06`
-(token-proportional across sources), tokenized with the apertus/swissai
-HuggingFace tokenizer (`--tokenizer-type HuggingFaceTokenizer --tokenizer-model
-alehc/swissai-tokenizer`). Override the tokenizer with `TOKENIZER_MODEL`, the
-mixture with `DATA_ROOT`/`DATA_SOURCES`, or set `MEGATRON_DATA_PATH` for a
-single `--data-path` prefix (e.g. the GPT2BPE climbmix debug set — pair it with
-a matching tokenizer override since climbmix is GPT2BPE-tokenized).
+**Tokenizer**: the apertus multilingual 200k tokenizer (`preliminary_mul_200k`),
+vendored as raw HF json under `_research/data/apertus-mul-200k-tokenizer/`
+(`tokenizer.json` + `tokenizer_config.json` + `special_tokens_map.json`, pulled
+from `swiss-ai/apertus-tokenizer-development`). Loaded from that local dir via
+`--tokenizer-type HuggingFaceTokenizer` (no HF-hub/LFS access at runtime).
+Override with `TOKENIZER_MODEL` (a local dir or a hub id).
+
+**Data**: sources under `DATA_ROOT` are glob'd for `.bin/.idx` shards (possibly
+nested) and handed to `--train-data-path` as a token-proportional blend. Pick a
+blend three ways, most-specific-wins:
+- `DATA_PRESET=<name>` — a named pre-tokenized blend defined in `common.sh`. The
+  **128e ladder** sets `DATA_PRESET=fineweb2hq-mul200k` = the fineweb-2-hq mmbert
+  quality_10 set (`_apertus_v2`, mul_200k-tokenized) under
+  `/capstor/.../datasets_tokenized`. Default is the **fwedu** SPP-annotated split;
+  set `INCLUDE_DCLM=1` to use the **dclm-edu** split instead (alternatives, not
+  blended).
+- `DATA_ROOT` + `DATA_SOURCES` — an explicit glob root + source list (the default
+  when no preset: the swissai blend under `/iopsstor/scratch/cscs/jpcoles/a06`).
+- `MEGATRON_DATA_PATH` — a single `--data-path` prefix (e.g. a GPT2BPE debug set;
+  pair with a matching `TOKENIZER_MODEL` if the vocab must match the data).
 
 ## Container
 
@@ -88,9 +101,9 @@ A **size** (`sizes/<name>.sh`) MUST set `NUM_LAYERS HIDDEN FFN_HIDDEN NUM_HEADS
 NUM_KV_HEADS SEQ_LEN MBS GBS TRAIN_SAMPLES SAVE_INTERVAL APERTUS_TRACK` and
 `MOE_ARGS=(...)` (empty `()` for dense — only expert *geometry*; the
 DeepSeek-V3 routing policy is invariant and lives in `common.sh`). MAY set
-`TP PP CP EP INIT_STD EXIT_DURATION_MINS DEFAULT_NODES DEFAULT_TIME` and
-`MLA_ARGS=(...)` (non-empty → `common.sh` emits `--multi-latent-attention` + the
-lora ranks / per-head dims and skips GQA; default is GQA via `NUM_KV_HEADS`).
+`TP PP CP EP INIT_STD EXIT_DURATION_MINS DEFAULT_NODES DEFAULT_TIME DATA_PRESET`
+and `MLA_ARGS=(...)` (non-empty → `common.sh` emits `--multi-latent-attention` +
+the lora ranks / per-head dims and skips GQA; default is GQA via `NUM_KV_HEADS`).
 
 The `*-moe-128e[-mla].sh` rungs are the fine-grained (128 experts, top-4)
 scaling ladder for the 670B-A40B target — see `sizes/128e-ladder.md`. MLA wiring

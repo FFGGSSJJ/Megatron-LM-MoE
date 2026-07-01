@@ -22,6 +22,9 @@ SAVE_INTERVAL=2600            # ~10 saves over the run
 
 APERTUS_TRACK=1.4a-moe-128e
 
+# 128e ladder trains on the fineweb-2-hq mul_200k blend (see lib/common.sh).
+DATA_PRESET=${DATA_PRESET:-fineweb2hq-mul200k}
+
 # Expert geometry only — routing policy is in common.sh.
 MOE_ARGS=(
     --num-experts 128
