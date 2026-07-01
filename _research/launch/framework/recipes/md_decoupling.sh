@@ -23,7 +23,7 @@
 #             matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere
 
 OPTIMIZER=md_decoupling
-EXP_TAG=md
+EXP_TAG=muonmd
 
 LR=${LR:-1e-3}
 MLR=${MLR:-1e-2}

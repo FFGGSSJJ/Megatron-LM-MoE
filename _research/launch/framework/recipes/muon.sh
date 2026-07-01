@@ -27,7 +27,7 @@
 EXP_TAG=muon
 
 LR=${LR:-1e-3}
-MIN_LR=${MIN_LR:-1e-5}
+MIN_LR=${MIN_LR:-1e-4}
 KNOB_STR=lr${LR}
 
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}

@@ -25,7 +25,7 @@ EXP_TAG=my-idea                # short slug -> shows up in EXP_NAME
 
 # Learning rate + schedule (omit any line to take common.sh's default).
 LR=${LR:-3e-4}
-MIN_LR=${MIN_LR:-1e-5}
+MIN_LR=${MIN_LR:-1e-4}
 KNOB_STR=lr${LR}               # appended to the run name; add the knobs you sweep
 
 # Regularization (optional overrides).
