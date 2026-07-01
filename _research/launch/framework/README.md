@@ -47,6 +47,30 @@ per-cluster sbatch flags (`--account=infra01`, cpus, mem) from
 `--dependency=singleton` (a resubmit of the same point queues instead of
 double-writing the checkpoint dir).
 
+## Debug it interactively
+
+`debug.sh` is the interactive twin of `submit.sh`: same `--size/--recipe`, but it
+runs inline via `torchrun` (no SLURM srun wrapper) for a few iters, so you can
+iterate in an allocation. Grab a node **inside the framework's container**, then:
+
+```bash
+CONTAINER=/capstor/store/cscs/swissai/infra01/users/gfu/img/alps-pytorch2512-a139.toml
+srun --account=infra01 --time=01:00:00 --nodes=1 --gpus-per-node=4 \
+     --cpus-per-task=72 --mem=460000 --mpi=pmix \
+     --network=disable_rdzv_get --environment=$CONTAINER --pty bash
+# ... now inside the container, from the repo root ...
+
+bash _research/launch/framework/debug.sh --size 270m-moe --recipe md_decoupling --iters 10
+bash _research/launch/framework/debug.sh --size 270m-moe --recipe md_decoupling --dry-run
+bash _research/launch/framework/debug.sh --size 270m-moe --recipe md_decoupling -- --lr 1e-4
+```
+
+A short run is just a small `TRAIN_SAMPLES = iters × GBS` override (the run stays
+sample-based, identical in shape to a real launch). Defaults: 4 ranks, 20 iters,
+10-min cap; debug runs land in a `debug-` wandb board. `debug.sh` calls
+`_research/launch/interactive-run.sh`, which sources the sbatch with the srun
+stubbed (`COMMON_NO_LAUNCH=1`) and launches `torchrun --standalone` directly.
+
 ## The md_decoupling recipe
 
 `--optimizer md_decoupling`: hypersphere normalization (direction) on 2D
