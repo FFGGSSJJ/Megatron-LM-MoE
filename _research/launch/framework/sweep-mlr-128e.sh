@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
         --vary)    VARY_NAME="${2%%=*}"; IFS=',' read -r -a VARY_VALS <<<"${2#*=}"; shift 2 ;;
         --reservation) RESERVATION=$APERTUS_RESERVATION; shift ;;   # bare flag: the apertus 1-5 reservation
         --dry-run|--auto-requeue) PASS+=("$1"); shift ;;
-        --nodes|--time|--cluster) PASS+=("$1" "$2"); shift 2 ;;
+        --nodes|--time|--cluster|--begin) PASS+=("$1" "$2"); shift 2 ;;
         *) echo "unknown arg: $1 (sweep flags: --center --steps --sizes --recipe --vary --reservation; rest forwarded to submit.sh)" >&2; exit 1 ;;
     esac
 done

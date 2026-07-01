@@ -45,8 +45,17 @@ MOE_ARGS=(
 EP=${EP:-4}                    # shard 128 experts 4-ways over intra-node NVLink (throughput);
                                # requires DP % 4 == 0; try MOE_DISPATCHER=alltoall if it doesn't pay off.
 
-# Surface the depth in the run/wandb name so each depth point is a distinct run.
-ARCH_KNOB_STR="L${NUM_LAYERS}"
+# Optional sandwich (post-)norm via SANDWICH=1: adds --sandwich-norm (its alpha comes
+# from the ladder's --residual-output-scaling, already on) and tags the run so it stays
+# distinct from the plain-norm depth twin. See 1.5b-moe-128e-sandwich.sh for the details.
+EXTRA_NETWORK_ARGS=()
+_SW_TAG=""
+if [ "${SANDWICH:-0}" = 1 ]; then
+    EXTRA_NETWORK_ARGS=(--sandwich-norm)
+    _SW_TAG="-sandwich"
+fi
+# Surface depth (+ sandwich) in the run/wandb name so each point is a distinct run.
+ARCH_KNOB_STR="L${NUM_LAYERS}${_SW_TAG}"
 
 # Node count fixed for the family; deeper points run longer at the same node count
 # (node-hours are constant — pass --nodes N / --auto-requeue to trade wall-clock).

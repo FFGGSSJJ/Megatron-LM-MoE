@@ -23,6 +23,7 @@ FRAMEWORK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 
 NODES=""; TIME=""; DRY=""; AUTO_RQ=""; CLUSTER=${CLUSTER:-alps3}
 RESERVATION=${RESERVATION:-}
+BEGIN=${BEGIN:-}          # delay first start, e.g. --begin now+8hours (sbatch --begin syntax)
 while [ $# -gt 0 ]; do
     case "$1" in
         --size)    SIZE="$2"; shift 2 ;;
@@ -31,6 +32,7 @@ while [ $# -gt 0 ]; do
         --nodes)   NODES="$2"; shift 2 ;;
         --time)    TIME="$2"; shift 2 ;;
         --reservation) RESERVATION="$2"; shift 2 ;;
+        --begin)   BEGIN="$2"; shift 2 ;;
         --auto-requeue) AUTO_RQ=1; shift ;;
         --dry-run) DRY=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -87,10 +89,12 @@ fi
 # sbatch flag itself doesn't survive into chained jobs).
 [ -n "$RESERVATION" ] && EXPORT="$EXPORT,RESERVATION=$RESERVATION"
 
-echo ">>> sbatch --nodes=$NODES --time=$TIME --job-name=$JOB_NAME ${CLUSTER_SBATCH_FLAGS[@]+${CLUSTER_SBATCH_FLAGS[*]}}${RESERVATION:+ --reservation=$RESERVATION} (SIZE=$SIZE RECIPE=$RECIPE CLUSTER=$CLUSTER)"
+echo ">>> sbatch --nodes=$NODES --time=$TIME --job-name=$JOB_NAME ${CLUSTER_SBATCH_FLAGS[@]+${CLUSTER_SBATCH_FLAGS[*]}}${RESERVATION:+ --reservation=$RESERVATION}${BEGIN:+ --begin=$BEGIN} (SIZE=$SIZE RECIPE=$RECIPE CLUSTER=$CLUSTER)"
 # --dependency=singleton: at most one job with this (knob-unique) name runs at
 # a time, so rerunning a sweep/submit while a same-point job is still queued or
 # running QUEUES the new one instead of double-writing the checkpoint dir.
+# --begin (optional) delays only this first submission; auto-requeue chain links
+# run afterany the previous one, so they don't need (and shouldn't have) the delay.
 exec sbatch \
     --nodes="$NODES" \
     --time="$TIME" \
@@ -98,5 +102,6 @@ exec sbatch \
     --dependency=singleton \
     ${CLUSTER_SBATCH_FLAGS[@]+"${CLUSTER_SBATCH_FLAGS[@]}"} \
     ${RESERVATION:+--reservation="$RESERVATION"} \
+    ${BEGIN:+--begin="$BEGIN"} \
     --export="$EXPORT" \
     "$FRAMEWORK_DIR/train.sbatch"
