@@ -38,7 +38,7 @@ LR_DECAY_STYLE=${LR_DECAY_STYLE:-linear}
 LR_WARMUP_SAMPLES=${LR_WARMUP_SAMPLES:-0}
 
 MUON_MOMENTUM=${MUON_MOMENTUM:-0.95}
-MUON_SCALE_MODE=${MUON_SCALE_MODE:-shape_up}
+MUON_SCALE_MODE=${MUON_SCALE_MODE:-shape_scaling}
 MUON_SCALAR_OPT=${MUON_SCALAR_OPT:-adam}
 
 # dist_muon shards optimizer state over DP (layer-wise, from the optimizer name)
