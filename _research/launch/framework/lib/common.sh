@@ -64,6 +64,12 @@ export TRITON_CACHE_DIR=$REPO_DIR/cache/triton${ARCH_TAG:-}
 export TORCHINDUCTOR_CACHE_DIR=$REPO_DIR/cache/inductor${ARCH_TAG:-}
 export TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-72}
+# numexpr (pulled in transitively, e.g. via pandas) sizes its thread pool to the
+# detected core count (72/task on GH200) and ERRORS at import when that exceeds
+# NUMEXPR_MAX_THREADS (default 64). Pin the pool to our CPU budget and raise the
+# ceiling well above any node's core count so the import never trips.
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}
+export NUMEXPR_MAX_THREADS=${NUMEXPR_MAX_THREADS:-512}
 export TMPDIR=$TMP_CACHE_DIR
 # Data is pre-tokenized .bin/.idx; the HF tokenizer is only loaded for vocab
 # metadata, so its thread pool is useless — silence the fork warning.
