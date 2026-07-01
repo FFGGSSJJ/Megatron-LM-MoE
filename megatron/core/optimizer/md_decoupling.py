@@ -307,15 +307,21 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             )
         if self.is_qkv_down_proj_fn(p):
             assert self.qkv_down_proj_split_shapes is not None
+            shapes = self._local_dim0_split_shapes(
+                p, x, self.qkv_down_proj_split_shapes, allow_groups=False
+            )
             return (
-                list(torch.split(x, self.qkv_down_proj_split_shapes, dim=0)),
+                list(torch.split(x, shapes, dim=0)),
                 lambda parts: torch.cat(parts, dim=0),
             )
         if self.is_kv_up_proj_fn(p):
             assert self.kv_up_proj_split_shapes is not None
+            shapes = self._local_dim0_split_shapes(
+                p, x, self.kv_up_proj_split_shapes, allow_groups=True
+            )
             return (
-                _split_grouped_dim0(x, self.kv_up_proj_split_shapes),
-                lambda parts: _merge_grouped_dim0(parts, x.shape, self.kv_up_proj_split_shapes),
+                _split_grouped_dim0(x, shapes),
+                lambda parts: _merge_grouped_dim0(parts, x.shape, shapes),
             )
         if self.split_mla_per_head and self.is_q_up_proj_fn(p):
             assert self.q_up_proj_head_dim is not None
@@ -324,6 +330,44 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 lambda parts: _merge_heads_dim0(parts, x.shape),
             )
         return None
+
+    def _local_dim0_split_shapes(self, p, x, shapes, allow_groups: bool):
+        shapes = tuple(shapes)
+        total = sum(shapes)
+        dim0 = x.size(0)
+        if dim0 == total or (allow_groups and dim0 % total == 0):
+            return shapes
+        if getattr(p, "partition_dim", None) != 0:
+            return shapes
+
+        tp_size = 1
+        if self.pg_collection is not None:
+            tp_group = (
+                self.pg_collection.expt_tp
+                if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp
+            )
+            tp_size = get_pg_size(tp_group)
+        if tp_size == 1 and total % dim0 == 0:
+            tp_size = total // dim0
+        if tp_size <= 1:
+            raise ValueError(
+                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"tensor dim0 {dim0} and global split shapes {shapes}"
+            )
+        if any(shape % tp_size != 0 for shape in shapes):
+            raise ValueError(
+                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"over TP size {tp_size}"
+            )
+
+        local_shapes = tuple(shape // tp_size for shape in shapes)
+        local_total = sum(local_shapes)
+        if dim0 != local_total and not (allow_groups and dim0 % local_total == 0):
+            raise ValueError(
+                f"Local split shapes {local_shapes} do not match tensor dim0 {dim0}"
+            )
+        return local_shapes
 
     def _orthogonalize_param(self, p, grad, is_qkv: bool = False):
         """Newton-Schulz orthogonalization, with optional QKV/MLA split."""

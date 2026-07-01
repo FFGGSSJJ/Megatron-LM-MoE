@@ -558,6 +558,24 @@ def test_md_decoupling_mla_kv_up_proj_split():
     assert torch.equal(output[8:], torch.full_like(output[8:], 2.0))
 
 
+def test_md_decoupling_mla_kv_up_proj_split_uses_local_dim0_tp_shapes():
+    param = torch.nn.Parameter(torch.empty(10, 4))
+    param.is_kv_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(12, 8),
+    )
+
+    assert [call.shape for call in calls] == [torch.Size([6, 4]), torch.Size([4, 4])]
+    assert torch.equal(output[:6], torch.ones_like(output[:6]))
+    assert torch.equal(output[6:], torch.full_like(output[6:], 2.0))
+
+
 def test_md_decoupling_mla_kv_up_proj_split_per_head():
     param = torch.nn.Parameter(torch.empty(10, 4))
     param.is_kv_up_proj = True
@@ -611,6 +629,24 @@ def test_md_decoupling_mla_qkv_down_proj_split_mechanics():
     )
 
     assert [call.shape for call in calls] == [torch.Size([2, 4]), torch.Size([3, 4])]
+    assert torch.equal(output[:2], torch.ones_like(output[:2]))
+    assert torch.equal(output[2:], torch.full_like(output[2:], 2.0))
+
+
+def test_md_decoupling_mla_qkv_down_proj_split_uses_local_dim0_tp_shapes():
+    param = torch.nn.Parameter(torch.empty(6, 4))
+    param.is_qkv_down_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(24, dtype=torch.float32).view(6, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
+        qkv_down_proj_split_shapes=(4, 8),
+    )
+
+    assert [call.shape for call in calls] == [torch.Size([2, 4]), torch.Size([4, 4])]
     assert torch.equal(output[:2], torch.ones_like(output[:2]))
     assert torch.equal(output[2:], torch.full_like(output[2:], 2.0))
 
