@@ -163,7 +163,7 @@ if [ "${#MOE_ARGS[@]}" -gt 0 ]; then
     MOE_ARGS+=(
         --moe-router-score-function sigmoid
         --moe-router-enable-expert-bias
-        --moe-router-bias-update-rate 1e-3
+        --moe-router-bias-update-rate 1e-2
         --moe-router-topk-scaling-factor 2.5
         --moe-router-dtype fp32
         --moe-router-load-balancing-type seq_aux_loss
@@ -411,7 +411,7 @@ else
 fi
 DATA_ARGS+=(
     --data-cache-path "$DATASET_CACHE_DIR"
-    --num-workers ${NUM_WORKERS:-4}
+    --num-workers ${NUM_WORKERS:-2}
 )
 
 # Flat array. RECIPE_ARGS sits where each legacy file put its optimizer block.
