@@ -211,8 +211,19 @@ NETWORK_SIZE_ARGS=(
 # Attention type: a size file sets MLA_ARGS (non-empty) to use Multi-Latent
 # Attention (DeepSeek-V3 style; the args carry the lora ranks + per-head dims);
 # otherwise the default is GQA via NUM_KV_HEADS.
+#
+# MLA_ROPE_FUSION (default 0 = off): MLA defaults rope_type=yarn + apply_rope_fusion=True,
+# which routes through the experimental fused_mla_yarn_rope_apply Triton kernel. That kernel
+# autotunes BLOCK_H against head_num and faults (CUDA illegal access) on at least head_num=6
+# (the 1.4b rung). We default it OFF for all MLA rungs — the unfused YaRN path is numerically
+# identical here (rotary_scaling_factor=mscale=1.0 → yarn ≡ plain RoPE) and RoPE is a
+# negligible fraction of compute. Re-enable per size (MLA_ROPE_FUSION=1 in the size file or
+# env) ONLY after a smoke test confirms that head_num runs without the fused-kernel crash.
+# GQA rungs are unaffected and keep fused RoPE.
+MLA_ROPE_FUSION=${MLA_ROPE_FUSION:-0}
 if [ "${#MLA_ARGS[@]}" -gt 0 ]; then
     NETWORK_SIZE_ARGS+=(--multi-latent-attention "${MLA_ARGS[@]}")
+    [ "$MLA_ROPE_FUSION" = "1" ] || NETWORK_SIZE_ARGS+=(--no-rope-fusion)
 else
     NETWORK_SIZE_ARGS+=(--group-query-attention --num-query-groups "$NUM_KV_HEADS")
 fi
