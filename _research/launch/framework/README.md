@@ -21,6 +21,7 @@ framework/
 │                     #   the 128e scaling ladder *-moe-128e[-mla], ...; 128e-ladder.md)
 └── recipes/
     ├── md_decoupling.sh   # the md-decoupling optimizer recipe (= submit_test.sh)
+    ├── muon.sh            # Muon on matrices + AdamW scalars (dist_muon by default)
     └── _template.sh       # copy to add a new optimizer/idea
 ```
 
