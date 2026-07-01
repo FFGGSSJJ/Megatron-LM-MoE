@@ -157,7 +157,7 @@ if [ "${#MOE_ARGS[@]}" -gt 0 ]; then
         --moe-router-topk-scaling-factor 2.5
         --moe-router-dtype fp32
         --moe-router-load-balancing-type seq_aux_loss
-        --moe-aux-loss-coeff "${MOE_AUX_LOSS_COEFF:-1e-3}"
+        --moe-aux-loss-coeff "${MOE_AUX_LOSS_COEFF:-1e-4}"
         --moe-grouped-gemm
     )
     [ "${MOE_PERMUTE_FUSION:-1}" = 1 ] && MOE_ARGS+=(--moe-permute-fusion)
