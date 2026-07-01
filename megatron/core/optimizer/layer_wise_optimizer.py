@@ -235,13 +235,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         def _allgather_helper_experts_param(params_list, group):
             rank = get_pg_rank(group)
             world_size = get_pg_size(group)
-            # fall back to the GPU path if there are no params or they aren't on CPU
-            if len(params_list[rank]) == 0 or params_list[rank][0].device.type != 'cpu':
+
+            # Parameter assignment may leave some ranks with an empty shard. Determine the
+            # communication path from all shards rather than indexing the local shard.
+            first_param = next((p for shard in params_list for p in shard), None)
+            if first_param is None:
+                return
+
+            # The generic path requires every tensor to be accepted by the process-group
+            # backend. Stage through CUDA whenever any expert parameter is CPU-offloaded.
+            if not any(p.device.type == 'cpu' for shard in params_list for p in shard):
                 _allgather_helper(params_list, group)
                 return
 
             dest_device = torch.cuda.current_device()
-            dtype = params_list[rank][0].dtype
+            dtype = first_param.dtype
 
             # Rank-by-rank broadcast through a single flat GPU scratch buffer
             # to reduce peak GPU memory usage

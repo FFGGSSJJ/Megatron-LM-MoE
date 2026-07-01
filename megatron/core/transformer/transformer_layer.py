@@ -423,6 +423,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
+        # KEEL (arXiv:2601.19895): Highway-style Post-LN. Each sub-layer computes
+        #   x = LN_post(alpha * x + Sublayer(LN_pre(x)))
+        # where LN_pre is the existing input/pre-mlp norm and LN_post is the post_*_layernorm slot
+        # built by the spec. The residual ("highway") branch is scaled by alpha (applied in
+        # _forward_attention / _forward_post_mlp). The very first attention and MLP sub-layers
+        # (decoder layer 1) drop alpha and LN_post, degrading to plain Pre-LN so that signal out of
+        # the embedding stays well-conditioned.
+        self.keel = self.config.keel
+        if self.keel:
+            keel_is_first_layer = (self.layer_number == 1) and not self.is_mtp_layer
+            if self.config.keel_alpha is not None:
+                keel_alpha = float(self.config.keel_alpha)
+            else:
+                # L = total residual sub-layers = one attention + one MLP per decoder layer.
+                keel_alpha = float(2 * self.config.num_layers)
+            self.keel_residual_scale = 1.0 if keel_is_first_layer else keel_alpha
+            if keel_is_first_layer:
+                # Remove the Post-LN: these sub-layers act as standard Pre-LN blocks.
+                self.post_self_attn_layernorm = IdentityOp()
+                self.post_mlp_layernorm = IdentityOp()
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
@@ -675,9 +696,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         # Optional sandwich norm: normalize the self-attention output before the residual add.
-        attention_output_with_bias = self._apply_post_norm(
-            attention_output_with_bias, self.post_self_attn_layernorm
-        )
+        # Skipped under KEEL, which instead normalizes the *summed* output after the add (below).
+        if not self.keel:
+            attention_output_with_bias = self._apply_post_norm(
+                attention_output_with_bias, self.post_self_attn_layernorm
+            )
+
+        # KEEL highway scaling: scale the residual ("carry") branch by alpha before the add, so the
+        # bias-dropout-add computes `alpha * x + Attn(LN(x))`. (No-op scale of 1.0 on layer 1.)
+        if self.keel:
+            residual = self.keel_residual_scale * residual
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -700,6 +728,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = off_interface.group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
+
+        # KEEL Post-LN: normalize the summed (alpha * x + Attn(...)) output. IdentityOp on layer 1.
+        if self.keel:
+            hidden_states = apply_module(self.post_self_attn_layernorm)(hidden_states)
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
@@ -912,9 +944,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         # Optional sandwich norm: normalize the MLP output before the residual add.
-        mlp_output_with_bias = self._apply_post_norm(
-            mlp_output_with_bias, self.post_mlp_layernorm
-        )
+        # Skipped under KEEL, which instead normalizes the *summed* output after the add (below).
+        if not self.keel:
+            mlp_output_with_bias = self._apply_post_norm(
+                mlp_output_with_bias, self.post_mlp_layernorm
+            )
+
+        # KEEL highway scaling: scale the residual ("carry") branch by alpha before the add, so the
+        # bias-dropout-add computes `alpha * x + MLP(LN(x))`. (No-op scale of 1.0 on layer 1.)
+        if self.keel:
+            residual = self.keel_residual_scale * residual
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -936,6 +975,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = off_interface.group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
+
+        # KEEL Post-LN: normalize the summed (alpha * x + MLP(...)) output. IdentityOp on layer 1.
+        if self.keel:
+            hidden_states = apply_module(self.post_mlp_layernorm)(hidden_states)
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

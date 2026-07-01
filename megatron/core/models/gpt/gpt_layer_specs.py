@@ -195,6 +195,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
     sandwich_norm: bool = False,
+    keel: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -248,9 +249,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
         use_te_activation_func=use_te_activation_func,
     )
 
-    # Sandwich norm: a standalone norm on each sublayer output, before the residual add.
+    # Post-attention / post-mlp norm slot, shared by sandwich norm and KEEL (the residual placement
+    # of the norm is decided in TransformerLayer.forward via config.keel). For KEEL the input
+    # pre-norm (LN_pre) is the layernorm already fused into linear_qkv / linear_fc1; this slot
+    # provides the additional Post-LN applied to the summed residual output.
     # TENorm picks LayerNorm/RMSNorm from config.normalization at build time.
-    post_layer_norm = backend.layer_norm() if sandwich_norm else IdentityOp
+    post_layer_norm = backend.layer_norm() if (sandwich_norm or keel) else IdentityOp
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -386,6 +390,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     sandwich_norm: bool = False,
+    keel: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -432,13 +437,15 @@ def get_gpt_layer_local_submodules(
         moe_use_offloading_experts=moe_use_offloading_experts,
     )
 
-    # Sandwich norm: a standalone norm on each sublayer output, before the residual add. Built with
-    # has_residual=False: unlike the pre-norms it does not sit on the residual stream (the residual
-    # add happens after it, in the bias-dropout-add), so it must stay a plain single-tensor norm and
-    # not the residual-fused variant. Matches the model's LayerNorm/RMSNorm type.
+    # Post-attention / post-mlp norm slot. Built with has_residual=False: unlike the pre-norms it
+    # does not sit on the residual stream (the residual add happens around it, in the
+    # bias-dropout-add), so it must stay a plain single-tensor norm and not the residual-fused
+    # variant. Matches the model's LayerNorm/RMSNorm type. Used by both sandwich norm (applied to
+    # the sublayer output *before* the add) and KEEL (applied to the summed output *after* the add);
+    # which one is selected is decided in TransformerLayer.forward via config.keel.
     post_layer_norm = (
         backend.layer_norm(rms_norm=(normalization == "RMSNorm"), for_qk=False, has_residual=False)
-        if sandwich_norm
+        if (sandwich_norm or keel)
         else IdentityOp
     )
 
@@ -615,6 +622,7 @@ def get_gpt_decoder_layer_specs(
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
             sandwich_norm=config.sandwich_norm,
+            keel=config.keel,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -629,6 +637,7 @@ def get_gpt_decoder_layer_specs(
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
             sandwich_norm=config.sandwich_norm,
+            keel=config.keel,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -660,6 +669,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             sandwich_norm=config.sandwich_norm,
+            keel=config.keel,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -673,6 +683,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             sandwich_norm=config.sandwich_norm,
+            keel=config.keel,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
