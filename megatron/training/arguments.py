@@ -2557,7 +2557,8 @@ def _add_training_args(parser):
     # tp-mode, extra-scale-factor, coefficient-type, fp32-matmul-prec, split-qkv). All defaults off.
     group.add_argument('--matrix-lr', type=float, default=None,
                        help='Absolute LR for matrix (2D non-embedding/output) params under '
-                       '--optimizer md_decoupling. Overrides muon_lr_factor * lr.')
+                       '--optimizer md_decoupling or muon/dist_muon (the Muon-managed matrices; '
+                       'the scalar Adam/Lion group stays on --lr). Overrides muon_lr_factor * lr.')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '
@@ -2572,8 +2573,8 @@ def _add_training_args(parser):
                        '(config.min_lr / config.lr). "absolute": every group decays to the same '
                        'floor (config.min_lr).')
     group.add_argument('--muon-lr-factor', type=float, default=1.0,
-                       help='When --matrix-lr is unset, matrix-param LR for md_decoupling is '
-                       'muon_lr_factor * lr. Default 1.0.')
+                       help='When --matrix-lr is unset, matrix-param LR for md_decoupling and '
+                       'muon/dist_muon is muon_lr_factor * lr. Default 1.0 (matrices track --lr).')
     group.add_argument('--hypersphere-mode', type=str, default=None,
                        choices=['row', 'col', 'flat', 'embed'],
                        help='Hypersphere normalization mode for non-embedding/output 2D matrices '

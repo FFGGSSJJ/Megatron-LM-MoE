@@ -308,7 +308,8 @@ class OptimizerConfig:
     # weight_decay fields above for shared knobs. All defaults are off; existing runs unaffected.
     ###################################################################################
     matrix_lr: Optional[float] = None
-    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling.
+    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling or
+    muon/dist_muon (the Muon-managed matrices; the scalar Adam/Lion group stays on --lr).
     Overrides muon_lr_factor * lr."""
 
     embedding_lr_multiplier: Optional[float] = None
@@ -325,7 +326,8 @@ class OptimizerConfig:
     decays to the same floor (config.min_lr)."""
 
     muon_lr_factor: float = 1.0
-    """When --matrix-lr is unset, matrix-param LR for md_decoupling is muon_lr_factor * lr."""
+    """When --matrix-lr is unset, matrix-param LR for md_decoupling and muon/dist_muon is
+    muon_lr_factor * lr. Default 1.0 (matrices track the base --lr)."""
 
     hypersphere_mode: Optional[str] = 'flat'
     """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
