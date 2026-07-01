@@ -105,6 +105,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         qkv_split_shapes: Optional[tuple[int, int, int]] = None,
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        is_kv_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        kv_up_proj_split_shapes: Optional[tuple[int, int]] = None,
+        is_qkv_down_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        qkv_down_proj_split_shapes: Optional[tuple[int, int]] = None,
+        split_mla_per_head: bool = False,
+        is_q_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        q_up_proj_head_dim: Optional[int] = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -134,6 +141,19 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
         self.qkv_split_shapes = qkv_split_shapes
         self.qkv_dim = qkv_dim
+        self.is_kv_up_proj_fn = (
+            is_kv_up_proj_fn if is_kv_up_proj_fn is not None else (lambda p: False)
+        )
+        self.kv_up_proj_split_shapes = kv_up_proj_split_shapes
+        self.is_qkv_down_proj_fn = (
+            is_qkv_down_proj_fn if is_qkv_down_proj_fn is not None else (lambda p: False)
+        )
+        self.qkv_down_proj_split_shapes = qkv_down_proj_split_shapes
+        self.split_mla_per_head = split_mla_per_head
+        self.is_q_up_proj_fn = (
+            is_q_up_proj_fn if is_q_up_proj_fn is not None else (lambda p: False)
+        )
+        self.q_up_proj_head_dim = q_up_proj_head_dim
 
         self.coefficient_type = coefficient_type
         self.num_ns_steps = num_ns_steps
@@ -275,8 +295,38 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if weight_decay != 0:
             p.add_(p, alpha=-weight_decay * group["lr"])
 
+    def _split_param_tensor(self, p, x, is_qkv: bool = False):
+        """Return split views and a merge function for grouped QKV/MLA weights."""
+        if not self.split_qkv:
+            return None
+        if is_qkv:
+            assert self.qkv_split_shapes is not None
+            return (
+                _split_qkv(x, self.qkv_split_shapes),
+                lambda parts: _merge_qkv(parts, x.shape, self.qkv_split_shapes),
+            )
+        if self.is_qkv_down_proj_fn(p):
+            assert self.qkv_down_proj_split_shapes is not None
+            return (
+                list(torch.split(x, self.qkv_down_proj_split_shapes, dim=0)),
+                lambda parts: torch.cat(parts, dim=0),
+            )
+        if self.is_kv_up_proj_fn(p):
+            assert self.kv_up_proj_split_shapes is not None
+            return (
+                _split_grouped_dim0(x, self.kv_up_proj_split_shapes),
+                lambda parts: _merge_grouped_dim0(parts, x.shape, self.kv_up_proj_split_shapes),
+            )
+        if self.split_mla_per_head and self.is_q_up_proj_fn(p):
+            assert self.q_up_proj_head_dim is not None
+            return (
+                _split_heads_dim0(x, self.q_up_proj_head_dim),
+                lambda parts: _merge_heads_dim0(parts, x.shape),
+            )
+        return None
+
     def _orthogonalize_param(self, p, grad, is_qkv: bool = False):
-        """Newton-Schulz orthogonalization, with optional QKV split."""
+        """Newton-Schulz orthogonalization, with optional QKV/MLA split."""
         if self.pg_collection is not None:
             tp_group = (self.pg_collection.expt_tp
                         if getattr(p, "expert_tp", False)
@@ -287,12 +337,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        if self.split_qkv and is_qkv:
-            qs, ks, vs = _split_qkv(grad, self.qkv_split_shapes)
-            qs = self._orthogonalize_tensor(qs, tp_group, partition_dim)
-            ks = self._orthogonalize_tensor(ks, tp_group, partition_dim)
-            vs = self._orthogonalize_tensor(vs, tp_group, partition_dim)
-            return _merge_qkv((qs, ks, vs), grad.shape, self.qkv_split_shapes)
+        split = self._split_param_tensor(p, grad, is_qkv)
+        if split is not None:
+            parts, merge = split
+            parts = [self._orthogonalize_tensor(g, tp_group, partition_dim) for g in parts]
+            return merge(parts)
         return self._orthogonalize_tensor(grad, tp_group, partition_dim)
 
     def _orthogonalize_tensor(self, grad, tp_group, partition_dim):
@@ -339,12 +388,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         mode = self._resolve_mode(is_embedding, is_router)
         if mode is None:
             return
-        if is_qkv and self.split_qkv:
-            ps = _split_qkv(p, self.qkv_split_shapes)
-            gs = _split_qkv(grad, self.qkv_split_shapes)
+        split_p = self._split_param_tensor(p, p, is_qkv)
+        if split_p is not None:
+            ps, _ = split_p
+            gs, merge = self._split_param_tensor(p, grad, is_qkv)
             for pi, gi in zip(ps, gs):
                 self._project_tangent_single_(pi, gi, is_out_proj, mode)
-            grad.copy_(_merge_qkv(gs, grad.size(), self.qkv_split_shapes))
+            grad.copy_(merge(gs))
             return
         self._project_tangent_single_(p, grad, is_out_proj, mode)
 
@@ -385,12 +435,14 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         radius_scale = self._resolve_radius_scale(is_out_proj)
 
         is_expert_tp = getattr(p, "expert_tp", False)
-        if is_qkv and self.split_qkv:
-            qs, ks, vs = _split_qkv(x, self.qkv_split_shapes)
-            self._normalize_single(qs, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            self._normalize_single(ks, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            self._normalize_single(vs, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            x.copy_(_merge_qkv((qs, ks, vs), x.size(), self.qkv_split_shapes))
+        split = self._split_param_tensor(p, x, is_qkv)
+        if split is not None:
+            parts, merge = split
+            for part in parts:
+                self._normalize_single(
+                    part, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp
+                )
+            x.copy_(merge(parts))
             return
 
         self._normalize_single(x, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
@@ -818,6 +870,30 @@ def _merge_qkv(qkv, xshape: tuple[int, int], shapes: tuple[int, int, int]) -> to
     return torch.cat(qkv, dim=1).view(xshape)
 
 
+def _split_grouped_dim0(x, shapes: tuple[int, int]) -> list[torch.Tensor]:
+    """Split a dim-0 grouped projection layout into its logical blocks."""
+    xshape = x.shape
+    num_groups = xshape[0] // sum(shapes)
+    parts = torch.split(x.view(num_groups, sum(shapes), -1), shapes, dim=1)
+    return [g.reshape(-1, xshape[-1]) for g in parts]
+
+
+def _merge_grouped_dim0(parts, xshape: tuple[int, int], shapes: tuple[int, int]) -> torch.Tensor:
+    num_groups = xshape[0] // sum(shapes)
+    parts = [g.view(num_groups, -1, xshape[-1]) for g in parts]
+    return torch.cat(parts, dim=1).view(xshape)
+
+
+def _split_heads_dim0(x, head_dim: int) -> list[torch.Tensor]:
+    xshape = x.shape
+    num_heads = xshape[0] // head_dim
+    return list(x.view(num_heads, head_dim, -1).unbind(0))
+
+
+def _merge_heads_dim0(parts, xshape: tuple[int, int]) -> torch.Tensor:
+    return torch.stack(parts, dim=0).view(xshape)
+
+
 # ===========================================================================
 # Optimizer builder
 # ===========================================================================
@@ -980,21 +1056,51 @@ def get_megatron_mddecoupling_optimizer(
 
     # Tag parameters with optimizer-specific attributes and compute qkv split shapes.
     qkv_split_shapes: Optional[List[int]] = None
+    kv_up_proj_split_shapes: Optional[tuple[int, int]] = None
+    qkv_down_proj_split_shapes: Optional[tuple[int, int]] = None
+    q_up_proj_head_dim: Optional[int] = None
     for model_chunk in model_chunks:
         cfg = model_chunk.config
+        num_attention_heads = cfg.num_attention_heads
+        num_query_groups = cfg.num_query_groups
+        kv_channels = cfg.kv_channels
         qkv_split_shapes = [
-            cfg.num_attention_heads // cfg.num_query_groups * cfg.kv_channels,
-            cfg.kv_channels,
-            cfg.kv_channels,
+            num_attention_heads // num_query_groups * kv_channels,
+            kv_channels,
+            kv_channels,
         ]
+        is_mla = getattr(cfg, 'multi_latent_attention', False)
+        if is_mla and config.muon_split_mla_per_head:
+            kv_up_proj_split_shapes = (cfg.qk_head_dim, cfg.v_head_dim)
+            q_up_proj_head_dim = cfg.qk_head_dim + cfg.qk_pos_emb_head_dim
+        elif is_mla:
+            kv_up_proj_split_shapes = (
+                num_attention_heads * cfg.qk_head_dim,
+                num_attention_heads * cfg.v_head_dim,
+            )
+            q_up_proj_head_dim = None
+        else:
+            kv_up_proj_split_shapes = None
+            q_up_proj_head_dim = None
+
+        qkv_down_proj_split_shapes = (
+            cfg.q_lora_rank,
+            cfg.kv_lora_rank + cfg.qk_pos_emb_head_dim,
+        ) if is_mla and getattr(cfg, 'q_lora_rank', None) is not None else None
+
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
+            if 'linear_kv_up_proj.weight' in name and len(param.shape) == 2:
+                param.is_kv_up_proj = True
+            if 'linear_q_up_proj.weight' in name and len(param.shape) == 2:
+                param.is_q_up_proj = True
+            if 'linear_qkv_down_proj.weight' in name and len(param.shape) == 2:
+                param.is_qkv_down_proj = True
             if name.endswith('router.weight') and len(param.shape) == 2:
                 param.is_router = True
             if ('linear_fc2' in name or 'linear_proj' in name) and len(param.shape) == 2:
@@ -1036,6 +1142,13 @@ def get_megatron_mddecoupling_optimizer(
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=qkv_split_shapes,
         qkv_dim=model_chunks[0].config.kv_channels,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=kv_up_proj_split_shapes,
+        is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
+        qkv_down_proj_split_shapes=qkv_down_proj_split_shapes,
+        split_mla_per_head=config.muon_split_mla_per_head,
+        is_q_up_proj_fn=lambda p: getattr(p, "is_q_up_proj", False),
+        q_up_proj_head_dim=q_up_proj_head_dim,
         fp32_matmul_prec=config.muon_fp32_matmul_prec,
         coefficient_type=config.muon_coefficient_type,
         num_ns_steps=config.muon_num_ns_steps,
