@@ -4,7 +4,7 @@
 # in-ladder stand-in for the 670B-A40B target with target-matched attention.
 # 24L / 2048H / 16 heads, first layer dense then 23 MoE. 128e top-4 + 1 shared,
 # moe_ffn = hidden/1.75. MLA per-head dims = target; lora ranks scaled at target
-# ratios. ~1.69B active / ~21.9B total. Token budget = 100 tok/active-param.
+# ratios. ~1.97B active / ~22.16B total. Token budget = 100 tok/active-param.
 
 NUM_LAYERS=24
 HIDDEN=2048
@@ -15,8 +15,8 @@ SEQ_LEN=8192
 
 MBS=${MBS:-1}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-20633600}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
-SAVE_INTERVAL=16100
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-24083200}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+SAVE_INTERVAL=18800
 
 APERTUS_TRACK=22a-moe-128e-mla
 

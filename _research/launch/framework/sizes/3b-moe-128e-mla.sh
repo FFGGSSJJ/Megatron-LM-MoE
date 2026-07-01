@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 #
-# 2.8b-moe-128e-mla — MLA twin of 2.8b-moe-128e (Multi-Latent Attention).
+# 3b-moe-128e-mla — MLA twin of 3b-moe-128e (Multi-Latent Attention).
 # 12L / 1024H / 8 heads, first layer dense then 11 MoE. 128e top-4 + 1 shared,
 # moe_ffn = hidden/1.75. MLA per-head dims = target; lora ranks scaled at target
-# ratios. ~0.41B active / ~2.8B total. Token budget = 100 tok/active-param.
+# ratios. ~0.55B active / ~2.97B total. Token budget = 100 tok/active-param.
 
 NUM_LAYERS=12
 HIDDEN=1024
@@ -14,10 +14,10 @@ SEQ_LEN=8192
 
 MBS=${MBS:-2}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-5039232}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
-SAVE_INTERVAL=3900
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-6764032}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+SAVE_INTERVAL=5300
 
-APERTUS_TRACK=2.8a-moe-128e-mla
+APERTUS_TRACK=3a-moe-128e-mla
 
 # 128e ladder trains on the fineweb-2-hq mul_200k blend (see lib/common.sh).
 DATA_PRESET=${DATA_PRESET:-fineweb2hq-mul200k}

@@ -14,7 +14,7 @@
 #   # ... now inside the container, from the repo root ...
 #
 #   bash _research/launch/framework/debug.sh --size 270m-moe --recipe md_decoupling
-#   bash _research/launch/framework/debug.sh --size 1.4b-moe-128e --recipe md_decoupling --nproc 4 --iters 10
+#   bash _research/launch/framework/debug.sh --size 1.5b-moe-128e --recipe md_decoupling --nproc 4 --iters 10
 #   bash _research/launch/framework/debug.sh --size 420m-moe --recipe md_decoupling -- --lr 1e-4  # extra flags override
 #   bash _research/launch/framework/debug.sh --size 420m-moe --recipe md_decoupling --dry-run     # print args, don't run
 #

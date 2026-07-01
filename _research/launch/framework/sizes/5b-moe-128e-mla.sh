@@ -3,7 +3,7 @@
 # 5b-moe-128e-mla — MLA twin of 5b-moe-128e (Multi-Latent Attention).
 # 14L / 1280H / 10 heads, first layer dense then 13 MoE. 128e top-4 + 1 shared,
 # moe_ffn = hidden/1.75. MLA per-head dims = target; lora ranks scaled at target
-# ratios. ~0.59B active / ~5.0B total. Token budget = 100 tok/active-param.
+# ratios. ~0.77B active / ~5.13B total. Token budget = 100 tok/active-param.
 
 NUM_LAYERS=14
 HIDDEN=1280
@@ -14,8 +14,8 @@ SEQ_LEN=8192
 
 MBS=${MBS:-2}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-7256960}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
-SAVE_INTERVAL=5700
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-9412992}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+SAVE_INTERVAL=7400
 
 APERTUS_TRACK=5a-moe-128e-mla
 

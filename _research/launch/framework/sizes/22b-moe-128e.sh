@@ -4,7 +4,7 @@
 # largest in-ladder stand-in for the in-house 670B-A40B target.
 # Iso-architecture proxy (128e top-4 + 1 shared, moe_ffn = hidden/1.75). head_dim
 # 128 (kernel-friendly, = target). 24L / 2048H / 16h / 8kv, first layer dense
-# then 23 MoE. ~1.69B active / ~21.88B total; 5.41% non-embed sparsity. Token
+# then 23 MoE. ~1.97B active / ~22.16B total; 5.41% non-embed sparsity. Token
 # budget = 100 tokens / active param.
 
 NUM_LAYERS=24
@@ -16,8 +16,8 @@ SEQ_LEN=8192
 
 MBS=${MBS:-1}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-20633600}  # ~169.0B tokens = 100 tok/active-param (÷GBS)
-SAVE_INTERVAL=16100           # ~10 saves over the run
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-24083200}  # ~197.3B tokens = 100 tok/active-param (÷GBS)
+SAVE_INTERVAL=18800           # ~10 saves over the run
 
 APERTUS_TRACK=22a-moe-128e
 

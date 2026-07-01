@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 #
-# 1.4b-moe-128e — smallest rung of the fine-grained (128e) MoE ladder (GQA);
+# 1.5b-moe-128e — smallest rung of the fine-grained (128e) MoE ladder (GQA);
 # the cheap LR/architecture-probe point.
 # Iso-architecture proxy for the in-house 670B-A40B target (128e top-4 + 1
 # shared, moe_ffn = hidden/1.75). head_dim 128 (kernel-friendly, = target).
-# 10L / 768H / 6h / 3kv, first layer dense then 9 MoE. ~0.27B active / ~1.42B
+# 10L / 768H / 6h / 3kv, first layer dense then 9 MoE. ~0.38B active / ~1.53B
 # total; 5.69% non-embed sparsity. Token budget = 100 tokens / active param.
 # Routing policy is invariant and lives in lib/common.sh.
 
@@ -17,10 +17,10 @@ SEQ_LEN=8192
 
 MBS=${MBS:-2}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-3305344}   # ~27.1B tokens = 100 tok/active-param (÷GBS)
-SAVE_INTERVAL=2600            # ~10 saves over the run
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-4598912}   # ~37.7B tokens = 100 tok/active-param (÷GBS)
+SAVE_INTERVAL=3600            # ~10 saves over the run
 
-APERTUS_TRACK=1.4a-moe-128e
+APERTUS_TRACK=1.5a-moe-128e
 
 # 128e ladder trains on the fineweb-2-hq mul_200k blend (see lib/common.sh).
 DATA_PRESET=${DATA_PRESET:-fineweb2hq-mul200k}

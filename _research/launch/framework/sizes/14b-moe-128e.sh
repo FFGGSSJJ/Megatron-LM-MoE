@@ -3,7 +3,7 @@
 # 14b-moe-128e — fifth rung of the fine-grained (128e) MoE ladder (GQA).
 # Iso-architecture proxy for the in-house 670B-A40B target (128e top-4 + 1
 # shared, moe_ffn = hidden/1.75). head_dim 128 (kernel-friendly, = target).
-# 20L / 1792H / 14h / 7kv, first layer dense then 19 MoE. ~1.21B active / ~14.18B
+# 20L / 1792H / 14h / 7kv, first layer dense then 19 MoE. ~1.46B active / ~14.43B
 # total; 5.43% non-embed sparsity. At the ~1B-active eval point. Token budget =
 # 100 tokens / active param.
 
@@ -16,8 +16,8 @@ SEQ_LEN=8192
 
 MBS=${MBS:-1}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-14817536}  # ~121.4B tokens = 100 tok/active-param (÷GBS)
-SAVE_INTERVAL=11600           # ~10 saves over the run
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-17835904}  # ~146.1B tokens = 100 tok/active-param (÷GBS)
+SAVE_INTERVAL=14000           # ~10 saves over the run
 
 APERTUS_TRACK=14a-moe-128e
 

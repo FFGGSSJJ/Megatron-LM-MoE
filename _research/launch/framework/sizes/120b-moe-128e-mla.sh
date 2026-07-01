@@ -5,7 +5,7 @@
 # 42L / 3584H / 28 heads, first layer dense then 41 MoE. 128e top-4 + 1 shared,
 # moe_ffn = hidden/1.75. MLA per-head dims = target (qk 128 / rope 64 / v 128);
 # lora ranks scaled at target ratios (kv-lora = hidden/14 = 256, q-lora = 3×kv).
-# ~7.19B active / ~119B total. Token budget = 100 tok/active-param (~719B tokens).
+# ~7.68B active / ~119.6B total. Token budget = 100 tok/active-param (~768B tokens).
 
 NUM_LAYERS=42
 HIDDEN=3584
@@ -16,8 +16,8 @@ SEQ_LEN=8192
 
 MBS=${MBS:-1}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-87735168}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
-SAVE_INTERVAL=68500
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-93772032}  # ~100 tok/active-param (active from GQA twin, ÷GBS)
+SAVE_INTERVAL=73000
 
 APERTUS_TRACK=120a-moe-128e-mla
 

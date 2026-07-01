@@ -4,8 +4,8 @@
 # (GQA); the largest in-family stand-in for the in-house 670B-A40B target.
 # Same ladder rules (128e top-4 + 1 shared, moe_ffn = hidden/1.75, head_dim 128,
 # 1 dense layer). 42L / 3584H / 28h / 14kv, first layer dense then 41 MoE.
-# ~7.19B active / ~119.1B total; 5.29% non-embed sparsity. Token budget = 100
-# tok/active param (~719B tokens — a large run; this rung is mainly a config
+# ~7.68B active / ~119.6B total; 5.29% non-embed sparsity. Token budget = 100
+# tok/active param (~768B tokens — a large run; this rung is mainly a config
 # reference / extrapolation anchor). Routing policy invariant in lib/common.sh.
 #
 # Sized like gpt-oss-120b (~117B total / 5.1B active) but in THIS ladder's family
@@ -20,8 +20,8 @@ SEQ_LEN=8192
 
 MBS=${MBS:-1}
 GBS=${GBS:-128}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-87735168}  # ~719B tokens = 100 tok/active-param (÷GBS)
-SAVE_INTERVAL=68500           # ~10 saves over the run
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-93772032}  # ~768B tokens = 100 tok/active-param (÷GBS)
+SAVE_INTERVAL=73000           # ~10 saves over the run
 
 APERTUS_TRACK=120a-moe-128e
 
