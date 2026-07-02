@@ -296,6 +296,9 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
+            if getattr(module, 'qb_beta_accum', None) is not None:
+                module.qb_beta_accum.zero_()
+                module.qb_beta_count.zero_()
 
 
 def _log_global_router_metrics(model: List[torch.nn.Module], config: TransformerConfig):
@@ -377,6 +380,57 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+
+
+def _update_router_qb_beta(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Update the quantile-balancing per-expert bias once per global batch."""
+    qb_beta_list = []
+    qb_beta_accum_list = []
+    qb_beta_count_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+                qb_beta_list.append(module.qb_beta)
+                qb_beta_accum_list.append(module.qb_beta_accum)
+                qb_beta_count_list.append(module.qb_beta_count)
+
+    if len(qb_beta_list) == 0:
+        return
+
+    stacked_beta = torch.stack(qb_beta_list, dim=0)
+    stacked_accum = torch.stack(qb_beta_accum_list, dim=0)
+    stacked_count = torch.stack(qb_beta_count_list, dim=0)
+
+    # NOTE: quantile_balancing gathers router logits across TP/CP before accumulating beta,
+    # so TP/CP replicas already contribute sequence-wide beta estimates here. Revisit
+    # this reduction if the TP/CP gather is removed or narrowed.
+
+    # Use async op to enqueue both collectives so as to reduce CPU overhead of the calls.
+    accum_reduce = torch.distributed.all_reduce(
+        stacked_accum, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group, async_op=True
+    )
+    count_reduce = torch.distributed.all_reduce(
+        stacked_count, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group, async_op=True
+    )
+
+    accum_reduce.wait()
+    count_reduce.wait()
+
+    count = stacked_count.clamp(min=1).to(stacked_accum.dtype).unsqueeze(-1)
+    stacked_global_avg = torch.where(
+        stacked_count.unsqueeze(-1) > 0, stacked_accum / count, stacked_beta
+    )
+
+    ema = config.moe_router_quantile_balancing_ema
+    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_global_avg
+    stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
+
+    for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
+        qb_beta.copy_(new_beta)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -541,6 +595,9 @@ def finalize_model_grads(
         _update_router_expert_bias(model, config)
 
     _log_global_router_metrics(model, config)
+
+    if "quantile_balancing" in config.moe_router_load_balancing_type:
+        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 

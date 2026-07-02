@@ -701,8 +701,11 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
+    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
+    handled by an internal per-expert bias update. It can be combined with "seq_aux_loss" by
+    passing a list of load balancing types.
     - "none": No load balancing.
-    A list of strings can be provided to combine multiple aux-loss load balancing types.
+    A list of strings can be provided to combine multiple load-balancing terms.
     The default is "aux_loss".
     """
 
@@ -772,6 +775,12 @@ class TransformerConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    moe_router_quantile_balancing_ema: float = 0.0
+    """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
+    `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
+    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
+    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1446,6 +1455,14 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+            if "quantile_balancing" in self.moe_router_load_balancing_type:
+                if any(
+                    load_balancing_type not in ["quantile_balancing", "seq_aux_loss"]
+                    for load_balancing_type in self.moe_router_load_balancing_type
+                ):
+                    raise ValueError(
+                        "quantile_balancing can only be combined with seq_aux_loss"
+                    )
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
