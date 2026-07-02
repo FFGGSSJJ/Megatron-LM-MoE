@@ -367,16 +367,17 @@ case "${DATA_PRESET:-}" in
     fineweb2hq-mul200k)
         # fineweb-2-hq mmbert quality_10, tokenized with the apertus
         # preliminary_mul_200k tokenizer (apertus_v2). Used by the 128e ladder.
-        # Default = the fwedu SPP-annotated split. Set INCLUDE_DCLM=1 to switch to
-        # the dclm-edu SPP-annotated split instead (the two are alternatives, not
-        # blended).
-        : "${DATA_ROOT:=/capstor/store/cscs/swissai/infra01/datasets_tokenized}"
+        # Relocated 2026-07-02 to ahuang/fwedu (flat layout; the old capstor
+        # datasets_tokenized path is gone). Default = the fwedu SPP-annotated split.
+        # NOTE: only the fwedu split lives at the new root — INCLUDE_DCLM=1 has no
+        # copy here yet and will error on the missing dir.
+        : "${DATA_ROOT:=/iopsstor/scratch/cscs/ahuang/fwedu}"
         if [ -n "${INCLUDE_DCLM:-}" ]; then
             _fw2hq_split=dclm
         else
             _fw2hq_split=fwedu
         fi
-        : "${DATA_SOURCES:=swissai-fineweb-2-hq-mmbert-full-quality_10-filterrobots-${_fw2hq_split}_spp_annotated_apertus_v2/preliminary_mul_200k/swissai-fineweb-2-hq-mmbert-full-quality_10-filterrobots-${_fw2hq_split}_spp_annotated}" ;;
+        : "${DATA_SOURCES:=swissai-fineweb-2-hq-mmbert-full-quality_10-filterrobots-${_fw2hq_split}_spp_annotated}" ;;
     "") : ;;   # no preset — fall through to the default swissai blend below
     *) echo "unknown DATA_PRESET: $DATA_PRESET (see lib/common.sh)" >&2; exit 1 ;;
 esac
