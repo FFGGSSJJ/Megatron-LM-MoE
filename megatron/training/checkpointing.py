@@ -35,6 +35,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
@@ -582,8 +583,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
 
-    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks. Gate on the
+    # actual optimizer type, not the name prefix: dist_muon AND md_decoupling (which is named
+    # 'md_decoupling', not 'dist_*') both build a LayerWiseDistributedOptimizer whose state is
+    # sharded per DP rank, so each rank must write its own shard. The name-prefix check missed
+    # md_decoupling, so only expert-DP-rank-0's shard was saved (in model_optim_rng.pt) and every
+    # DP rank reloaded that one shard -> param-group size / tensor-shape mismatch on resume.
+    if isinstance(optimizer, LayerWiseDistributedOptimizer) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
         ensure_directory_exists(optim_checkpoint_name)
@@ -1584,6 +1590,22 @@ def load_args_from_checkpoint(
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
 
+    # Apertus custom architecture flags. These are forward-affecting TransformerConfig fields that
+    # default to False/None, so they need force=True (else _set_arg early-returns because the value
+    # isn't None). Without these, --use-checkpoint-args (inference / generation / ckpt conversion)
+    # silently rebuilds the WRONG model: unscaled embeddings, missing residual/depth scaling, and —
+    # worst — no sandwich-norm/keel norm sublayers, so the checkpoint's extra norm weights fail to
+    # load (missing keys) or are silently dropped. Training resume is unaffected (it re-passes every
+    # flag on the CLI and doesn't set --use-checkpoint-args).
+    _set_arg('scale_embeddings_by_sqrt_hidden', force=True)
+    _set_arg('residual_output_scaling', force=True)
+    _set_arg('sandwich_norm', force=True)
+    _set_arg('keel', force=True)
+    _set_arg('keel_alpha', force=True)
+    _set_arg('pnglu', force=True)
+    _set_arg('pnglu_fusion', force=True)
+    _set_arg('qk_layernorm', force=True)
+
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
         # Using checkpoint version might not always be safe (e.g., if running on different cluster).
@@ -1925,8 +1947,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
-                # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
+            if isinstance(optimizer, LayerWiseDistributedOptimizer) and args.ckpt_format == 'torch':
+                # LayerWiseDistributedOptimizer load optimizer state from file on different ranks.
+                # Match the save-side gate (isinstance, not name prefix) so md_decoupling reloads
+                # its per-DP-rank shard instead of the single shared shard from state_dict.
                 dp_rank = mpu.get_data_parallel_rank()
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)

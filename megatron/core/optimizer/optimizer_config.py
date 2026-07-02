@@ -311,7 +311,8 @@ class OptimizerConfig:
     # weight_decay fields above for shared knobs. All defaults are off; existing runs unaffected.
     ###################################################################################
     matrix_lr: Optional[float] = None
-    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling.
+    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling or
+    muon/dist_muon (the Muon-managed matrices; the scalar Adam/Lion group stays on --lr).
     Overrides muon_lr_factor * lr."""
 
     embedding_lr_multiplier: Optional[float] = None
@@ -328,7 +329,8 @@ class OptimizerConfig:
     decays to the same floor (config.min_lr)."""
 
     muon_lr_factor: float = 1.0
-    """When --matrix-lr is unset, matrix-param LR for md_decoupling is muon_lr_factor * lr."""
+    """When --matrix-lr is unset, matrix-param LR for md_decoupling and muon/dist_muon is
+    muon_lr_factor * lr. Default 1.0 (matrices track the base --lr)."""
 
     hypersphere_mode: Optional[str] = 'flat'
     """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
@@ -355,6 +357,12 @@ class OptimizerConfig:
     """Scale the hypersphere target radius for is_out_proj params (linear_proj, linear_fc2) by
     1/sqrt(2 * num_layers), matching scaled_init_method_normal."""
 
+    hypersphere_radius_from_init: bool = False
+    """Place each flat-mode matrix's sphere at its init Frobenius norm (init_std=1/sqrt(hidden))
+    instead of the shape-native sqrt(max(d_out,d_in)). Rescales both the projection target and the
+    Muon update by sqrt(min(d_out,d_in)/hidden), so narrow matrices (MLA lora, MoE fc2, GQA K/V)
+    stay on their init sphere. No-op for matrices whose smaller dim already equals hidden."""
+
     md_router_use_orthogonal_updates: Optional[bool] = True
     """Per-param-group override for use_orthogonal_updates on MoE router weights. True forces
     Muon for routers, False forces the Adam branch, None follows --use-orthogonal-updates."""
@@ -372,6 +380,12 @@ class OptimizerConfig:
     hypersphere_gains_mode_embedding: Optional[str] = None
     """Gains mode override for the embedding. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
 
+    hypersphere_gains_mode_router: Optional[str] = 'none'
+    """Gains mode override for MoE router weights. One of 'row'/'col'/'rowcol'/'flat'/'none'.
+    Defaults to 'none': per-expert row gains re-introduce the per-expert magnitude that the router
+    hypersphere normalization removes, which unbalances expert selection. Only takes effect when
+    --hypersphere-gains-mode is set (routers otherwise have no gains at all)."""
+
     gains_lr: Optional[float] = None
     """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks
     the schedule shape of the main LR)."""
@@ -379,6 +393,13 @@ class OptimizerConfig:
     gain_parametrization: str = 'softplus'
     """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
     'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""
+
+    gains_no_clamp_min: bool = False
+    """Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in _preprocess_gains.
+    The clamp floors the divisor, which is asymmetric with _apply_gains (multiplies by the true,
+    unclamped phi(g)) and — under gain_parametrization='direct' — blocks a gain from shrinking
+    through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
+    nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state

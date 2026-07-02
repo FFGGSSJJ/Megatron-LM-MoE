@@ -97,6 +97,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         # constraint preserves Megatron's depth-aware init for residual-out projections.
         hypersphere_scale_out_proj_init: bool = False,
         num_layers: Optional[int] = None,
+        # Place each flat-mode matrix's sphere at its init Frobenius norm (init_std=1/sqrt(hidden))
+        # instead of the shape-native sqrt(max(d_out,d_in)). Fixes the narrow matrices (MLA lora,
+        # MoE fc2, GQA K/V) whose smaller dim != hidden and would otherwise be pulled off init.
+        hypersphere_radius_from_init: bool = False,
+        hidden_size: Optional[int] = None,
         # Muon (orthogonalized updates).
         use_orthogonal_updates: bool = False,
         momentum_beta: float = 0.95,
@@ -129,6 +134,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             self.out_proj_radius_scale = 1.0 / math.sqrt(2 * num_layers)
         else:
             self.out_proj_radius_scale = 1.0
+
+        self.hypersphere_radius_from_init = hypersphere_radius_from_init
+        self.hidden_size = hidden_size
+        if hypersphere_radius_from_init:
+            assert hidden_size is not None and hidden_size > 0, (
+                "hypersphere_radius_from_init=True requires hidden_size"
+            )
 
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
@@ -238,8 +250,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 grad = grad.lerp(exp_avg, momentum_beta)
             else:
                 grad = exp_avg
+            flat_mode = self._resolve_mode(is_embedding, is_router) == "flat"
             with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv)
+                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, flat_mode=flat_mode)
             # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
             # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
             # target radius 1/sqrt(2L) the bare update needs the same shrink factor.
@@ -275,8 +288,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if weight_decay != 0:
             p.add_(p, alpha=-weight_decay * group["lr"])
 
-    def _orthogonalize_param(self, p, grad, is_qkv: bool = False):
-        """Newton-Schulz orthogonalization, with optional QKV split."""
+    def _orthogonalize_param(self, p, grad, is_qkv: bool = False, flat_mode: bool = False):
+        """Newton-Schulz orthogonalization, with optional QKV split. ``flat_mode`` enables the
+        init-radius rescale (see _init_radius_scale); it is per-block so Q/K/V get their own factor
+        under split_qkv."""
         if self.pg_collection is not None:
             tp_group = (self.pg_collection.expt_tp
                         if getattr(p, "expert_tp", False)
@@ -289,13 +304,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
 
         if self.split_qkv and is_qkv:
             qs, ks, vs = _split_qkv(grad, self.qkv_split_shapes)
-            qs = self._orthogonalize_tensor(qs, tp_group, partition_dim)
-            ks = self._orthogonalize_tensor(ks, tp_group, partition_dim)
-            vs = self._orthogonalize_tensor(vs, tp_group, partition_dim)
+            qs = self._orthogonalize_tensor(qs, tp_group, partition_dim, flat_mode)
+            ks = self._orthogonalize_tensor(ks, tp_group, partition_dim, flat_mode)
+            vs = self._orthogonalize_tensor(vs, tp_group, partition_dim, flat_mode)
             return _merge_qkv((qs, ks, vs), grad.shape, self.qkv_split_shapes)
-        return self._orthogonalize_tensor(grad, tp_group, partition_dim)
+        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode)
 
-    def _orthogonalize_tensor(self, grad, tp_group, partition_dim):
+    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False):
         assert grad.ndim == 2
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
@@ -309,6 +324,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
         scale = _get_muon_scale_factor(size[0], size[1], mode=self.scale_mode)
+        if flat_mode:
+            scale *= self._init_radius_scale(size[0], size[1])
         return orth * scale * self.extra_scale_factor
 
     def _resolve_mode(self, is_embedding: bool, is_router: bool = False):
@@ -331,6 +348,18 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 and self.hypersphere_preserve_init):
             return 1.0
         return self.out_proj_radius_scale
+
+    def _init_radius_scale(self, size_out: int, size_in: int) -> float:
+        """Extra flat-mode radius multiplier that moves the sphere from the shape-native
+        sqrt(max(d_out,d_in)) onto the model's init Frobenius norm. With init_std=1/sqrt(hidden),
+        init_norm = sqrt(d_out*d_in/hidden), so init_norm/sqrt(max) = sqrt(min(d_out,d_in)/hidden).
+        Sizes must be GLOBAL (TP-unsharded), matching the flat target / Muon scale. Returns 1.0 when
+        disabled or when the smaller dim == hidden (already on the init sphere). Applied identically
+        to the projection target and the Muon update so the two stay consistent; the out_proj depth
+        factor cancels in the ratio and composes multiplicatively."""
+        if not self.hypersphere_radius_from_init or self.hidden_size is None:
+            return 1.0
+        return (min(size_out, size_in) / self.hidden_size) ** 0.5
 
     def _project_tangent_inplace(self, p, grad, is_qkv: bool = False, is_out_proj: bool = False,
                                   is_embedding: bool = False, is_router: bool = False):
@@ -426,6 +455,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             if partition_dim in {0, 1}:
                 global_sizes[partition_dim] *= tp_size
             x.mul_(max(global_sizes) ** 0.5)
+            init_scale = self._init_radius_scale(global_sizes[0], global_sizes[1])
+            if init_scale != 1.0:
+                x.mul_(init_scale)
         if radius_scale != 1.0:
             x.mul_(radius_scale)
 
@@ -450,6 +482,7 @@ class MDDecoupling(_MDDecouplingBase):
         hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed"]] = None,
         hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
         hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
+        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
         gains_lr: Optional[float] = None,
         gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
@@ -459,11 +492,16 @@ class MDDecoupling(_MDDecouplingBase):
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
+        # Drop the 1e-8 clamp_min on phi(g) in _preprocess_gains so gains can shrink through 1e-8
+        # or flip sign (only meaningful for gain_parametrization="direct"; no-op for softplus).
+        gains_no_clamp_min: bool = False,
         **kwargs,
     ):
         self.hypersphere_gains_mode = hypersphere_gains_mode
         self.hypersphere_gains_mode_output = hypersphere_gains_mode_output
         self.hypersphere_gains_mode_embedding = hypersphere_gains_mode_embedding
+        self.hypersphere_gains_mode_router = hypersphere_gains_mode_router
+        self.gains_no_clamp_min = gains_no_clamp_min
         self.gains_lr = gains_lr  # None → follow group["lr"] verbatim
         self.gains_min_lr = gains_min_lr  # gains LR floor (matches the group's min_lr policy)
         self.gains_betas = gains_betas
@@ -649,13 +687,16 @@ class MDDecoupling(_MDDecouplingBase):
         row_eff = self._phi(row) if row is not None else None
         col_eff = self._phi(col) if col is not None else None
 
-        # Undo gains to recover bare normalized weight.
+        # Undo gains to recover bare normalized weight. The clamp_min floors the divisor; under
+        # --gains-no-clamp-min we skip it so the divide is the exact inverse of _apply_gains'
+        # multiply for any nonzero gain (letting direct gains shrink through eps or flip sign).
+        clamp = not self.gains_no_clamp_min
         if flat_eff is not None:
-            p.div_(flat_eff.clamp_min(eps))
+            p.div_(flat_eff.clamp_min(eps) if clamp else flat_eff)
         if row_eff is not None:
-            p.div_(row_eff[:, None].clamp_min(eps))
+            p.div_((row_eff.clamp_min(eps) if clamp else row_eff)[:, None])
         if col_eff is not None:
-            p.div_(col_eff[None, :].clamp_min(eps))
+            p.div_((col_eff.clamp_min(eps) if clamp else col_eff)[None, :])
 
         # Compute ∂L/∂phi(g) from bare p and the gain-baked grad still on p.grad.
         p_times_pgrad = p * p.grad
@@ -772,6 +813,9 @@ class MDDecoupling(_MDDecouplingBase):
     def _resolve_gains_mode(self, p):
         is_output = getattr(p, "is_output_parameter", False)
         is_embedding = getattr(p, "is_embedding_parameter", False)
+        is_router = getattr(p, "is_router", False)
+        if is_router and self.hypersphere_gains_mode_router is not None:
+            return self.hypersphere_gains_mode_router
         if is_output and self.hypersphere_gains_mode_output is not None:
             return self.hypersphere_gains_mode_output
         if is_embedding and self.hypersphere_gains_mode_embedding is not None:
@@ -1029,6 +1073,8 @@ def get_megatron_mddecoupling_optimizer(
         hypersphere_preserve_init=config.hypersphere_preserve_init,
         hypersphere_scale_out_proj_init=config.hypersphere_scale_out_proj_init,
         num_layers=model_chunks[0].config.num_layers,
+        hypersphere_radius_from_init=config.hypersphere_radius_from_init,
+        hidden_size=model_chunks[0].config.hidden_size,
         use_orthogonal_updates=config.use_orthogonal_updates,
         momentum_beta=config.muon_momentum,
         use_nesterov=config.muon_use_nesterov,
@@ -1046,6 +1092,7 @@ def get_megatron_mddecoupling_optimizer(
         hypersphere_gains_mode=config.hypersphere_gains_mode,
         hypersphere_gains_mode_output=config.hypersphere_gains_mode_output,
         hypersphere_gains_mode_embedding=config.hypersphere_gains_mode_embedding,
+        hypersphere_gains_mode_router=config.hypersphere_gains_mode_router,
         gains_lr=config.gains_lr if config.gains_lr is not None else config.lr,
         # Gains decay on their own band down to this floor, honouring --min-lr-mode
         # (absolute → gains_min_lr = min(config.min_lr, gains_base) = config.min_lr).
@@ -1056,6 +1103,7 @@ def get_megatron_mddecoupling_optimizer(
         gains_eps=config.adam_eps,
         gains_weight_decay=config.weight_decay,
         gain_parametrization=config.gain_parametrization,
+        gains_no_clamp_min=config.gains_no_clamp_min,
     )
 
     optimizers = []
