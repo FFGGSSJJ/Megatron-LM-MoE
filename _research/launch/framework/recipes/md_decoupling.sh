@@ -91,7 +91,7 @@ RECIPE_ARGS=(
     # Hypersphere (direction): flat on matrices, off on embedding/LM head,
     # row-wise on the router.
     --hypersphere-mode flat
-    --hypersphere-embedding-mode none
+    --hypersphere-embedding-mode row
     --hypersphere-router-mode row
     # NOTE: --hypersphere-scale-out-proj-init (1/sqrt(2*num_layers) on the out-proj
     # weight-norm/gain) is intentionally NOT set: common.sh enables
