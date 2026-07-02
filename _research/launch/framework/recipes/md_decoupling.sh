@@ -106,6 +106,7 @@ RECIPE_ARGS=(
     # silently change this recipe. GAIN_PARAM defaults to softplus (positive).
     --hypersphere-gains-mode rowcol
     --hypersphere-gains-mode-router "$GAINS_ROUTER"
+    --hypersphere-gains-mode-embedding none
     --gain-parametrization "$GAIN_PARAM"
     "${NO_CLAMP_ARGS[@]}"
     # Grad-accum fusion is incompatible with the custom optimizer's grad path.
