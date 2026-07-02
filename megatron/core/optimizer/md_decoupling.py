@@ -492,8 +492,6 @@ class MDDecoupling(_MDDecouplingBase):
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
-        # Drop the 1e-8 clamp_min on phi(g) in _preprocess_gains so gains can shrink through 1e-8
-        # or flip sign (only meaningful for gain_parametrization="direct"; no-op for softplus).
         gains_no_clamp_min: bool = False,
         **kwargs,
     ):
@@ -687,9 +685,7 @@ class MDDecoupling(_MDDecouplingBase):
         row_eff = self._phi(row) if row is not None else None
         col_eff = self._phi(col) if col is not None else None
 
-        # Undo gains to recover bare normalized weight. The clamp_min floors the divisor; under
-        # --gains-no-clamp-min we skip it so the divide is the exact inverse of _apply_gains'
-        # multiply for any nonzero gain (letting direct gains shrink through eps or flip sign).
+        # Undo gains to recover bare normalized weight.
         clamp = not self.gains_no_clamp_min
         if flat_eff is not None:
             p.div_(flat_eff.clamp_min(eps) if clamp else flat_eff)
