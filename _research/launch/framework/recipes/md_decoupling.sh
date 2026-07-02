@@ -21,6 +21,12 @@
 #   RADIUS_FROM_INIT  1 → put each flat matrix sphere at its init Frobenius norm
 #             (sqrt(min/hidden) rescale) instead of sqrt(max); keeps narrow
 #             matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere
+#   GAIN_PARAM  gain parametrization: softplus (default, phi(g)>0) | direct (phi(g)=g)
+#   GAINS_ROUTER  router gains mode (default rowcol; 'none' disables per-expert
+#             router gains — md_decoupling.py's own default is now 'none', so this
+#             recipe pins rowcol to keep its historical behavior)
+#   GAINS_NO_CLAMP  1 → drop the 1e-8 recover clamp on phi(g) (only meaningful for
+#             GAIN_PARAM=direct; lets gains shrink through 0 / flip sign)
 
 OPTIMIZER=md_decoupling
 EXP_TAG=muonmd
@@ -37,6 +43,18 @@ RADIUS_FROM_INIT=${RADIUS_FROM_INIT:-1}
 RADIUS_FROM_INIT_ARGS=()
 if [ "$RADIUS_FROM_INIT" = 1 ]; then
     RADIUS_FROM_INIT_ARGS=(--hypersphere-radius-from-init)
+fi
+
+# Gain-parametrization / router-gains / recover-clamp knobs. Defaults reproduce
+# the original recipe exactly: softplus gains, rowcol gains on the router, and the
+# 1e-8 recover clamp left ON. GAINS_ROUTER is pinned here (not left to the
+# md_decoupling.py default, which is now 'none') so this recipe is unchanged.
+GAIN_PARAM=${GAIN_PARAM:-softplus}
+GAINS_ROUTER=${GAINS_ROUTER:-rowcol}
+GAINS_NO_CLAMP=${GAINS_NO_CLAMP:-0}
+NO_CLAMP_ARGS=()
+if [ "$GAINS_NO_CLAMP" = 1 ]; then
+    NO_CLAMP_ARGS=(--gains-no-clamp-min)
 fi
 
 # md_decoupling's canonical regularization (no weight decay; Adam betas reused
@@ -83,9 +101,13 @@ RECIPE_ARGS=(
     "${RADIUS_FROM_INIT_ARGS[@]}"
     # Router uses the Muon branch.
     --md-router-use-orthogonal-updates True
-    # Learnable per-axis gains (magnitude), softplus-parametrized (positive).
+    # Learnable per-axis gains (magnitude). Router gains pinned to $GAINS_ROUTER
+    # (default rowcol) so md_decoupling.py's router-gains=none default does not
+    # silently change this recipe. GAIN_PARAM defaults to softplus (positive).
     --hypersphere-gains-mode rowcol
-    --gain-parametrization softplus
+    --hypersphere-gains-mode-router "$GAINS_ROUTER"
+    --gain-parametrization "$GAIN_PARAM"
+    "${NO_CLAMP_ARGS[@]}"
     # Grad-accum fusion is incompatible with the custom optimizer's grad path.
     --no-gradient-accumulation-fusion
 )

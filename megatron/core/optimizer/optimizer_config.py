@@ -380,6 +380,12 @@ class OptimizerConfig:
     hypersphere_gains_mode_embedding: Optional[str] = None
     """Gains mode override for the embedding. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
 
+    hypersphere_gains_mode_router: Optional[str] = 'none'
+    """Gains mode override for MoE router weights. One of 'row'/'col'/'rowcol'/'flat'/'none'.
+    Defaults to 'none': per-expert row gains re-introduce the per-expert magnitude that the router
+    hypersphere normalization removes, which unbalances expert selection. Only takes effect when
+    --hypersphere-gains-mode is set (routers otherwise have no gains at all)."""
+
     gains_lr: Optional[float] = None
     """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks
     the schedule shape of the main LR)."""
@@ -387,6 +393,13 @@ class OptimizerConfig:
     gain_parametrization: str = 'softplus'
     """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
     'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""
+
+    gains_no_clamp_min: bool = False
+    """Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in _preprocess_gains.
+    The clamp floors the divisor, which is asymmetric with _apply_gains (multiplies by the true,
+    unclamped phi(g)) and — under gain_parametrization='direct' — blocks a gain from shrinking
+    through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
+    nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state

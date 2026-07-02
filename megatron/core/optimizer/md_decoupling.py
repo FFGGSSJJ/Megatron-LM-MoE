@@ -482,6 +482,7 @@ class MDDecoupling(_MDDecouplingBase):
         hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed"]] = None,
         hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
         hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
+        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
         gains_lr: Optional[float] = None,
         gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
@@ -491,11 +492,16 @@ class MDDecoupling(_MDDecouplingBase):
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
+        # Drop the 1e-8 clamp_min on phi(g) in _preprocess_gains so gains can shrink through 1e-8
+        # or flip sign (only meaningful for gain_parametrization="direct"; no-op for softplus).
+        gains_no_clamp_min: bool = False,
         **kwargs,
     ):
         self.hypersphere_gains_mode = hypersphere_gains_mode
         self.hypersphere_gains_mode_output = hypersphere_gains_mode_output
         self.hypersphere_gains_mode_embedding = hypersphere_gains_mode_embedding
+        self.hypersphere_gains_mode_router = hypersphere_gains_mode_router
+        self.gains_no_clamp_min = gains_no_clamp_min
         self.gains_lr = gains_lr  # None → follow group["lr"] verbatim
         self.gains_min_lr = gains_min_lr  # gains LR floor (matches the group's min_lr policy)
         self.gains_betas = gains_betas
@@ -681,13 +687,16 @@ class MDDecoupling(_MDDecouplingBase):
         row_eff = self._phi(row) if row is not None else None
         col_eff = self._phi(col) if col is not None else None
 
-        # Undo gains to recover bare normalized weight.
+        # Undo gains to recover bare normalized weight. The clamp_min floors the divisor; under
+        # --gains-no-clamp-min we skip it so the divide is the exact inverse of _apply_gains'
+        # multiply for any nonzero gain (letting direct gains shrink through eps or flip sign).
+        clamp = not self.gains_no_clamp_min
         if flat_eff is not None:
-            p.div_(flat_eff.clamp_min(eps))
+            p.div_(flat_eff.clamp_min(eps) if clamp else flat_eff)
         if row_eff is not None:
-            p.div_(row_eff[:, None].clamp_min(eps))
+            p.div_((row_eff.clamp_min(eps) if clamp else row_eff)[:, None])
         if col_eff is not None:
-            p.div_(col_eff[None, :].clamp_min(eps))
+            p.div_((col_eff.clamp_min(eps) if clamp else col_eff)[None, :])
 
         # Compute ∂L/∂phi(g) from bare p and the gain-baked grad still on p.grad.
         p_times_pgrad = p * p.grad
@@ -804,6 +813,9 @@ class MDDecoupling(_MDDecouplingBase):
     def _resolve_gains_mode(self, p):
         is_output = getattr(p, "is_output_parameter", False)
         is_embedding = getattr(p, "is_embedding_parameter", False)
+        is_router = getattr(p, "is_router", False)
+        if is_router and self.hypersphere_gains_mode_router is not None:
+            return self.hypersphere_gains_mode_router
         if is_output and self.hypersphere_gains_mode_output is not None:
             return self.hypersphere_gains_mode_output
         if is_embedding and self.hypersphere_gains_mode_embedding is not None:
@@ -1080,6 +1092,7 @@ def get_megatron_mddecoupling_optimizer(
         hypersphere_gains_mode=config.hypersphere_gains_mode,
         hypersphere_gains_mode_output=config.hypersphere_gains_mode_output,
         hypersphere_gains_mode_embedding=config.hypersphere_gains_mode_embedding,
+        hypersphere_gains_mode_router=config.hypersphere_gains_mode_router,
         gains_lr=config.gains_lr if config.gains_lr is not None else config.lr,
         # Gains decay on their own band down to this floor, honouring --min-lr-mode
         # (absolute → gains_min_lr = min(config.min_lr, gains_base) = config.min_lr).
@@ -1090,6 +1103,7 @@ def get_megatron_mddecoupling_optimizer(
         gains_eps=config.adam_eps,
         gains_weight_decay=config.weight_decay,
         gain_parametrization=config.gain_parametrization,
+        gains_no_clamp_min=config.gains_no_clamp_min,
     )
 
     optimizers = []
