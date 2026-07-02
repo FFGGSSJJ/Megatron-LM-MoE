@@ -685,7 +685,9 @@ class MDDecoupling(_MDDecouplingBase):
         row_eff = self._phi(row) if row is not None else None
         col_eff = self._phi(col) if col is not None else None
 
-        # Undo gains to recover bare normalized weight.
+        # Undo gains to recover bare normalized weight. The clamp_min floors the divisor; under
+        # --gains-no-clamp-min we skip it so the divide is the exact inverse of _apply_gains'
+        # multiply for any nonzero gain (letting direct gains shrink through eps or flip sign).
         clamp = not self.gains_no_clamp_min
         if flat_eff is not None:
             p.div_(flat_eff.clamp_min(eps) if clamp else flat_eff)
