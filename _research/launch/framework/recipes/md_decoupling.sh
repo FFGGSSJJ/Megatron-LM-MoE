@@ -88,7 +88,7 @@ RECIPE_ARGS=(
     --muon-scale-mode shape_up
     --muon-momentum 0.95
     --muon-use-nesterov
-    # Hypersphere (direction): flat on matrices, off on embedding/LM head,
+    # Hypersphere (direction): flat on matrices, row-wise on embedding/LM head,
     # row-wise on the router.
     --hypersphere-mode flat
     --hypersphere-embedding-mode row
