@@ -47,7 +47,11 @@ export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
 # ── paths & environment (identical across every run) ─────────────────────────
 REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-apertus-moe
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+# The repo root — NOT SLURM_SUBMIT_DIR, which is wherever sbatch was invoked from
+# (submitting from a subdir like _research/launch/framework made WORKDIR the framework
+# dir, doubling paths like $WORKDIR/_research/launch/install_python_deps.sh). Everything
+# else here already hardcodes REPO_DIR, so keep WORKDIR consistent. Override via env.
+WORKDIR=${WORKDIR:-$REPO_DIR}
 cd "$WORKDIR"
 
 # ARCH_TAG (from clusters/<cluster>.sh) keeps compiled-kernel caches and
