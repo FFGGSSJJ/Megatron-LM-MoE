@@ -249,14 +249,14 @@ class TEGroupedMLP(MegatronModule):
                 tp_group=self.tp_group,
             )
 
+        fc2_output_size = self.config.hidden_size if self.config.moe_latent_size is None else self.config.moe_latent_size
+        if self.config.moe_expert_asymmetric_latent_size is not None:
+            fc2_output_size = self.config.moe_expert_asymmetric_latent_size
+
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
             not_none(self.config.moe_ffn_hidden_size),
-            (
-                self.config.hidden_size
-                if self.config.moe_latent_size is None
-                else self.config.moe_latent_size
-            ),
+            fc2_output_size,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,

@@ -272,6 +272,55 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
             )
 
+        if self.config.moe_asymmetric_latent_size:
+            assert not self.config.moe_latent_size, (
+                "MoE asymmetric latent projections cannot be used with MoE latent projections."
+            )
+            assert HAVE_TE, "TransformerEngine is required for MoE asymmetric latent projections."
+            linear_cls = TELinear
+
+            self.fc1_latent_proj_down_asymmetric = linear_cls(
+                self.config.hidden_size,
+                self.config.moe_asymmetric_latent_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+
+            self.fc2_latent_proj_up_asymmetric = linear_cls(
+                self.config.moe_asymmetric_latent_size,
+                self.config.hidden_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+
+        if self.config.moe_expert_asymmetric_latent_size:
+            assert self.config.moe_latent_size is None
+            assert self.config.moe_asymmetric_latent_size is None
+            assert HAVE_TE, "TransformerEngine is required for MoE expert asymmetric latent projections."
+            linear_cls = TELinear
+
+            self.fc2_latent_proj_up_expert_asymmetric = linear_cls(
+                self.config.moe_expert_asymmetric_latent_size,
+                self.config.hidden_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
@@ -496,6 +545,9 @@ class MoELayer(BaseMoELayer):
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
+        if self.config.moe_asymmetric_latent_size:
+            output, _ = self.fc1_latent_proj_down_asymmetric(output)
+
         return output, mlp_bias
 
     def combine(self, output: torch.Tensor):
@@ -505,6 +557,10 @@ class MoELayer(BaseMoELayer):
         experts (e.g., via an All-to-All communication).
         """
         output = self.token_dispatcher.token_combine(output)
+        if self.config.moe_asymmetric_latent_size:
+            output, _ = self.fc2_latent_proj_up_asymmetric(output)
+        if self.config.moe_expert_asymmetric_latent_size:
+            output, _ = self.fc2_latent_proj_up_expert_asymmetric(output)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
