@@ -297,6 +297,29 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
     @staticmethod
+    def _zero_fp8_padding_rows(hidden_states, probs, actual_tokens_per_expert, padded_tokens_per_expert):
+        """Zero the FP8-padding rows that TE's Fp8Padding leaves uninitialized.
+
+        Fp8Padding allocates its output with ``torch.empty`` and only writes the real rows
+        (see ``transformer_engine.pytorch.module.fp8_padding``); padding rows hold whatever was
+        previously in that memory. That's harmless for the padded output rows themselves --
+        Fp8Unpadding slices them away before they reach the loss, so their incoming gradient is
+        exactly zero -- but PolyNorm's alpha_1/alpha_2 are per-expert parameters whose gradient
+        sums over every row mapped to that expert (real and padding alike) via
+        repeat_interleave, and a stray NaN/Inf in an uninitialized padding row can poison that
+        whole-expert gradient (``0 * NaN == NaN``) even though the row's own output is unused.
+        Zeroing both operands in place before they reach the gate/GLU multiply guarantees every
+        padding row contributes exactly zero to the forward output and to every downstream
+        gradient (the gate's, and transitively fc1/fc2's weight gradients).
+        """
+        offset = 0
+        for actual, padded in zip(actual_tokens_per_expert, padded_tokens_per_expert):
+            if padded > actual:
+                hidden_states[offset + actual : offset + padded].zero_()
+                probs[offset + actual : offset + padded].zero_()
+            offset += padded
+
+    @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
@@ -419,6 +442,13 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
+            if self.config.pnglu:
+                self._zero_fp8_padding_rows(
+                    permuted_local_hidden_states,
+                    permuted_probs,
+                    actual_tokens_per_expert,
+                    tokens_per_expert,
+                )
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
 

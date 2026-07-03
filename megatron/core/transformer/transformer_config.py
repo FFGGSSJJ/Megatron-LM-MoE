@@ -1317,8 +1317,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        # PolyNorm GLU (pnglu): the GLU gate becomes a small learnable module, so the fused /
-        # TE / quantized activation kernels (which hardcode SiLU/GELU) cannot be used.
+        # PolyNorm GLU (pnglu): the GLU gate becomes a small learnable module, so kernels that
+        # hardcode SiLU/GELU (TE's fused bias-activation, FlashInfer/mcore inference kernels)
+        # cannot be used. TEGroupedMLP's own fp8/fp4 quantized path is exempt -- its bias_act_func
+        # has a dedicated pnglu branch (see the NOTE below on Fp8Padding for the one correctness
+        # wrinkle that required a fix).
         if self.pnglu:
             if not self.gated_linear_unit:
                 raise ValueError(
@@ -1332,10 +1335,11 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.use_te_activation_func:
                 raise ValueError("pnglu=True is incompatible with use_te_activation_func.")
-            if self.fp8 is not None or self.fp4 is not None:
+            if (self.fp8 is not None or self.fp4 is not None) and self.moe_use_offloading_experts:
                 raise ValueError(
-                    "pnglu=True is not supported with fp8/fp4: the quantized grouped-expert path "
-                    "pads tokens_per_expert and applies fused activation kernels."
+                    "pnglu=True with fp8/fp4 and moe_use_offloading_experts=True is not supported: "
+                    "OffloadingExpertsMLP's fp8 compute is controlled by moe_use_inplace_fp8_param, "
+                    "not fp8/fp4. Use --moe-use-inplace-fp8-param (without --fp8/--fp4) instead."
                 )
             if self.use_fused_weighted_squared_relu:
                 raise ValueError("pnglu=True is incompatible with use_fused_weighted_squared_relu.")
@@ -1346,6 +1350,20 @@ class TransformerConfig(ModelParallelConfig):
                     "pnglu=True is not supported with transformer_impl='inference_optimized' "
                     "(the FlashInfer / mcore fused MoE kernels hardcode the activation type)."
                 )
+            # NOTE: TEGroupedMLP's quantized (fp8/fp4) grouped-expert path pads each expert's
+            # token block to a GEMM alignment boundary via TE's Fp8Padding, which allocates its
+            # output with torch.empty (uninitialized) and never writes the padding rows -- see
+            # transformer_engine.pytorch.module.fp8_padding._Fp8Padding.forward. That's harmless
+            # for the discarded padded output rows themselves (Fp8Unpadding slices them away
+            # before they reach the loss, so their incoming gradient is exactly zero), but
+            # PolyNorm's alpha_1/alpha_2 are per-expert parameters whose gradient sums over every
+            # row mapped to that expert -- real and padding alike -- via repeat_interleave. A
+            # stray NaN/Inf in an uninitialized padding row can poison that whole-expert gradient
+            # even though the row's own output is never used (0 * NaN = NaN). TEGroupedMLP.forward
+            # zeros the padding rows of both the hidden states and permuted_probs in place right
+            # after Fp8Padding (see _zero_fp8_padding_rows) specifically to close this gap for
+            # pnglu; the plain SwiGLU/GeGLU path has no equivalent shared-parameter reduction and
+            # is left as-is.
             # NOTE: PolyNorm reduces over the (TP/ETP-sharded) ffn feature dimension, but it
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
