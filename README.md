@@ -11,6 +11,37 @@ Megatron-LM and Megatron Core
 
 <div align="left">
 
+## swiss-ai fork: shared ablation setup (optional `_research/` submodule)
+
+**Only needed if you intend to use the shared ablation setup.** Otherwise you can ignore this.
+
+If you do want it: `_research/` is a **git submodule** → [`swiss-ai/pretrain`](https://github.com/swiss-ai/pretrain), tracking branch `apertus-2-pretrain-ablations`, holding our Apertus-2 MoE pretraining launcher + ablation configs. They live there so a one-argument config change is a commit to `pretrain` — pulled independently — rather than a push to this repo's `main` that everyone must re-sync to.
+
+**First-time setup**
+
+```bash
+# fresh clone: pull the submodule too
+git clone --recurse-submodules git@github.com:swiss-ai/Megatron-LM-MoE.git
+
+# existing clone — _research changes from a tracked directory into a submodule, which
+# does NOT auto-populate on pull, so initialise it once:
+git submodule update --init _research
+```
+
+**Everyday workflow for ablations**
+
+```bash
+# change a config → commit to pretrain (never touches Megatron main)
+cd _research && git add -p && git commit && git push
+
+# stay current with others' config changes
+cd _research && git pull            # you're on branch apertus-2-pretrain-ablations
+# ...or from the repo root:
+git submodule update --remote _research
+```
+
+The submodule pointer pinned in this repo deliberately lags what's checked out; everyone pulls `_research` directly to stay current, and the pin is bumped only occasionally. Each run logs `PRETRAIN CONFIG COMMIT: <sha>[-dirty]` — that logged SHA, not the pin, is the source of truth for which config produced a run.
+
 ## About
 
 This repository contains two components: **Megatron-LM** and **Megatron Core**.
