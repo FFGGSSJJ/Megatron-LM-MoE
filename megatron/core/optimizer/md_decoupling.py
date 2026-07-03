@@ -59,6 +59,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_embedding_mode(mode):
+    return None if mode == "external" else mode
+
+
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
@@ -86,7 +90,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
         hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
-        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
+        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none", "external"]] = None,
         hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
@@ -122,7 +126,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.use_nesterov = use_nesterov
 
         self.hypersphere_mode = hypersphere_mode
-        self.hypersphere_embedding_mode = hypersphere_embedding_mode
+        self.hypersphere_embedding_mode = _normalize_embedding_mode(hypersphere_embedding_mode)
         self.hypersphere_router_mode = hypersphere_router_mode
         self.hypersphere_eps = hypersphere_eps
         self.hypersphere_tangential_grad = hypersphere_tangential_grad
@@ -479,10 +483,10 @@ class MDDecoupling(_MDDecouplingBase):
     def __init__(
         self,
         params,
-        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed"]] = None,
-        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
-        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
-        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
+        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed", "none"]] = None,
+        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
         gains_lr: Optional[float] = None,
         gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
@@ -495,10 +499,16 @@ class MDDecoupling(_MDDecouplingBase):
         gains_no_clamp_min: bool = False,
         **kwargs,
     ):
-        self.hypersphere_gains_mode = hypersphere_gains_mode
-        self.hypersphere_gains_mode_output = hypersphere_gains_mode_output
-        self.hypersphere_gains_mode_embedding = hypersphere_gains_mode_embedding
-        self.hypersphere_gains_mode_router = hypersphere_gains_mode_router
+        self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
+        self.hypersphere_gains_mode_output = (
+            None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
+        )
+        self.hypersphere_gains_mode_embedding = (
+            None if hypersphere_gains_mode_embedding == "inherit" else hypersphere_gains_mode_embedding
+        )
+        self.hypersphere_gains_mode_router = (
+            None if hypersphere_gains_mode_router == "inherit" else hypersphere_gains_mode_router
+        )
         self.gains_no_clamp_min = gains_no_clamp_min
         self.gains_lr = gains_lr  # None → follow group["lr"] verbatim
         self.gains_min_lr = gains_min_lr  # gains LR floor (matches the group's min_lr policy)
@@ -809,15 +819,17 @@ class MDDecoupling(_MDDecouplingBase):
             p.mul_(self._phi(col)[None, :])
 
     def _resolve_gains_mode(self, p):
-        is_output = getattr(p, "is_output_parameter", False)
-        is_embedding = getattr(p, "is_embedding_parameter", False)
+        if self.hypersphere_gains_mode is None:
+            return None
+        is_output = getattr(p, "is_md_output_parameter", False)
+        is_embedding = getattr(p, "is_md_embedding_parameter", False)
         is_router = getattr(p, "is_router", False)
         if is_router and self.hypersphere_gains_mode_router is not None:
             return self.hypersphere_gains_mode_router
-        if is_output and self.hypersphere_gains_mode_output is not None:
-            return self.hypersphere_gains_mode_output
         if is_embedding and self.hypersphere_gains_mode_embedding is not None:
             return self.hypersphere_gains_mode_embedding
+        if is_output and self.hypersphere_gains_mode_output is not None:
+            return self.hypersphere_gains_mode_output
         return self.hypersphere_gains_mode
 
 
@@ -902,7 +914,8 @@ def _mddecoupling_config_overrides(
     # MDDecoupling on the Adam branch (use_orthogonal_updates=False) + post-step normalization.
     # When it is None they are routed to the external chained Adam (see the param partition in
     # get_megatron_mddecoupling_optimizer), so no MDDecoupling override is needed here.
-    if config.hypersphere_embedding_mode is not None:
+    hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
+    if hypersphere_embedding_mode is not None:
         overrides[ParamKey(attr='is_embedding_or_output_parameter')] = {
             'use_orthogonal_updates': False
         }
@@ -936,10 +949,10 @@ def _mddecoupling_config_overrides(
         'min_lr': _group_min_lr(config, matrix_lr),
     }
 
-    # Embedding LR (embedding + tied LM head share is_embedding_parameter).
+    # Embedding LR (embedding + tied LM head).
     if config.embedding_lr_multiplier is not None:
         emb_lr = config.embedding_lr_multiplier * config.lr
-        overrides[ParamKey(attr='is_embedding_parameter')] = {
+        overrides[ParamKey(attr='is_md_embedding_parameter')] = {
             'max_lr': emb_lr,
             'min_lr': _group_min_lr(config, emb_lr),
         }
@@ -948,8 +961,8 @@ def _mddecoupling_config_overrides(
     if config.output_lr is not None:
         output_only = ParamPredicate(
             name="md_output_not_embedding",
-            fn=lambda p: (getattr(p, "is_output_parameter", False)
-                          and not getattr(p, "is_embedding_parameter", False)),
+            fn=lambda p: (getattr(p, "is_md_output_parameter", False)
+                          and not getattr(p, "is_md_embedding_parameter", False)),
         )
         overrides[ParamKey(predicate=output_only)] = {
             'max_lr': config.output_lr,
@@ -1034,16 +1047,26 @@ def get_megatron_mddecoupling_optimizer(
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
+            if len(param.shape) != 2:
+                continue
             # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+            if 'linear_qkv.weight' in name:
                 param.is_qkv = True
-            if name.endswith('router.weight') and len(param.shape) == 2:
+            if name.endswith('router.weight'):
                 param.is_router = True
-            if ('linear_fc2' in name or 'linear_proj' in name) and len(param.shape) == 2:
+            if name.endswith('word_embeddings.weight'):
+                param.is_md_embedding_parameter = True
+            if name.endswith('output_layer.weight'):
+                if getattr(param, "shared_embedding", False):
+                    param.is_md_embedding_parameter = True
+                elif not getattr(param, "is_md_embedding_parameter", False):
+                    param.is_md_output_parameter = True
+            if 'linear_fc2' in name or 'linear_proj' in name:
                 param.is_out_proj = True
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
-    emb_in_md = config.hypersphere_embedding_mode is not None
+    hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
+    emb_in_md = hypersphere_embedding_mode is not None
     linear_params = []
     nonlinear_params = []
     for model_chunk in model_chunks:
@@ -1065,7 +1088,7 @@ def get_megatron_mddecoupling_optimizer(
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         hypersphere_mode=config.hypersphere_mode,
-        hypersphere_embedding_mode=config.hypersphere_embedding_mode,
+        hypersphere_embedding_mode=hypersphere_embedding_mode,
         hypersphere_router_mode=config.hypersphere_router_mode,
         hypersphere_tangential_grad=config.hypersphere_tangential_grad,
         hypersphere_preserve_init=config.hypersphere_preserve_init,

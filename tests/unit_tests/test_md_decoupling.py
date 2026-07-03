@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +9,8 @@ import torch
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.md_decoupling import MDDecoupling
 from megatron.core.optimizer.md_decoupling import _split_qkv
+from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
@@ -84,6 +87,53 @@ def _assert_qkv_split_tangent(optimizer, param, grad):
     torch.testing.assert_close(residuals, torch.zeros_like(residuals), rtol=1e-5, atol=1e-6)
 
 
+class _TinyMDDecouplingModel(torch.nn.Module):
+    def __init__(self, shared_output=False, device="cpu"):
+        super().__init__()
+        self.config = SimpleNamespace(
+            context_parallel_size=1,
+            hidden_size=8,
+            kv_channels=4,
+            num_attention_heads=2,
+            num_layers=1,
+            num_query_groups=1,
+        )
+        self.ddp_config = SimpleNamespace(
+            num_distributed_optimizer_instances=1,
+            use_distributed_optimizer=False,
+            use_megatron_fsdp=False,
+        )
+        self.embedding = torch.nn.Module()
+        self.embedding.word_embeddings = torch.nn.Embedding(8, 8, device=device)
+        self.output_layer = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.router = torch.nn.Linear(8, 4, bias=False, device=device)
+        self.attn = torch.nn.Module()
+        self.attn.linear_qkv = torch.nn.Linear(8, 24, bias=False, device=device)
+        self.mlp = torch.nn.Module()
+        self.mlp.linear_fc2 = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.norm = torch.nn.LayerNorm(8, device=device)
+
+        self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
+        self.output_layer.weight.is_embedding_or_output_parameter = True
+        if shared_output:
+            self.output_layer.weight.shared_embedding = True
+
+
+def test_md_decoupling_recipe_defaults():
+    config = OptimizerConfig()
+
+    assert config.hypersphere_mode == "flat"
+    assert config.hypersphere_embedding_mode == "row"
+    assert config.hypersphere_router_mode == "row"
+    assert config.hypersphere_radius_from_init is False
+    assert config.hypersphere_gains_mode == "rowcol"
+    assert config.hypersphere_gains_mode_output == "inherit"
+    assert config.hypersphere_gains_mode_embedding == "none"
+    assert config.hypersphere_gains_mode_router == "rowcol"
+    assert config.use_orthogonal_updates is True
+    assert config.gain_parametrization == "softplus"
+
+
 def test_md_decoupling_router_gains_mode_override():
     param = torch.nn.Parameter(torch.ones(2, 2))
     param.is_router = True
@@ -96,6 +146,124 @@ def test_md_decoupling_router_gains_mode_override():
     )
 
     assert optimizer._resolve_gains_mode(param) == "none"
+
+
+def test_md_decoupling_default_gains_mode_resolution():
+    normal = torch.nn.Parameter(torch.ones(2, 2))
+    embedding = torch.nn.Parameter(torch.ones(2, 2))
+    output = torch.nn.Parameter(torch.ones(2, 2))
+    router = torch.nn.Parameter(torch.ones(2, 2))
+    embedding.is_md_embedding_parameter = True
+    output.is_md_output_parameter = True
+    router.is_router = True
+    optimizer = MDDecoupling(
+        params=[normal, embedding, output, router],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        hypersphere_gains_mode_output="inherit",
+        hypersphere_gains_mode_embedding="none",
+        hypersphere_gains_mode_router="rowcol",
+        pg_collection=None,
+    )
+
+    assert optimizer._resolve_gains_mode(normal) == "rowcol"
+    assert optimizer._resolve_gains_mode(embedding) == "none"
+    assert optimizer._resolve_gains_mode(output) == "rowcol"
+    assert optimizer._resolve_gains_mode(router) == "rowcol"
+
+
+def test_md_decoupling_gains_mode_none_disables_gain_state():
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.is_router = True
+    param.grad = torch.ones_like(param)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="none",
+        hypersphere_gains_mode_router="rowcol",
+        use_orthogonal_updates=False,
+        pg_collection=None,
+    )
+
+    optimizer.step()
+
+    gain_state_keys = {
+        "flat_gain",
+        "flat_gain_m",
+        "flat_gain_v",
+        "row_gain",
+        "row_gain_m",
+        "row_gain_v",
+        "col_gain",
+        "col_gain_m",
+        "col_gain_v",
+    }
+    assert optimizer.hypersphere_gains_mode is None
+    assert optimizer._resolve_gains_mode(param) is None
+    assert gain_state_keys.isdisjoint(optimizer.state[param])
+
+
+def test_md_decoupling_embedding_gain_override_wins_for_tied_output():
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.is_md_embedding_parameter = True
+    param.is_md_output_parameter = True
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        hypersphere_gains_mode_embedding="none",
+        hypersphere_gains_mode_output="flat",
+        pg_collection=None,
+    )
+
+    assert optimizer._resolve_gains_mode(param) == "none"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="optimizer wrapper creates CUDA scale")
+def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
+    Utils.initialize_model_parallel()
+    try:
+        untied_model = _TinyMDDecouplingModel(shared_output=False, device="cuda")
+        shared_model = _TinyMDDecouplingModel(shared_output=True, device="cuda")
+        config = OptimizerConfig(
+            optimizer="md_decoupling",
+            lr=0.01,
+            min_lr=0.0,
+            use_orthogonal_updates=False,
+        )
+
+        optimizer = get_megatron_mddecoupling_optimizer(
+            config,
+            [untied_model],
+            use_gloo_process_groups=False,
+        )
+        shared_optimizer = get_megatron_mddecoupling_optimizer(
+            config,
+            [shared_model],
+            use_gloo_process_groups=False,
+        )
+        md_optimizer = optimizer.chained_optimizers[0].optimizer
+        shared_md_optimizer = shared_optimizer.chained_optimizers[0].optimizer
+
+        assert untied_model.embedding.word_embeddings.weight.is_md_embedding_parameter is True
+        assert not hasattr(untied_model.embedding.word_embeddings.weight, "is_md_output_parameter")
+        assert untied_model.output_layer.weight.is_md_output_parameter is True
+        assert not hasattr(untied_model.output_layer.weight, "is_md_embedding_parameter")
+        assert untied_model.router.weight.is_router is True
+        assert untied_model.attn.linear_qkv.weight.is_qkv is True
+        assert untied_model.mlp.linear_fc2.weight.is_out_proj is True
+        assert (
+            md_optimizer._resolve_gains_mode(untied_model.embedding.word_embeddings.weight)
+            == "none"
+        )
+        assert md_optimizer._resolve_gains_mode(untied_model.output_layer.weight) == "rowcol"
+        assert md_optimizer._resolve_gains_mode(untied_model.router.weight) == "rowcol"
+
+        assert shared_model.output_layer.weight.is_md_embedding_parameter is True
+        assert not hasattr(shared_model.output_layer.weight, "is_md_output_parameter")
+        assert shared_md_optimizer._resolve_gains_mode(shared_model.output_layer.weight) == "none"
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_md_decoupling_direct_gains_no_clamp_min_round_trip():
