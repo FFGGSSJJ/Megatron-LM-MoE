@@ -108,6 +108,7 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'is_embedding_parameter',
     'is_md_embedding_parameter',
     'is_md_output_parameter',
+    'merged_offload_expert',
 )
 
 

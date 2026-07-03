@@ -88,12 +88,14 @@ def _assert_qkv_split_tangent(optimizer, param, grad):
 
 
 class _TinyMDDecouplingModel(torch.nn.Module):
-    def __init__(self, shared_output=False, device="cpu"):
+    def __init__(self, shared_output=False, offloading_expert=False, device="cpu"):
         super().__init__()
         self.config = SimpleNamespace(
             context_parallel_size=1,
             hidden_size=8,
             kv_channels=4,
+            moe_use_inplace_fp8_param=offloading_expert,
+            moe_use_offloading_experts=offloading_expert,
             num_attention_heads=2,
             num_layers=1,
             num_query_groups=1,
@@ -112,6 +114,9 @@ class _TinyMDDecouplingModel(torch.nn.Module):
         self.mlp = torch.nn.Module()
         self.mlp.linear_fc2 = torch.nn.Linear(8, 8, bias=False, device=device)
         self.norm = torch.nn.LayerNorm(8, device=device)
+        if offloading_expert:
+            self.experts = torch.nn.Module()
+            self.experts.weight2 = torch.nn.Parameter(torch.ones(2, 8, 8, device=device))
 
         self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         self.output_layer.weight.is_embedding_or_output_parameter = True
@@ -225,10 +230,20 @@ def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
     try:
         untied_model = _TinyMDDecouplingModel(shared_output=False, device="cuda")
         shared_model = _TinyMDDecouplingModel(shared_output=True, device="cuda")
+        offload_model = _TinyMDDecouplingModel(
+            offloading_expert=True, device="cuda"
+        ).bfloat16()
         config = OptimizerConfig(
             optimizer="md_decoupling",
             lr=0.01,
             min_lr=0.0,
+            use_orthogonal_updates=False,
+        )
+        offload_config = OptimizerConfig(
+            optimizer="md_decoupling",
+            lr=0.01,
+            min_lr=0.0,
+            bf16=True,
             use_orthogonal_updates=False,
         )
 
@@ -242,8 +257,14 @@ def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
             [shared_model],
             use_gloo_process_groups=False,
         )
+        offload_optimizer = get_megatron_mddecoupling_optimizer(
+            offload_config,
+            [offload_model],
+            use_gloo_process_groups=False,
+        )
         md_optimizer = optimizer.chained_optimizers[0].optimizer
         shared_md_optimizer = shared_optimizer.chained_optimizers[0].optimizer
+        offload_md_optimizer = offload_optimizer.chained_optimizers[0].optimizer
 
         assert untied_model.embedding.word_embeddings.weight.is_md_embedding_parameter is True
         assert not hasattr(untied_model.embedding.word_embeddings.weight, "is_md_output_parameter")
@@ -262,6 +283,18 @@ def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
         assert shared_model.output_layer.weight.is_md_embedding_parameter is True
         assert not hasattr(shared_model.output_layer.weight, "is_md_output_parameter")
         assert shared_md_optimizer._resolve_gains_mode(shared_model.output_layer.weight) == "none"
+
+        assert offload_model.experts.weight2.expert_tp is True
+        assert offload_model.experts.weight2.merged_offload_expert is True
+        assert offload_model.experts.weight2.is_out_proj is True
+        offload_main_param = offload_model.experts.weight2.main_param
+        assert offload_main_param.merged_offload_expert is True
+        assert offload_main_param.is_out_proj is True
+        assert any(
+            p is offload_main_param
+            for group in offload_md_optimizer.param_groups
+            for p in group["params"]
+        )
     finally:
         Utils.destroy_model_parallel()
 
