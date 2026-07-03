@@ -886,8 +886,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # all optimizer parameters passed to optim_state_to_sharding_state are
         # expected to have the same shape as the model parameters,
         # so we save the step separately and ignore it here
+        shape_mismatch_keys = getattr(self.optimizer, 'sharded_state_shape_mismatch_keys', ())
         optim_state_to_sharding_state(
-            state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
+            state_dict['optimizer'],
+            id_to_sharded_param_map,
+            exclude_keys="step",
+            shape_mismatch_keys=shape_mismatch_keys,
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
@@ -1093,7 +1097,13 @@ class FP32Optimizer(MegatronOptimizer):
         # all optimizer parameters passed to optim_state_to_sharding_state are
         # expected to have the same shape as the model parameters,
         # so we save the step separately and ignore it here
-        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
+        shape_mismatch_keys = getattr(self.optimizer, 'sharded_state_shape_mismatch_keys', ())
+        optim_state_to_sharding_state(
+            state_dict,
+            id_to_sharded_param_map,
+            exclude_keys="step",
+            shape_mismatch_keys=shape_mismatch_keys,
+        )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
         if step:

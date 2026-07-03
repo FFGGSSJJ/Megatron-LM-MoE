@@ -5,10 +5,18 @@ import os
 import pytest
 import torch
 
+from megatron.core.dist_checkpointing import ShardedObject
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing import load
+from megatron.core.dist_checkpointing import save
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.md_decoupling import MDDecoupling
+from megatron.core.optimizer.md_decoupling import _md_init_state_fn
 from megatron.core.optimizer.md_decoupling import _split_qkv
+from megatron.core.optimizer.optimizer import FP32Optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -120,6 +128,108 @@ def test_md_decoupling_direct_gains_no_clamp_min_round_trip():
     optimizer._apply_gains(param)
 
     torch.testing.assert_close(param, original)
+
+
+def test_md_decoupling_sharded_state_dict_includes_gain_objects():
+    param = torch.nn.Parameter(torch.ones(3, 4))
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        pg_collection=None,
+    )
+    megatron_optimizer = FP32Optimizer(
+        optimizer,
+        OptimizerConfig(optimizer='md_decoupling'),
+        _md_init_state_fn,
+    )
+    model_sharded_state_dict = {
+        'linear.weight': ShardedTensor.from_rank_offsets('linear.weight', param)
+    }
+
+    state_dict = megatron_optimizer.sharded_state_dict(
+        model_sharded_state_dict,
+        is_loading=True,
+    )
+    param_state = state_dict['state'][0]
+
+    assert isinstance(param_state['exp_avg'], ShardedTensor)
+    assert isinstance(param_state['row_gain'], ShardedObject)
+    assert isinstance(param_state['row_gain_m'], ShardedObject)
+    assert isinstance(param_state['row_gain_v'], ShardedObject)
+    assert isinstance(param_state['col_gain'], ShardedObject)
+    assert isinstance(param_state['col_gain_m'], ShardedObject)
+    assert isinstance(param_state['col_gain_v'], ShardedObject)
+
+
+def _md_sharded_optimizer(param):
+    optimizer = MDDecoupling(
+        params=[
+            {
+                'params': [param],
+                'wd_mult': 1.0,
+                'is_expert_parallel': False,
+                'is_decoupled_lr': False,
+            }
+        ],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        pg_collection=None,
+    )
+    return FP32Optimizer(
+        optimizer,
+        OptimizerConfig(optimizer='md_decoupling'),
+        _md_init_state_fn,
+    )
+
+
+def _linear_weight_sharded_state(param):
+    return {'linear.weight': ShardedTensor.from_rank_offsets('linear.weight', param)}
+
+
+def test_md_decoupling_torch_dist_round_trips_gain_objects(tmp_path_dist_ckpt):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        expected_gains = (
+            ('row_gain', 2.0, (3,)),
+            ('row_gain_m', 3.0, (3,)),
+            ('row_gain_v', 4.0, (3,)),
+            ('col_gain', 5.0, (4,)),
+            ('col_gain_m', 6.0, (4,)),
+            ('col_gain_v', 7.0, (4,)),
+        )
+        param = torch.nn.Parameter(torch.ones(3, 4))
+        megatron_optimizer = _md_sharded_optimizer(param)
+        megatron_optimizer.sharded_state_dict(
+            _linear_weight_sharded_state(param),
+            is_loading=True,
+        )
+        optimizer = megatron_optimizer.optimizer
+        for name, value, _ in expected_gains:
+            optimizer.state[param][name].fill_(value)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'md_gain_state_round_trip', sync=True) as ckpt_dir:
+            save(
+                megatron_optimizer.sharded_state_dict(_linear_weight_sharded_state(param)),
+                ckpt_dir,
+            )
+
+            loaded_param = torch.nn.Parameter(torch.ones(3, 4))
+            loaded_megatron_optimizer = _md_sharded_optimizer(loaded_param)
+            loaded_state_dict = load(
+                loaded_megatron_optimizer.sharded_state_dict(
+                    _linear_weight_sharded_state(loaded_param),
+                    is_loading=True,
+                ),
+                ckpt_dir,
+            )
+            loaded_megatron_optimizer.load_state_dict(loaded_state_dict)
+
+        loaded_state = loaded_megatron_optimizer.optimizer.state[loaded_param]
+        for name, value, shape in expected_gains:
+            torch.testing.assert_close(loaded_state[name], torch.full(shape, value))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @requires_cuda_and_emerging

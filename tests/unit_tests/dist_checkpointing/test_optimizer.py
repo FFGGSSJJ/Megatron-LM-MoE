@@ -11,7 +11,13 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import (
+    ShardedObject,
+    ShardedTensor,
+    load,
+    load_plain_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -236,6 +242,31 @@ class TestOptimizer:
                 for layer_name in model_state_dict
             ]
         )
+
+    def test_optimizer_mismatched_state_uses_sharded_object(self):
+        Utils.initialize_model_parallel(1, 1)
+        model = Model()
+        param = model.proj.weight
+        optim_state_dict = {
+            'state': {
+                0: {
+                    'exp_avg': torch.ones_like(param),
+                    'gain': torch.ones(param.size(0)),
+                }
+            },
+            'param_groups': [{'params': [0]}],
+        }
+        param_map = get_param_id_to_sharded_param_map(model.sharded_state_dict(), [param])
+
+        optim_state_to_sharding_state(
+            optim_state_dict,
+            param_map,
+            shape_mismatch_keys=('gain',),
+        )
+
+        assert isinstance(optim_state_dict['state'][0]['exp_avg'], ShardedTensor)
+        assert isinstance(optim_state_dict['state'][0]['gain'], ShardedObject)
+        assert optim_state_dict['state'][0]['gain'].key == 'optimizer.state.gain.proj.weight'
 
 
 def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **config_kwargs):

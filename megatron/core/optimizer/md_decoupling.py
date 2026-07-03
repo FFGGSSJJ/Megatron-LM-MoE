@@ -473,8 +473,21 @@ class MDDecoupling(_MDDecouplingBase):
     Gain optimizer state (1st/2nd moments) is tracked manually as plain tensors in
     `self.state[p]`. This avoids registering gain `nn.Parameter`s in an inner `AdamW` that lives
     outside `self.param_groups` — torch.optim's state_dict id-mapping doesn't survive that. Gain
-    tensors have a different shape than `p`, so use `--ckpt-format torch`.
+    tensors have a different shape than `p`; torch_dist stores those tensors as rank-local
+    checkpoint objects.
     """
+
+    sharded_state_shape_mismatch_keys = (
+        "row_gain",
+        "row_gain_m",
+        "row_gain_v",
+        "col_gain",
+        "col_gain_m",
+        "col_gain_v",
+        "flat_gain",
+        "flat_gain_m",
+        "flat_gain_v",
+    )
 
     def __init__(
         self,
@@ -960,10 +973,11 @@ def _mddecoupling_config_overrides(
 
 
 def _md_init_state_fn(opt, config=None):
-    """Initialize MDDecoupling state for torch_dist checkpoint compatibility (gain state is still
-    created lazily at first step; recommend --ckpt-format torch when gains are enabled)."""
+    """Initialize MDDecoupling state for torch_dist checkpoint compatibility."""
     for group in opt.param_groups:
         for p in group['params']:
+            if hasattr(opt, "_maybe_init_gain_state"):
+                opt._maybe_init_gain_state(p)
             if "exp_avg" not in opt.state[p]:
                 opt.state[p]["exp_avg"] = torch.zeros_like(p.data)
                 if not group.get("use_orthogonal_updates", False) and group.get("beta2", 0) != 0:

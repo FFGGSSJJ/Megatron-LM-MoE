@@ -18,6 +18,7 @@ from megatron.core.utils import log_single_rank, to_local_if_dtensor
 from .dict_utils import nested_values
 from .mapping import (
     LocalNonpersistentObject,
+    ShardedObject,
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
@@ -108,10 +109,30 @@ def make_sharded_optimizer_tensor(
     return sh_ten
 
 
+def make_sharded_optimizer_object(
+    model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: object, prefix: str
+) -> ShardedObject:
+    """Build a non-reshardable optimizer state object for state not shaped like the model param."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        global_shape = (torch.distributed.get_world_size(),)
+        global_offset = (torch.distributed.get_rank(),)
+    else:
+        global_shape = (1,)
+        global_offset = (0,)
+
+    return ShardedObject(
+        f'{prefix}.{model_param.key}',
+        optim_param,
+        global_shape,
+        global_offset,
+    )
+
+
 def optim_state_to_sharding_state(
     optim_state_dict: StateDict,
     id_to_sharded_param_map: Dict[int, ShardedTensor],
     exclude_keys: Tuple[str] = (),
+    shape_mismatch_keys: Tuple[str] = (),
 ):
     """Turn optimizer state dict to sharded state dict based on model state dict *in-place*.
 
@@ -127,10 +148,17 @@ def optim_state_to_sharding_state(
             to model sharded tensors. Can be generated with `get_param_id_to_sharded_param_map`
             function.
         exclude_keys (Tuple[str]): optimizer state keys to exclude from the final state dict.
+        shape_mismatch_keys (Tuple[str]): optimizer state keys whose tensors are intentionally
+            not shaped like the model parameter. These are saved as non-reshardable local objects.
 
     Returns:
         None: state dict is modified in place
     """
+    if isinstance(exclude_keys, str):
+        exclude_keys = (exclude_keys,)
+    if isinstance(shape_mismatch_keys, str):
+        shape_mismatch_keys = (shape_mismatch_keys,)
+
     sharded_state = {}
     for param_id, param_state in optim_state_dict['state'].items():
         sharded_state[param_id] = {}
@@ -138,9 +166,15 @@ def optim_state_to_sharding_state(
             if state_key in exclude_keys:
                 continue
             if param_id in id_to_sharded_param_map:
-                sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
-                    id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
-                )
+                model_param = id_to_sharded_param_map[param_id]
+                if state_key in shape_mismatch_keys:
+                    sharded_state[param_id][state_key] = make_sharded_optimizer_object(
+                        model_param, param, prefix=f'optimizer.state.{state_key}'
+                    )
+                else:
+                    sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
+                        model_param, param, prefix=f'optimizer.state.{state_key}'
+                    )
             else:
                 raise ValueError(f'Param id {param_id} does not match any model sharded param')
 
