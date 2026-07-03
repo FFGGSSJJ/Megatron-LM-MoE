@@ -1177,6 +1177,7 @@ def get_megatron_mddecoupling_optimizer(
 
     prev_optimizer = config.optimizer
     config.optimizer = 'adam'
+    # TODO: should adam also get the md_decoupling pg_collection passed to it?
     chained_adam = get_megatron_optimizer(
         config,
         model_chunks,

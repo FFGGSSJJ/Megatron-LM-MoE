@@ -107,6 +107,8 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'is_embedding_or_output_parameter',
     'is_embedding_parameter',
     'is_output_parameter',
+    'is_md_embedding_parameter',
+    'is_md_output_parameter',
 )
 
 
