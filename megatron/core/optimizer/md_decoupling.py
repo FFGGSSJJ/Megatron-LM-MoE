@@ -59,6 +59,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_embedding_mode(mode):
+    return None if mode == "external" else mode
+
+
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
@@ -86,7 +90,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
         hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
-        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
+        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none", "external"]] = None,
         hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
@@ -122,7 +126,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.use_nesterov = use_nesterov
 
         self.hypersphere_mode = hypersphere_mode
-        self.hypersphere_embedding_mode = hypersphere_embedding_mode
+        self.hypersphere_embedding_mode = _normalize_embedding_mode(hypersphere_embedding_mode)
         self.hypersphere_router_mode = hypersphere_router_mode
         self.hypersphere_eps = hypersphere_eps
         self.hypersphere_tangential_grad = hypersphere_tangential_grad
@@ -418,7 +422,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         grad.sub_(p * radial)
 
     def _normalize(self, p, x, is_qkv: bool = False, is_out_proj: bool = False,
-                   is_embedding: bool = False, is_router: bool = False, 
+                   is_embedding: bool = False, is_router: bool = False,
                    is_merged_offload_expert: bool = False):
         """In-place L2-sphere projection of a 2D tensor `x` (sized like `p`).
 
@@ -443,9 +447,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             self._normalize_single(vs, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
             x.copy_(_merge_qkv((qs, ks, vs), x.size(), self.qkv_split_shapes))
             return
-        
+
         # TODO(fuguan): for now merged experts follow the same pipeline of normalization
-        # as qkv. But it might introduce high memory cost. 
+        # as qkv. But it might introduce high memory cost.
         if is_merged_offload_expert:
             experts = _split_experts(x)
             for expert in experts:
@@ -510,10 +514,10 @@ class MDDecoupling(_MDDecouplingBase):
     def __init__(
         self,
         params,
-        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed"]] = None,
-        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
-        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
-        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
+        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed", "none"]] = None,
+        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
         gains_lr: Optional[float] = None,
         gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
@@ -523,15 +527,19 @@ class MDDecoupling(_MDDecouplingBase):
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
-        # Drop the 1e-8 clamp_min on phi(g) in _preprocess_gains so gains can shrink through 1e-8
-        # or flip sign (only meaningful for gain_parametrization="direct"; no-op for softplus).
         gains_no_clamp_min: bool = False,
         **kwargs,
     ):
-        self.hypersphere_gains_mode = hypersphere_gains_mode
-        self.hypersphere_gains_mode_output = hypersphere_gains_mode_output
-        self.hypersphere_gains_mode_embedding = hypersphere_gains_mode_embedding
-        self.hypersphere_gains_mode_router = hypersphere_gains_mode_router
+        self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
+        self.hypersphere_gains_mode_output = (
+            None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
+        )
+        self.hypersphere_gains_mode_embedding = (
+            None if hypersphere_gains_mode_embedding == "inherit" else hypersphere_gains_mode_embedding
+        )
+        self.hypersphere_gains_mode_router = (
+            None if hypersphere_gains_mode_router == "inherit" else hypersphere_gains_mode_router
+        )
         self.gains_no_clamp_min = gains_no_clamp_min
         self.gains_lr = gains_lr  # None → follow group["lr"] verbatim
         self.gains_min_lr = gains_min_lr  # gains LR floor (matches the group's min_lr policy)
@@ -607,8 +615,8 @@ class MDDecoupling(_MDDecouplingBase):
         A 3D merged offload-expert weight (num_local_experts, out, in) is a stack of
         independent (out, in) expert weights: row_gain (E, out), col_gain (E, in),
         flat_gain (E,). The reduced axes shift up by one (in-axis -> dim 2, out-axis -> dim 1)
-        and the per-expert flat norm reduces over (1, 2) instead of the whole tensor. 
-        The *_bk entries are the slice tuples used to broadcast the effective gains back onto p: 
+        and the per-expert flat norm reduces over (1, 2) instead of the whole tensor.
+        The *_bk entries are the slice tuples used to broadcast the effective gains back onto p:
         2D uses [:, None] / [None, :]; 3D adds a leading expert axis.
         """
         if getattr(p, "merged_offload_expert", False):
@@ -767,7 +775,7 @@ class MDDecoupling(_MDDecouplingBase):
             p.div_(col_eff[layout["col_bk"]].clamp_min(eps) if clamp else col_eff[layout["col_bk"]])
 
         # Compute ∂L/∂phi(g) from bare p and the gain-baked grad still on p.grad.
-        # Reduction dims shift up by one for 3D experts (in-axis dim 2, out-axis dim 1) 
+        # Reduction dims shift up by one for 3D experts (in-axis dim 2, out-axis dim 1)
         # so the sums land on the per-expert gain axes (E, out) / (E, in).
         p_times_pgrad = p * p.grad
         gain_grads = {}
@@ -886,15 +894,17 @@ class MDDecoupling(_MDDecouplingBase):
             p.mul_(self._phi(col)[lay["col_bk"]])
 
     def _resolve_gains_mode(self, p):
-        is_output = getattr(p, "is_output_parameter", False)
-        is_embedding = getattr(p, "is_embedding_parameter", False)
+        if self.hypersphere_gains_mode is None:
+            return None
+        is_output = getattr(p, "is_md_output_parameter", False)
+        is_embedding = getattr(p, "is_md_embedding_parameter", False)
         is_router = getattr(p, "is_router", False)
         if is_router and self.hypersphere_gains_mode_router is not None:
             return self.hypersphere_gains_mode_router
-        if is_output and self.hypersphere_gains_mode_output is not None:
-            return self.hypersphere_gains_mode_output
         if is_embedding and self.hypersphere_gains_mode_embedding is not None:
             return self.hypersphere_gains_mode_embedding
+        if is_output and self.hypersphere_gains_mode_output is not None:
+            return self.hypersphere_gains_mode_output
         return self.hypersphere_gains_mode
 
 
@@ -986,7 +996,8 @@ def _mddecoupling_config_overrides(
     # MDDecoupling on the Adam branch (use_orthogonal_updates=False) + post-step normalization.
     # When it is None they are routed to the external chained Adam (see the param partition in
     # get_megatron_mddecoupling_optimizer), so no MDDecoupling override is needed here.
-    if config.hypersphere_embedding_mode is not None:
+    hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
+    if hypersphere_embedding_mode is not None:
         overrides[ParamKey(attr='is_embedding_or_output_parameter')] = {
             'use_orthogonal_updates': False
         }
@@ -1009,7 +1020,7 @@ def _mddecoupling_config_overrides(
 
     # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
     # get base lr from the router_override above.
-    # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in), 
+    # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
         name="md_non_embedding_or_output_matrix",
@@ -1022,10 +1033,10 @@ def _mddecoupling_config_overrides(
         'min_lr': _group_min_lr(config, matrix_lr),
     }
 
-    # Embedding LR (embedding + tied LM head share is_embedding_parameter).
+    # Embedding LR (embedding + tied LM head).
     if config.embedding_lr_multiplier is not None:
         emb_lr = config.embedding_lr_multiplier * config.lr
-        overrides[ParamKey(attr='is_embedding_parameter')] = {
+        overrides[ParamKey(attr='is_md_embedding_parameter')] = {
             'max_lr': emb_lr,
             'min_lr': _group_min_lr(config, emb_lr),
         }
@@ -1034,8 +1045,8 @@ def _mddecoupling_config_overrides(
     if config.output_lr is not None:
         output_only = ParamPredicate(
             name="md_output_not_embedding",
-            fn=lambda p: (getattr(p, "is_output_parameter", False)
-                          and not getattr(p, "is_embedding_parameter", False)),
+            fn=lambda p: (getattr(p, "is_md_output_parameter", False)
+                          and not getattr(p, "is_md_embedding_parameter", False)),
         )
         overrides[ParamKey(predicate=output_only)] = {
             'max_lr': config.output_lr,
@@ -1118,26 +1129,42 @@ def get_megatron_mddecoupling_optimizer(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'experts' in name and 'shared' not in name:
+            is_expert_param = 'experts' in name and 'shared' not in name
+            is_2d = len(param.shape) == 2
+            is_merged_offload_expert = (
+                is_expert_param
+                and len(param.shape) == 3
+                and getattr(model_chunk.config, "moe_use_offloading_experts", False)
+                and getattr(model_chunk.config, "moe_use_inplace_fp8_param", False)
+            )
+            if is_expert_param:
                 param.expert_tp = True
-            # the merged offloading-expert weight is a single 3D (num_local_experts, out, in) tensor
-            if ('experts' in name and 'shared' not in name and len(param.shape) == 3
-                    and model_chunk.config.moe_use_offloading_experts
-                    and model_chunk.config.moe_use_inplace_fp8_param):
+            if is_merged_offload_expert:
                 param.merged_offload_expert = True
+            elif not is_2d:
+                continue
             # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+            if is_2d and 'linear_qkv.weight' in name:
                 param.is_qkv = True
-            if name.endswith('router.weight') and len(param.shape) == 2:
+            if is_2d and name.endswith('router.weight'):
                 param.is_router = True
-            
-            is_out_proj = (('linear_fc2' in name or 'linear_proj' in name) and len(param.shape) == 2) or \
-                          ('experts.weight2' in name and len(param.shape) == 3)
+            if is_2d and name.endswith('word_embeddings.weight'):
+                param.is_md_embedding_parameter = True
+            if is_2d and name.endswith('output_layer.weight'):
+                if getattr(param, "shared_embedding", False):
+                    param.is_md_embedding_parameter = True
+                elif not getattr(param, "is_md_embedding_parameter", False):
+                    param.is_md_output_parameter = True
+            is_out_proj = (
+                (is_2d and ('linear_fc2' in name or 'linear_proj' in name))
+                or ('experts.weight2' in name and len(param.shape) == 3)
+            )
             if is_out_proj:
                 param.is_out_proj = True
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
-    emb_in_md = config.hypersphere_embedding_mode is not None
+    hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
+    emb_in_md = hypersphere_embedding_mode is not None
     linear_params = []
     nonlinear_params = []
     for model_chunk in model_chunks:
@@ -1163,7 +1190,7 @@ def get_megatron_mddecoupling_optimizer(
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         hypersphere_mode=config.hypersphere_mode,
-        hypersphere_embedding_mode=config.hypersphere_embedding_mode,
+        hypersphere_embedding_mode=hypersphere_embedding_mode,
         hypersphere_router_mode=config.hypersphere_router_mode,
         hypersphere_tangential_grad=config.hypersphere_tangential_grad,
         hypersphere_preserve_init=config.hypersphere_preserve_init,
@@ -1252,6 +1279,7 @@ def get_megatron_mddecoupling_optimizer(
 
     prev_optimizer = config.optimizer
     config.optimizer = 'adam'
+    # TODO: should adam also get the md_decoupling pg_collection passed to it?
     chained_adam = get_megatron_optimizer(
         config,
         model_chunks,

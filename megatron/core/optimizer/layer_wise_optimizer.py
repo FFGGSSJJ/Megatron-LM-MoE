@@ -347,6 +347,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # `.values()` crashed on the multi-optimizer list, which md_decoupling hits).
         if len(self.chained_optimizers) == 1:
             sub_state_dicts = [state_dict]
+        elif isinstance(state_dict, dict):
+            sub_state_dicts = state_dict.values()
         else:
             sub_state_dicts = state_dict
         for sd in sub_state_dicts:
