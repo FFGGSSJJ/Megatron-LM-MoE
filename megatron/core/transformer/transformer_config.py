@@ -237,6 +237,15 @@ class TransformerConfig(ModelParallelConfig):
     runs eager/torch.compile). Not compatible with ``bias_activation_fusion``,
     ``use_te_activation_func``, or the offloading-experts path."""
 
+    gxpry: bool = False
+    """If True, replace the gate of a gated linear unit with the learnable GXPRY gate: like
+    ``gxpr`` (``GXPRY(x_glu) * x_linear`` with
+    ``gate(x) = |ap2|*x**2 + |ap1|*x + |b|`` or ``gate(x) = (|b|+|an|)*softsign(x) + |b|``) but
+    the piecewise branch is selected by the sign of ``x_linear`` instead of ``x_glu``. Requires
+    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own coefficients.
+    No fused kernel yet (always runs eager/torch.compile). Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
     xr2: bool = False
     """If True, replace the MLP activation with XR2 -- ``xpr`` without the ``x**3`` term:
     ``|ap1|*x**2 + |b|*x`` for ``x>0``, ``(|b|+|an|)*x*softsign(x) + |b|*x`` for ``x<=0``. Not a
@@ -1420,6 +1429,7 @@ class TransformerConfig(ModelParallelConfig):
         _new_activation_flags = {
             'xpr': self.xpr,
             'gxpr': self.gxpr,
+            'gxpry': self.gxpry,
             'xr2': self.xr2,
             'gxr2': self.gxr2,
             'pn3glu': self.pn3glu,
@@ -1433,7 +1443,7 @@ class TransformerConfig(ModelParallelConfig):
             )
         if _active_new_activations:
             _active_name = _active_new_activations[0]
-            _is_gated = _active_name in ('gxpr', 'gxr2', 'pn3glu')
+            _is_gated = _active_name in ('gxpr', 'gxpry', 'gxr2', 'pn3glu')
             if _is_gated and not self.gated_linear_unit:
                 raise ValueError(
                     f"{_active_name}=True requires gated_linear_unit=True (it replaces the GLU "

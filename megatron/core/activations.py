@@ -464,6 +464,59 @@ class GXPR(XPR):
 
 
 @jit_fuser
+def compiled_gxpry_gate(x, y, alpha_p1, alpha_p2, alpha_n, beta):
+    """GXPRY gate: the same two pieces as :func:`compiled_xpr_gate`, but the piecewise branch is
+    selected by the sign of ``y`` (the GLU linear half) instead of ``x`` (the GLU gate half).
+
+    ``alpha_p2 * x**2 + alpha_p1 * x + beta`` when ``y > 0``, and
+    ``alpha_n * softsign(x) + beta`` when ``y <= 0``.
+    """
+    return torch.where(
+        y > 0,
+        alpha_p2 * x * x + alpha_p1 * x + beta,
+        alpha_n * F.softsign(x) + beta,
+    )
+
+
+class GXPRY(XPR):
+    """Learnable GLU gate — like :class:`GXPR`, but the piecewise branch is chosen by the sign
+    of ``y`` (the GLU *linear* half, ``x_linear``) instead of ``x`` (the GLU *gate* half,
+    ``x_glu``)::
+
+        gate(x, y) = |alpha_p2| * x**2 + |alpha_p1| * x + |beta|                (y > 0)
+                   = (|beta| + |alpha_n|) * softsign(x) + |beta|                (y <= 0)
+
+    ``forward`` takes *both* GLU halves and returns ``gate(x_glu, x_linear) * x_linear *
+    [scores]``, same calling convention as :class:`GXPR`. Shares :class:`XPR`'s
+    per-(local-)expert coefficients and ``tokens_per_expert`` expansion.
+
+    Unlike GXPR (which is algebraically ``XPR(x) / x``, so it degenerates to a well-defined
+    non-gated single-input activation), GXPRY's branch condition depends on the *second* input,
+    so it has no non-gated counterpart -- it is inherently a two-input (GLU) op. It also has no
+    ``0/0`` concern at ``y == 0``: the output is simply ``gate(x, y) * 0 == 0`` regardless of
+    which branch ``gate`` took.
+    """
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``gate(x_glu, x_linear) * x_linear * [scores]``.
+
+        Args:
+            x_glu: GLU gate half, ``(..., D)`` (``D`` = local ffn feature dim).
+            x_linear: GLU linear half, same shape/dtype as ``x_glu``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+            scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
+        """
+        alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
+        gate = compiled_gxpry_gate(x_glu, x_linear, alpha_p1, alpha_p2, alpha_n, beta)
+        out = gate * x_linear
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
+@jit_fuser
 def compiled_xr2(x, alpha_p1, alpha_n, beta):
     """Core XR2 activation — :func:`compiled_xpr` without the ``x**3`` term.
 
