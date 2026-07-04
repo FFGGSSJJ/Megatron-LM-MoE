@@ -248,6 +248,16 @@ class TransformerConfig(ModelParallelConfig):
     while leaving the residual stream itself untouched, which bounds activation growth in deep
     networks. Applies to the self-attention and MLP sublayers."""
 
+    post_attn_norm_zero_init: bool = False
+    """If True (requires `sandwich_norm`), zero-initialize the gain of the post-attention sandwich
+    norm (`post_self_attn_layernorm`) so the attention sublayer contributes nothing to the residual
+    stream at init (`x = x + 0 * Norm(Attn(Norm(x))) = x`). The network therefore starts as a pure
+    stack of MLP/MoE blocks, which can help the MoE router settle before attention starts
+    contributing. Only the post-attention norm is zeroed; the post-MLP sandwich norm keeps its
+    default (unit) gain, and the gains train normally afterwards. When
+    `layernorm_zero_centered_gamma` is set (effective gain = `1 + weight`), the gain is zeroed via
+    `weight = -1` so the effective gain is still 0."""
+
     scale_embeddings_by_sqrt_hidden: bool = False
     """If True, multiply the output of the embedding by ``sqrt(hidden_size)``. Combined with an
     embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the
@@ -1158,6 +1168,13 @@ class TransformerConfig(ModelParallelConfig):
                 "fused TP inference kernel folds the residual add into the attention/MLP output "
                 "projection, leaving no point at which to normalize the sublayer output before "
                 "the residual add."
+            )
+
+        if self.post_attn_norm_zero_init and not self.sandwich_norm:
+            raise ValueError(
+                "post_attn_norm_zero_init requires sandwich_norm: it zero-inits the gain of the "
+                "post-attention sandwich norm (post_self_attn_layernorm), which is an IdentityOp "
+                "(no gain) unless sandwich_norm is enabled."
             )
 
         if self.keel:
