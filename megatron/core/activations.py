@@ -39,6 +39,22 @@ def compiled_polynorm(x, alpha_1, alpha_2, eps: float = 1e-6):
     return out.to(input_dtype)
 
 
+@jit_fuser
+def compiled_poly3norm(x, alpha_1, alpha_2, alpha_3, eps: float = 1e-6):
+    """3rd-order PolyNorm gate: ``a1*RMSNorm(x) + a2*RMSNorm(x**2) + a3*RMSNorm(x**3)``.
+
+    Same conventions as :func:`compiled_polynorm`, extended with one more (odd) term.
+    """
+    input_dtype = x.dtype
+    x = x.float()
+
+    def norm(t):
+        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+
+    out = alpha_1 * norm(x) + alpha_2 * norm(x * x) + alpha_3 * norm(x * x * x)
+    return out.to(input_dtype)
+
+
 class _AllReduceSumSymmetric(torch.autograd.Function):
     """All-reduce(sum) over ``group`` in BOTH the forward and backward passes.
 
@@ -119,6 +135,10 @@ class PolyNorm(MegatronModule):
     the group (forward and backward) so every rank uses the *full-feature* RMS, and the
     replicated ``alpha`` gradients are all-reduced over the group so the replicas stay in sync.
     The result is therefore identical to (and bitwise-consistent across) any TP/ETP degree.
+
+    ``num_terms=3`` (``--pn3glu``) adds a 3rd (odd) term ``|alpha_3| * RMSNorm(x ** 3)``; this
+    variant has no fused Triton kernel and always runs the torch fallback. ``num_terms=2``
+    (default, ``--pnglu``) is unchanged and keeps the fused-kernel fast path.
     """
 
     def __init__(
@@ -128,11 +148,16 @@ class PolyNorm(MegatronModule):
         alpha_init: float = 0.2,
         eps: float = 1e-6,
         tp_group: "torch.distributed.ProcessGroup | None" = None,
+        num_terms: int = 2,
     ):
         super().__init__(config=config)
+        assert num_terms in (2, 3), f"PolyNorm supports num_terms in (2, 3), got {num_terms}."
         self.num_local_experts = num_local_experts
+        self.num_terms = num_terms
         self.alpha_1 = nn.Parameter(torch.full((num_local_experts,), alpha_init))
         self.alpha_2 = nn.Parameter(torch.full((num_local_experts,), alpha_init))
+        if num_terms == 3:
+            self.alpha_3 = nn.Parameter(torch.full((num_local_experts,), alpha_init))
         self.eps = eps
         # The group over which the ffn feature dimension is sharded. tp_size==1 (no sharding,
         # e.g. local CPU runs or ETP=1 experts) takes the cheap fused path with no collectives.
@@ -141,6 +166,50 @@ class PolyNorm(MegatronModule):
             self.tp_size = torch.distributed.get_world_size(group=tp_group)
         else:
             self.tp_size = 1
+
+    def _raw_coeffs(self, x, tokens_per_expert):
+        """Return ``(alpha_1, alpha_2, alpha_3_or_None)``, positive, NOT yet broadcast-shaped.
+
+        ``alpha_3`` is ``None`` when ``num_terms == 2``. Kept un-unsqueezed (shape
+        ``(num_local_experts,)`` or ``(num_tokens,)``) because the fused Triton kernel expects
+        that shape directly; :meth:`_broadcast_coeffs` produces the ``(num_tokens, 1)`` shape
+        needed by the torch fallback.
+        """
+        alpha_1 = torch.abs(self.alpha_1)  # (num_local_experts,)
+        alpha_2 = torch.abs(self.alpha_2)
+        alpha_3 = torch.abs(self.alpha_3) if self.num_terms == 3 else None
+
+        if self.num_local_experts == 1 or tokens_per_expert is None:
+            if self.num_local_experts > 1:
+                raise ValueError(
+                    "PolyNorm with num_local_experts > 1 requires `tokens_per_expert` so "
+                    "the per-expert coefficients can be mapped onto the concatenated tokens."
+                )
+            return alpha_1, alpha_2, alpha_3
+
+        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens,).
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+        tpe_tensor = torch.tensor(tokens_per_expert, device=x.device)
+        a1 = torch.repeat_interleave(alpha_1, tpe_tensor)
+        a2 = torch.repeat_interleave(alpha_2, tpe_tensor)
+        a3 = torch.repeat_interleave(alpha_3, tpe_tensor) if alpha_3 is not None else None
+        return a1, a2, a3
+
+    def _broadcast_coeffs(self, alpha_1, alpha_2, alpha_3):
+        """Unsqueeze per-token coefficients to ``(num_tokens, 1)`` for the torch fallback."""
+        a1b = alpha_1.unsqueeze(-1) if alpha_1.dim() == 1 and self.num_local_experts > 1 else alpha_1
+        a2b = alpha_2.unsqueeze(-1) if alpha_2.dim() == 1 and self.num_local_experts > 1 else alpha_2
+        a3b = None
+        if alpha_3 is not None:
+            a3b = alpha_3.unsqueeze(-1) if alpha_3.dim() == 1 and self.num_local_experts > 1 else alpha_3
+        return a1b, a2b, a3b
+
+    def _compute_gate_local(self, x, alpha_1, alpha_2, alpha_3):
+        """Gate computation when the ffn feature dim is whole on this rank (``tp_size == 1``)."""
+        if self.num_terms == 2:
+            return compiled_polynorm(x, alpha_1, alpha_2, self.eps)
+        return compiled_poly3norm(x, alpha_1, alpha_2, alpha_3, self.eps)
 
     def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
         """Return ``gate(x_glu) * x_linear * [scores]``.
@@ -152,28 +221,11 @@ class PolyNorm(MegatronModule):
                 per-expert coefficients onto the concatenated tokens.
             scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
         """
-        # Keep the coefficients positive.
-        alpha_1 = torch.abs(self.alpha_1)  # (num_local_experts,)
-        alpha_2 = torch.abs(self.alpha_2)
-
-        if self.num_local_experts == 1 or tokens_per_expert is None:
-            if self.num_local_experts > 1:
-                raise ValueError(
-                    "PolyNorm with num_local_experts > 1 requires `tokens_per_expert` so "
-                    "the per-expert coefficients can be mapped onto the concatenated tokens."
-                )
-            # Single coefficient broadcast to every token: shape (1,).
-            a1, a2 = alpha_1, alpha_2
-        else:
-            # Expand per-expert coefficients to per-token coefficients: shape (num_tokens,).
-            if isinstance(tokens_per_expert, torch.Tensor):
-                tokens_per_expert = tokens_per_expert.tolist()
-            tpe_tensor = torch.tensor(tokens_per_expert, device=x_glu.device)
-            a1 = torch.repeat_interleave(alpha_1, tpe_tensor)
-            a2 = torch.repeat_interleave(alpha_2, tpe_tensor)
+        alpha_1, alpha_2, alpha_3 = self._raw_coeffs(x_glu, tokens_per_expert)
 
         use_fused = (
-            HAVE_FUSED_PNGLU
+            self.num_terms == 2
+            and HAVE_FUSED_PNGLU
             and x_glu.is_cuda
             and self.tp_size == 1
             and x_glu.shape[-1] <= MAX_FUSED_FEATURE_DIM
@@ -181,34 +233,37 @@ class PolyNorm(MegatronModule):
         )
         if use_fused:
             # Single fused kernel: gate + (* x_linear) + (* scores), shape-agnostic over tokens.
-            return fused_polynorm_glu_impl(x_glu, x_linear, a1, a2, self.eps, scores)
+            return fused_polynorm_glu_impl(x_glu, x_linear, alpha_1, alpha_2, self.eps, scores)
 
         # Fallback: compute the gate in torch, then apply the multiplies in eager mode.
-        a1b = a1.unsqueeze(-1) if a1.dim() == 1 and self.num_local_experts > 1 else a1
-        a2b = a2.unsqueeze(-1) if a2.dim() == 1 and self.num_local_experts > 1 else a2
+        a1b, a2b, a3b = self._broadcast_coeffs(alpha_1, alpha_2, alpha_3)
         if self.tp_size == 1:
             # ffn feature dim is whole on this rank: cheap fused per-token norm.
-            gate = compiled_polynorm(x_glu, a1b, a2b, self.eps)
+            gate = self._compute_gate_local(x_glu, a1b, a2b, a3b)
         else:
             # ffn feature dim is TP-sharded: reduce the feature statistics across the group.
-            gate = self._tp_forward(x_glu, a1b, a2b)
+            gate = self._tp_forward(x_glu, a1b, a2b, a3b)
         out = gate * x_linear
         if scores is not None:
             original_dtype = out.dtype
             out = (out * scores).to(original_dtype)
         return out
 
-    def _tp_forward(self, x, alpha_1, alpha_2):
+    def _tp_forward(self, x, alpha_1, alpha_2, alpha_3=None):
         """TP-invariant path: recover the full-feature RMS from the local feature shards."""
         input_dtype = x.dtype
         xf = x.float()
         # Each ColumnParallel rank holds an equal 1/tp_size slice of the ffn features.
         n_global = xf.shape[-1] * self.tp_size
         # Per-token partial feature sums on this rank: sum(x^2) and sum(x^4) (== sum((x^2)^2)) for
-        # RMSNorm(x) and RMSNorm(x^2). One symmetric all-reduce completes both.
+        # RMSNorm(x) and RMSNorm(x^2), plus sum(x^6) (== sum((x^3)^2)) for RMSNorm(x^3) when
+        # num_terms == 3. One symmetric all-reduce completes all of them together.
         s1 = xf.pow(2).sum(-1, keepdim=True)
         s2 = xf.pow(2).pow(2).sum(-1, keepdim=True)
-        s = _AllReduceSumSymmetric.apply(torch.cat([s1, s2], dim=-1), self.tp_group)
+        stats = [s1, s2]
+        if alpha_3 is not None:
+            stats.append(xf.pow(3).pow(2).sum(-1, keepdim=True))
+        s = _AllReduceSumSymmetric.apply(torch.cat(stats, dim=-1), self.tp_group)
         inv1 = torch.rsqrt(s[..., 0:1] / n_global + self.eps)
         inv2 = torch.rsqrt(s[..., 1:2] / n_global + self.eps)
         # alpha is replicated across the group; all-reduce its gradient so the replicas stay
@@ -216,7 +271,54 @@ class PolyNorm(MegatronModule):
         alpha_1 = _SyncGradSum.apply(alpha_1.float(), self.tp_group)
         alpha_2 = _SyncGradSum.apply(alpha_2.float(), self.tp_group)
         out = alpha_1 * (xf * inv1) + alpha_2 * (xf * xf * inv2)
+        if alpha_3 is not None:
+            inv3 = torch.rsqrt(s[..., 2:3] / n_global + self.eps)
+            alpha_3 = _SyncGradSum.apply(alpha_3.float(), self.tp_group)
+            out = out + alpha_3 * (xf * xf * xf * inv3)
         return out.to(input_dtype)
+
+
+class PolyNormAct(PolyNorm):
+    """Non-gated counterpart of PolyNorm/``--pn3glu``: returns the raw polynomial-RMSNorm gate
+    value directly, applied to the MLP activation input (not multiplied by a second GLU half).
+
+    ``gate(x) = |alpha_1| * RMSNorm(x) + |alpha_2| * RMSNorm(x**2) + |alpha_3| * RMSNorm(x**3)``
+
+    Always uses ``num_terms=3`` ("up to the ``x**3`` term"). Shares :class:`PolyNorm`'s
+    per-(local-)expert coefficients, TP handling, and ``tokens_per_expert`` expansion; only the
+    calling convention (single input, no GLU multiply) differs.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int = 1,
+        config=None,
+        alpha_init: float = 0.2,
+        eps: float = 1e-6,
+        tp_group: "torch.distributed.ProcessGroup | None" = None,
+    ):
+        super().__init__(
+            num_local_experts=num_local_experts,
+            config=config,
+            alpha_init=alpha_init,
+            eps=eps,
+            tp_group=tp_group,
+            num_terms=3,
+        )
+
+    def forward(self, x, tokens_per_expert=None):
+        """Return ``gate(x)``.
+
+        Args:
+            x: activation input, ``(..., D)``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+        """
+        alpha_1, alpha_2, alpha_3 = self._raw_coeffs(x, tokens_per_expert)
+        a1b, a2b, a3b = self._broadcast_coeffs(alpha_1, alpha_2, alpha_3)
+        if self.tp_size == 1:
+            return self._compute_gate_local(x, a1b, a2b, a3b)
+        return self._tp_forward(x, a1b, a2b, a3b)
 
 
 @jit_fuser
@@ -354,6 +456,124 @@ class GXPR(XPR):
         """
         alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
         gate = compiled_xpr_gate(x_glu, alpha_p1, alpha_p2, alpha_n, beta)
+        out = gate * x_linear
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
+@jit_fuser
+def compiled_xr2(x, alpha_p1, alpha_n, beta):
+    """Core XR2 activation — :func:`compiled_xpr` without the ``x**3`` term.
+
+    ``alpha_p1 * x**2 + beta * x`` for ``x > 0``, and
+    ``alpha_n * x * softsign(x) + beta * x`` for ``x <= 0``.
+    """
+    return torch.where(
+        x > 0,
+        alpha_p1 * x * x + beta * x,
+        alpha_n * x * F.softsign(x) + beta * x,
+    )
+
+
+@jit_fuser
+def compiled_xr2_gate(x, alpha_p1, alpha_n, beta):
+    """XR2 GLU gate: ``compiled_xr2(x, ...) / x``, simplified algebraically to avoid the ``0/0``
+    at ``x == 0``.
+
+    ``alpha_p1 * x + beta`` for ``x > 0``, and ``alpha_n * softsign(x) + beta`` for ``x <= 0``.
+    """
+    return torch.where(x > 0, alpha_p1 * x + beta, alpha_n * F.softsign(x) + beta)
+
+
+class XR2(MegatronModule):
+    """Learnable elementwise activation (not a gated unit) — :class:`XPR` without the ``x**3``
+    term::
+
+        XR2(x) = |alpha_p1| * x**2 + |beta| * x                                 (x > 0)
+               = (|beta| + |alpha_n|) * x * softsign(x) + |beta| * x            (x <= 0)
+
+    Same per-(local-)expert coefficient / ``tokens_per_expert`` handling as :class:`XPR`. No
+    fused kernel yet; always runs the (torch.compile-fused) eager implementation.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int = 1,
+        config=None,
+        alpha_p_init: float = 0.8,
+        alpha_n_init: float = 0.8,
+        beta_init: float = 0.5,
+    ):
+        super().__init__(config=config)
+        self.num_local_experts = num_local_experts
+        self.alpha_p1 = nn.Parameter(torch.full((num_local_experts,), alpha_p_init))
+        self.alpha_n = nn.Parameter(torch.full((num_local_experts,), alpha_n_init - beta_init))
+        self.beta = nn.Parameter(torch.full((num_local_experts,), beta_init))
+
+    def _coeffs(self, x, tokens_per_expert):
+        """Return ``(alpha_p1, alpha_n, beta)``, positive and expanded per-token."""
+        alpha_p1 = torch.abs(self.alpha_p1)  # (num_local_experts,)
+        beta = torch.abs(self.beta)
+        alpha_n = beta + torch.abs(self.alpha_n)
+
+        if self.num_local_experts == 1 or tokens_per_expert is None:
+            if self.num_local_experts > 1:
+                raise ValueError(
+                    f"{type(self).__name__} with num_local_experts > 1 requires "
+                    "`tokens_per_expert` so the per-expert coefficients can be mapped onto the "
+                    "concatenated tokens."
+                )
+            return alpha_p1, alpha_n, beta
+
+        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens, 1).
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+        tpe_tensor = torch.tensor(tokens_per_expert, device=x.device)
+
+        def expand(a):
+            return torch.repeat_interleave(a, tpe_tensor).unsqueeze(-1)
+
+        return expand(alpha_p1), expand(alpha_n), expand(beta)
+
+    def forward(self, x, tokens_per_expert=None):
+        """Return ``XR2(x)``.
+
+        Args:
+            x: activation input, ``(..., D)``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+        """
+        alpha_p1, alpha_n, beta = self._coeffs(x, tokens_per_expert)
+        return compiled_xr2(x, alpha_p1, alpha_n, beta)
+
+
+class GXR2(XR2):
+    """Learnable GLU gate — the gated-linear-unit counterpart of :class:`XR2`.
+
+    Mathematically ``gate(x) = XR2(x) / x``, simplified to avoid the ``0/0`` at ``x == 0``::
+
+        gate(x) = |alpha_p1| * x + |beta|                              (x > 0)
+                = (|beta| + |alpha_n|) * softsign(x) + |beta|           (x <= 0)
+
+    ``forward`` takes *both* GLU halves and returns ``gate(x_glu) * x_linear * [scores]``, same
+    calling convention as :class:`GXPR`. Shares :class:`XR2`'s per-(local-)expert coefficients
+    and ``tokens_per_expert`` expansion.
+    """
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``gate(x_glu) * x_linear * [scores]``.
+
+        Args:
+            x_glu: GLU gate half, ``(..., D)`` (``D`` = local ffn feature dim).
+            x_linear: GLU linear half, same shape/dtype as ``x_glu``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+            scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
+        """
+        alpha_p1, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
+        gate = compiled_xr2_gate(x_glu, alpha_p1, alpha_n, beta)
         out = gate * x_linear
         if scores is not None:
             original_dtype = out.dtype

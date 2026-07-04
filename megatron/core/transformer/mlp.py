@@ -23,7 +23,7 @@ from megatron.core.fusions.fused_bias_geglu import (
     quick_gelu,
     weighted_bias_quick_geglu_impl,
 )
-from megatron.core.activations import GXPR, PolyNorm, XPR
+from megatron.core.activations import GXPR, GXR2, PolyNorm, PolyNormAct, XPR, XR2
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -237,13 +237,26 @@ class MLP(MegatronModule):
             self.polynorm_glu = PolyNorm(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
             )
+        if self.config.pn3glu:
+            self.polynorm_glu = PolyNorm(
+                num_local_experts=1, config=self.config, tp_group=self.tp_group, num_terms=3
+            )
 
-        # XPR/GXPR: like PolyNorm, a dense MLP (and each SequentialMLP / shared expert, which
-        # are themselves MLPs) owns a single coefficient set, so num_local_experts=1 here.
+        # XPR/GXPR/XR2/GXR2/PolyNormAct: like PolyNorm, a dense MLP (and each SequentialMLP /
+        # shared expert, which are themselves MLPs) owns a single coefficient set, so
+        # num_local_experts=1 here.
         if self.config.xpr:
             self.xpr_act = XPR(num_local_experts=1, config=self.config)
         if self.config.gxpr:
             self.gxpr_glu = GXPR(num_local_experts=1, config=self.config)
+        if self.config.xr2:
+            self.xr2_act = XR2(num_local_experts=1, config=self.config)
+        if self.config.gxr2:
+            self.gxr2_glu = GXR2(num_local_experts=1, config=self.config)
+        if self.config.polynorm:
+            self.polynorm_act = PolyNormAct(
+                num_local_experts=1, config=self.config, tp_group=self.tp_group
+            )
 
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
@@ -327,7 +340,7 @@ class MLP(MegatronModule):
             # When PolyNorm fuses the per_token_scale multiply into its kernel we skip the
             # eager post-multiply below (the fc2-bias scaling further down still uses per_token_scale).
             scale_fused = False
-            if self.config.gated_linear_unit and self.config.pnglu:
+            if self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)
@@ -347,6 +360,16 @@ class MLP(MegatronModule):
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.gxpr_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.gxr2:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.gxr2_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit:
 
                 def glu(x):
@@ -360,6 +383,10 @@ class MLP(MegatronModule):
                 intermediate_parallel = glu(intermediate_parallel)
             elif self.config.xpr:
                 intermediate_parallel = self.xpr_act(intermediate_parallel)
+            elif self.config.xr2:
+                intermediate_parallel = self.xr2_act(intermediate_parallel)
+            elif self.config.polynorm:
+                intermediate_parallel = self.polynorm_act(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 

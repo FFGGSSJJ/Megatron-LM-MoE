@@ -237,6 +237,36 @@ class TransformerConfig(ModelParallelConfig):
     runs eager/torch.compile). Not compatible with ``bias_activation_fusion``,
     ``use_te_activation_func``, or the offloading-experts path."""
 
+    xr2: bool = False
+    """If True, replace the MLP activation with XR2 -- ``xpr`` without the ``x**3`` term:
+    ``|ap1|*x**2 + |b|*x`` for ``x>0``, ``(|b|+|an|)*x*softsign(x) + |b|*x`` for ``x<=0``. Not a
+    gated unit. Each (local) expert gets its own coefficients. No fused kernel yet. Not
+    compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
+    gxr2: bool = False
+    """If True, replace the gate of a gated linear unit with the GXR2 gate (the GLU counterpart
+    of ``xr2``): ``GXR2(x_glu) * x_linear`` where ``gate(x) = |ap1|*x + |b|`` for ``x>0`` and
+    ``gate(x) = (|b|+|an|)*softsign(x) + |b|`` for ``x<=0``. Requires ``gated_linear_unit=True``.
+    Each (local) expert gets its own coefficients. No fused kernel yet. Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
+    pn3glu: bool = False
+    """If True, replace the gate of a gated linear unit with a learnable 3rd-order PolyNorm GLU
+    (``pnglu`` with an added ``x**3`` term): ``PolyNorm(x_glu) * x_linear`` where
+    ``PolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3)``. Requires
+    ``gated_linear_unit=True``. Each (local) expert gets its own ``(a1, a2, a3)`` coefficients.
+    Unlike ``pnglu`` this has no fused Triton kernel yet and always runs the torch/TP-aware
+    fallback. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
+    polynorm: bool = False
+    """If True, replace the MLP activation with the non-gated 3rd-order PolyNorm activation
+    (``pn3glu`` without the GLU multiply): ``|a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) +
+    |a3|*RMSNorm(x**3)``, applied directly to the activation input. Not a gated unit. Each
+    (local) expert gets its own coefficients. No fused kernel yet. Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -1385,27 +1415,44 @@ class TransformerConfig(ModelParallelConfig):
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
 
-        if self.xpr or self.gxpr:
-            if self.xpr and self.gxpr:
-                raise ValueError("xpr and gxpr are mutually exclusive; use one or the other.")
-            if self.gxpr and not self.gated_linear_unit:
+        # These are all recently-added, not-yet-fused learnable activations sharing the same
+        # (narrow) compatibility envelope; they are mutually exclusive with each other.
+        _new_activation_flags = {
+            'xpr': self.xpr,
+            'gxpr': self.gxpr,
+            'xr2': self.xr2,
+            'gxr2': self.gxr2,
+            'pn3glu': self.pn3glu,
+            'polynorm': self.polynorm,
+        }
+        _active_new_activations = [name for name, is_set in _new_activation_flags.items() if is_set]
+        if len(_active_new_activations) > 1:
+            raise ValueError(
+                f"{_active_new_activations} are mutually exclusive; set only one of "
+                f"{list(_new_activation_flags)}."
+            )
+        if _active_new_activations:
+            _active_name = _active_new_activations[0]
+            _is_gated = _active_name in ('gxpr', 'gxr2', 'pn3glu')
+            if _is_gated and not self.gated_linear_unit:
                 raise ValueError(
-                    "gxpr=True requires gated_linear_unit=True (it replaces the GLU gate)."
+                    f"{_active_name}=True requires gated_linear_unit=True (it replaces the GLU "
+                    "gate)."
                 )
             if self.bias_activation_fusion:
                 raise ValueError(
-                    "xpr=True/gxpr=True are incompatible with bias_activation_fusion: there is "
-                    "no fused kernel for them yet. Disable bias-activation fusion "
+                    f"{_active_name}=True is incompatible with bias_activation_fusion: there is "
+                    "no fused kernel for it yet. Disable bias-activation fusion "
                     "(e.g. --no-bias-swiglu-fusion)."
                 )
             if self.use_te_activation_func:
                 raise ValueError(
-                    "xpr=True/gxpr=True are incompatible with use_te_activation_func (no TE "
-                    "builder exists for them)."
+                    f"{_active_name}=True is incompatible with use_te_activation_func (no TE "
+                    "builder exists for it)."
                 )
             if self.moe_use_offloading_experts:
                 raise ValueError(
-                    "xpr=True/gxpr=True are not wired into the offloading-experts path yet."
+                    f"{_active_name}=True is not wired into the offloading-experts path yet."
                 )
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:

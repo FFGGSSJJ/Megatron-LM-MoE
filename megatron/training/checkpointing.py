@@ -1604,8 +1604,12 @@ def load_args_from_checkpoint(
     _set_arg('keel_alpha', force=True)
     _set_arg('pnglu', force=True)
     _set_arg('pnglu_fusion', force=True)
+    _set_arg('pn3glu', force=True)
     _set_arg('xpr', force=True)
     _set_arg('gxpr', force=True)
+    _set_arg('xr2', force=True)
+    _set_arg('gxr2', force=True)
+    _set_arg('polynorm', force=True)
     _set_arg('qk_layernorm', force=True)
 
     # Tokenizer args.
