@@ -221,6 +221,22 @@ class TransformerConfig(ModelParallelConfig):
     to the torch implementation automatically regardless of this flag. Set False to force the torch
     path (e.g. for debugging or bitwise comparison)."""
 
+    xpr: bool = False
+    """If True, replace the MLP activation with the learnable elementwise XPR activation:
+    ``|ap2|*x**3 + |ap1|*x**2 + |b|*x`` for ``x>0``, ``(|b|+|an|)*x*softsign(x) + |b|*x`` for
+    ``x<=0``. Not a gated unit. Each (local) expert in an MoE layer gets its own coefficients.
+    No fused kernel yet (always runs eager/torch.compile). Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
+    gxpr: bool = False
+    """If True, replace the gate of a gated linear unit with the learnable GXPR gate (the GLU
+    counterpart of ``xpr``): ``GXPR(x_glu) * x_linear`` where
+    ``gate(x) = |ap2|*x**2 + |ap1|*x + |b|`` for ``x>0`` and
+    ``gate(x) = (|b|+|an|)*softsign(x) + |b|`` for ``x<=0``. Requires ``gated_linear_unit=True``.
+    Each (local) expert in an MoE layer gets its own coefficients. No fused kernel yet (always
+    runs eager/torch.compile). Not compatible with ``bias_activation_fusion``,
+    ``use_te_activation_func``, or the offloading-experts path."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -1368,6 +1384,29 @@ class TransformerConfig(ModelParallelConfig):
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
+
+        if self.xpr or self.gxpr:
+            if self.xpr and self.gxpr:
+                raise ValueError("xpr and gxpr are mutually exclusive; use one or the other.")
+            if self.gxpr and not self.gated_linear_unit:
+                raise ValueError(
+                    "gxpr=True requires gated_linear_unit=True (it replaces the GLU gate)."
+                )
+            if self.bias_activation_fusion:
+                raise ValueError(
+                    "xpr=True/gxpr=True are incompatible with bias_activation_fusion: there is "
+                    "no fused kernel for them yet. Disable bias-activation fusion "
+                    "(e.g. --no-bias-swiglu-fusion)."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "xpr=True/gxpr=True are incompatible with use_te_activation_func (no TE "
+                    "builder exists for them)."
+                )
+            if self.moe_use_offloading_experts:
+                raise ValueError(
+                    "xpr=True/gxpr=True are not wired into the offloading-experts path yet."
+                )
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")

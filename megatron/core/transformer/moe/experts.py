@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import PolyNorm, squared_relu
+from megatron.core.activations import GXPR, PolyNorm, XPR, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -249,6 +249,13 @@ class TEGroupedMLP(MegatronModule):
                 tp_group=self.tp_group,
             )
 
+        # XPR/GXPR: the grouped path runs all local experts in one call, so we hold one
+        # coefficient set per local expert and expand it per-token via tokens_per_expert.
+        if self.config.xpr:
+            self.xpr_act = XPR(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.gxpr:
+            self.gxpr_glu = GXPR(num_local_experts=self.num_local_experts, config=self.config)
+
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
             not_none(self.config.moe_ffn_hidden_size),
@@ -304,10 +311,11 @@ class TEGroupedMLP(MegatronModule):
         (see ``transformer_engine.pytorch.module.fp8_padding``); padding rows hold whatever was
         previously in that memory. That's harmless for the padded output rows themselves --
         Fp8Unpadding slices them away before they reach the loss, so their incoming gradient is
-        exactly zero -- but PolyNorm's alpha_1/alpha_2 are per-expert parameters whose gradient
-        sums over every row mapped to that expert (real and padding alike) via
-        repeat_interleave, and a stray NaN/Inf in an uninitialized padding row can poison that
-        whole-expert gradient (``0 * NaN == NaN``) even though the row's own output is unused.
+        exactly zero -- but PolyNorm's alpha_1/alpha_2 (and XPR/GXPR's coefficients) are
+        per-expert parameters whose gradient sums over every row mapped to that expert (real and
+        padding alike) via repeat_interleave, and a stray NaN/Inf in an uninitialized padding row
+        can poison that whole-expert gradient (``0 * NaN == NaN``) even though the row's own
+        output is unused.
         Zeroing both operands in place before they reach the gate/GLU multiply guarantees every
         padding row contributes exactly zero to the forward output and to every downstream
         gradient (the gate's, and transitively fc1/fc2's weight gradients).
@@ -346,8 +354,8 @@ class TEGroupedMLP(MegatronModule):
         Applies bias and activation function to the output of linear_fc1.
 
         ``tokens_per_expert`` (the per-local-expert token counts of ``intermediate_parallel``)
-        is only used when ``config.pnglu`` is set, to map each expert's PolyNorm
-        coefficients onto its tokens.
+        is only used when ``config.pnglu``/``config.xpr``/``config.gxpr`` is set, to map each
+        expert's learnable coefficients onto its tokens.
         """
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
@@ -397,6 +405,17 @@ class TEGroupedMLP(MegatronModule):
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
+            elif self.config.gated_linear_unit and self.config.gxpr:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.gxpr_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
             elif self.config.gated_linear_unit:
 
                 def glu(x):
@@ -408,6 +427,10 @@ class TEGroupedMLP(MegatronModule):
                     return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
+            elif self.config.xpr:
+                intermediate_parallel = self.xpr_act(
+                    intermediate_parallel, tokens_per_expert=tokens_per_expert
+                )
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
             if not probs_fused:
@@ -442,7 +465,9 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
-            if self.config.pnglu:
+            if self.config.pnglu or self.config.xpr or self.config.gxpr:
+                # XPR/GXPR have the same per-expert-coefficient repeat_interleave gradient
+                # exposure as PolyNorm (see the docstring below) -- zero their padding rows too.
                 self._zero_fp8_padding_rows(
                     permuted_local_hidden_states,
                     permuted_probs,
@@ -524,8 +549,8 @@ class TEGroupedMLP(MegatronModule):
         sharded_state_dict = {}
         for name, module in self._modules.items():
             module_sharded_offsets = sharded_offsets
-            if name == 'polynorm_glu' and not singleton_local_shards:
-                # The PolyNorm coefficients are stored as a single (num_local_experts,)
+            if name in ('polynorm_glu', 'xpr_act', 'gxpr_glu') and not singleton_local_shards:
+                # The PolyNorm/XPR/GXPR coefficients are stored as a single (num_local_experts,)
                 # tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
                 # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
                 # mirroring how the expert weights are mapped to global experts. Without this,

@@ -220,6 +220,148 @@ class PolyNorm(MegatronModule):
 
 
 @jit_fuser
+def compiled_xpr(x, alpha_p1, alpha_p2, alpha_n, beta):
+    """Core XPR activation.
+
+    ``alpha_p2 * x**3 + alpha_p1 * x**2 + beta * x`` for ``x > 0``, and
+    ``alpha_n * x * softsign(x) + beta * x`` for ``x <= 0``.
+
+    All coefficients broadcast against ``x``: either a single (broadcastable) coefficient of
+    shape ``(1,)`` (dense / single-expert case) or per-token coefficients of shape
+    ``(num_tokens, 1)`` (grouped-expert case, where each token already carries the coefficients
+    of the expert it was routed to).
+    """
+    return torch.where(
+        x > 0,
+        alpha_p2 * x * x * x + alpha_p1 * x * x + beta * x,
+        alpha_n * x * F.softsign(x) + beta * x,
+    )
+
+
+@jit_fuser
+def compiled_xpr_gate(x, alpha_p1, alpha_p2, alpha_n, beta):
+    """XPR GLU gate: ``compiled_xpr(x, ...) / x``, simplified algebraically to avoid the ``0/0``
+    at ``x == 0``.
+
+    ``alpha_p2 * x**2 + alpha_p1 * x + beta`` for ``x > 0``, and
+    ``alpha_n * softsign(x) + beta`` for ``x <= 0``.
+    """
+    return torch.where(
+        x > 0,
+        alpha_p2 * x * x + alpha_p1 * x + beta,
+        alpha_n * F.softsign(x) + beta,
+    )
+
+
+class XPR(MegatronModule):
+    """Learnable elementwise activation (not a gated unit)::
+
+        XPR(x) = |alpha_p2| * x**3 + |alpha_p1| * x**2 + |beta| * x                    (x > 0)
+               = (|beta| + |alpha_n|) * x * softsign(x) + |beta| * x                    (x <= 0)
+
+    ``alpha_p1``, ``alpha_p2``, ``alpha_n``, ``beta`` are learnable (``abs`` keeps them
+    positive; the negative-branch coefficient is parameterized as ``beta + |alpha_n|`` so that,
+    at init, it equals ``alpha_n_init`` regardless of ``beta_init``).
+
+    To support grouped MoE experts (where the activations of all local experts are concatenated
+    along the token dimension and processed in a single call) this module holds one coefficient
+    set *per local expert*: each parameter has shape ``(num_local_experts,)``. When
+    ``tokens_per_expert`` is supplied the per-expert coefficients are expanded to per-token
+    coefficients, so every token is activated with the coefficients of the expert it was routed
+    to. For a dense MLP (or a ``SequentialMLP`` expert) ``num_local_experts == 1`` and the single
+    coefficient set is broadcast to all tokens.
+
+    No fused kernel is provided yet; this always runs the (torch.compile-fused) eager
+    implementation.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int = 1,
+        config=None,
+        alpha_p_init: float = 0.8,
+        alpha_p2_init: float = 0.4,
+        alpha_n_init: float = 0.8,
+        beta_init: float = 0.5,
+    ):
+        super().__init__(config=config)
+        self.num_local_experts = num_local_experts
+        self.alpha_p1 = nn.Parameter(torch.full((num_local_experts,), alpha_p_init))
+        self.alpha_p2 = nn.Parameter(torch.full((num_local_experts,), alpha_p2_init))
+        self.alpha_n = nn.Parameter(torch.full((num_local_experts,), alpha_n_init - beta_init))
+        self.beta = nn.Parameter(torch.full((num_local_experts,), beta_init))
+
+    def _coeffs(self, x, tokens_per_expert):
+        """Return ``(alpha_p1, alpha_p2, alpha_n, beta)``, positive and expanded per-token."""
+        alpha_p1 = torch.abs(self.alpha_p1)  # (num_local_experts,)
+        alpha_p2 = torch.abs(self.alpha_p2)
+        beta = torch.abs(self.beta)
+        alpha_n = beta + torch.abs(self.alpha_n)
+
+        if self.num_local_experts == 1 or tokens_per_expert is None:
+            if self.num_local_experts > 1:
+                raise ValueError(
+                    f"{type(self).__name__} with num_local_experts > 1 requires "
+                    "`tokens_per_expert` so the per-expert coefficients can be mapped onto the "
+                    "concatenated tokens."
+                )
+            return alpha_p1, alpha_p2, alpha_n, beta
+
+        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens, 1).
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+        tpe_tensor = torch.tensor(tokens_per_expert, device=x.device)
+
+        def expand(a):
+            return torch.repeat_interleave(a, tpe_tensor).unsqueeze(-1)
+
+        return expand(alpha_p1), expand(alpha_p2), expand(alpha_n), expand(beta)
+
+    def forward(self, x, tokens_per_expert=None):
+        """Return ``XPR(x)``.
+
+        Args:
+            x: activation input, ``(..., D)``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+        """
+        alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x, tokens_per_expert)
+        return compiled_xpr(x, alpha_p1, alpha_p2, alpha_n, beta)
+
+
+class GXPR(XPR):
+    """Learnable GLU gate — the gated-linear-unit counterpart of :class:`XPR`.
+
+    Mathematically ``gate(x) = XPR(x) / x``, simplified to avoid the ``0/0`` at ``x == 0``::
+
+        gate(x) = |alpha_p2| * x**2 + |alpha_p1| * x + |beta|                  (x > 0)
+                = (|beta| + |alpha_n|) * softsign(x) + |beta|                  (x <= 0)
+
+    ``forward`` takes *both* GLU halves and returns ``gate(x_glu) * x_linear * [scores]``, same
+    calling convention as :class:`PolyNorm`. Shares :class:`XPR`'s per-(local-)expert
+    coefficients and ``tokens_per_expert`` expansion.
+    """
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``gate(x_glu) * x_linear * [scores]``.
+
+        Args:
+            x_glu: GLU gate half, ``(..., D)`` (``D`` = local ffn feature dim).
+            x_linear: GLU linear half, same shape/dtype as ``x_glu``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+            scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
+        """
+        alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
+        gate = compiled_xpr_gate(x_glu, alpha_p1, alpha_p2, alpha_n, beta)
+        out = gate * x_linear
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
+@jit_fuser
 def squared_relu(x: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation"""
     return torch.pow(F.relu(x), 2)

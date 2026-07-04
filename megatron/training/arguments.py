@@ -1086,7 +1086,7 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        if args.swiglu or args.pnglu:
+        if args.swiglu or args.pnglu or args.gxpr:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -1734,6 +1734,21 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.silu
         # Fused bias+activation kernels hardcode SiLU/GELU and cannot run PolyNorm.
         kw_args['bias_activation_fusion'] = False
+    if args.xpr:
+        # XPR is a standalone learnable activation (not a gated unit), applied by a dedicated
+        # module (see MLP/TEGroupedMLP), not via config.activation_func.
+        assert not (args.swiglu or args.squared_relu or args.quick_geglu or args.pnglu), \
+            '--xpr cannot be combined with other activation flags.'
+        kw_args['bias_activation_fusion'] = False
+    if args.gxpr:
+        # GXPR replaces the gate of a gated linear unit; it is itself a (learnable) gated unit.
+        assert not (args.swiglu or args.squared_relu or args.quick_geglu or args.pnglu), \
+            '--gxpr cannot be combined with other activation flags.'
+        kw_args['gated_linear_unit'] = True
+        # The gate is computed by the GXPR module. Keep SiLU as a harmless placeholder
+        # activation_func for the (unused) non-gxpr code paths and width-doubling assumptions.
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -2065,6 +2080,8 @@ def _add_network_size_args(parser):
         # defined explicitly as CLI arguments below
         "pnglu",
         "pnglu_fusion",
+        "xpr",
+        "gxpr",
         "sandwich_norm",
         "keel",
         "keel_alpha",
@@ -2148,6 +2165,16 @@ def _add_network_size_args(parser):
                        'default and auto-falls-back on CPU / TP-sharded layers / missing Triton.')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
+    group.add_argument('--xpr', action='store_true',
+                       help='Use XPR, a learnable elementwise activation: '
+                       '|ap2|*x^3 + |ap1|*x^2 + |b|*x for x>0, and '
+                       '(|b|+|an|)*x*softsign(x) + |b|*x for x<=0. Not a gated unit. '
+                       'Each MoE expert gets its own coefficients.')
+    group.add_argument('--gxpr', action='store_true',
+                       help='Use GXPR, the gated-linear-unit counterpart of --xpr: '
+                       'gate(x_glu) * x_linear, where gate(x) = |ap2|*x^2 + |ap1|*x + |b| for '
+                       'x>0, and (|b|+|an|)*softsign(x) + |b| for x<=0 (== XPR(x)/x). Implies '
+                       'gated linear units. Each MoE expert gets its own coefficients.')
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
                        'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')
