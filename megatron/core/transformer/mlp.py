@@ -23,7 +23,17 @@ from megatron.core.fusions.fused_bias_geglu import (
     quick_gelu,
     weighted_bias_quick_geglu_impl,
 )
-from megatron.core.activations import GXPR, GXPRY, GXR2, PolyNorm, PolyNormAct, XPR, XR2, XR2GLU
+from megatron.core.activations import (
+    GXPR,
+    GXPRY,
+    GXPRV2,
+    GXR2,
+    PolyNorm,
+    PolyNormAct,
+    XPR,
+    XR2,
+    XR2GLU,
+)
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -251,6 +261,8 @@ class MLP(MegatronModule):
             self.gxpr_glu = GXPR(num_local_experts=1, config=self.config)
         if self.config.gxpry:
             self.gxpry_glu = GXPRY(num_local_experts=1, config=self.config)
+        if self.config.gxprv2:
+            self.gxprv2_glu = GXPRV2(num_local_experts=1, config=self.config)
         if self.config.xr2:
             self.xr2_act = XR2(num_local_experts=1, config=self.config)
         if self.config.gxr2:
@@ -373,6 +385,16 @@ class MLP(MegatronModule):
                     x_linear = x_linear + self.config.glu_linear_offset
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.gxpry_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.gxprv2:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.gxprv2_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit and self.config.gxr2:
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)

@@ -258,6 +258,17 @@ class TransformerConfig(ModelParallelConfig):
     No fused kernel yet (always runs eager/torch.compile). Not compatible with
     ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
 
+    gxprv2: bool = False
+    """If True, replace the gate of a gated linear unit with the GXPRV2 gate: ``gxpr`` with
+    ``beta`` removed entirely (not just initialized near zero) -- no additive floor term, and
+    the negative-branch coefficient ``an`` is no longer coupled to ``beta``:
+    ``GXPRV2(x_glu) * x_linear`` where ``gate(x) = |ap2|*x**2 + |ap1|*x`` for ``x>0`` and
+    ``gate(x) = |an|*softsign(x)`` for ``x<=0``. Unlike ``gxpr`` (``gate(0) == |beta|``), here
+    ``gate(0) == 0``, matching standard gated activations. Requires
+    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own coefficients.
+    No fused kernel yet (always runs eager/torch.compile). Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
     xr2: bool = False
     """If True, replace the MLP activation with XR2 -- ``xpr`` without the ``x**3`` term:
     ``|ap1|*x**2 + |b|*x`` for ``x>0``, ``(|b|+|an|)*x*softsign(x) + |b|*x`` for ``x<=0``. Not a
@@ -1451,6 +1462,7 @@ class TransformerConfig(ModelParallelConfig):
             'xpr': self.xpr,
             'gxpr': self.gxpr,
             'gxpry': self.gxpry,
+            'gxprv2': self.gxprv2,
             'xr2': self.xr2,
             'gxr2': self.gxr2,
             'xr2glu': self.xr2glu,
@@ -1465,7 +1477,7 @@ class TransformerConfig(ModelParallelConfig):
             )
         if _active_new_activations:
             _active_name = _active_new_activations[0]
-            _is_gated = _active_name in ('gxpr', 'gxpry', 'gxr2', 'xr2glu', 'pn3glu')
+            _is_gated = _active_name in ('gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'pn3glu')
             if _is_gated and not self.gated_linear_unit:
                 raise ValueError(
                     f"{_active_name}=True requires gated_linear_unit=True (it replaces the GLU "

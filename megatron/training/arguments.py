@@ -1086,7 +1086,10 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        if args.swiglu or args.pnglu or args.gxpr or args.gxpry or args.gxr2 or args.xr2glu or args.pn3glu:
+        if (
+            args.swiglu or args.pnglu or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2
+            or args.xr2glu or args.pn3glu
+        ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -1744,6 +1747,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'xpr': args.xpr,
         'gxpr': args.gxpr,
         'gxpry': args.gxpry,
+        'gxprv2': args.gxprv2,
         'xr2': args.xr2,
         'gxr2': args.gxr2,
         'xr2glu': args.xr2glu,
@@ -1773,6 +1777,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
     if args.gxpry:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.gxprv2:
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
@@ -2123,6 +2131,7 @@ def _add_network_size_args(parser):
         "gxpr",
         "gxpr_fusion",
         "gxpry",
+        "gxprv2",
         "xr2",
         "gxr2",
         "xr2glu",
@@ -2231,6 +2240,13 @@ def _add_network_size_args(parser):
                        'polynomial/softsign pieces) but the piecewise branch is selected by the '
                        'sign of x_linear instead of x_glu. Implies gated linear units. Each MoE '
                        'expert gets its own coefficients.')
+    group.add_argument('--gxprv2', action='store_true',
+                       help='Use GXPRV2: --gxpr with beta removed entirely (not just '
+                       'initialized near zero) -- no additive floor term, and an is no longer '
+                       'coupled to beta: gate(x_glu) * x_linear, where gate(x) = |ap2|*x^2 + '
+                       '|ap1|*x for x>0, and |an|*softsign(x) for x<=0. Unlike --gxpr '
+                       '(gate(0) == |beta|), here gate(0) == 0. Implies gated linear units. '
+                       'Each MoE expert gets its own coefficients.')
     group.add_argument('--xr2', action='store_true',
                        help='Use XR2, --xpr without the x^3 term: |ap1|*x^2 + |b|*x for x>0, '
                        'and (|b|+|an|)*x*softsign(x) + |b|*x for x<=0. Not a gated unit. Each '

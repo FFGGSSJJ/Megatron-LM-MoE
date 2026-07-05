@@ -556,6 +556,101 @@ class GXPRY(XPR):
 
 
 @jit_fuser
+def compiled_gxprv2_gate(x, alpha_p1, alpha_p2, alpha_n):
+    """GXPRV2 gate: :class:`GXPR` with ``beta`` removed entirely -- no additive floor term, and
+    ``alpha_n`` is no longer coupled to ``beta`` (``an = |alpha_n|`` directly, not
+    ``|beta| + |alpha_n|``).
+
+    ``alpha_p2 * x**2 + alpha_p1 * x`` for ``x > 0``, and ``alpha_n * softsign(x)`` for ``x <= 0``.
+    """
+    return torch.where(
+        x > 0,
+        alpha_p2 * x * x + alpha_p1 * x,
+        alpha_n * F.softsign(x),
+    )
+
+
+class GXPRV2(MegatronModule):
+    """Learnable GLU gate -- :class:`GXPR` with ``beta`` removed entirely (not just
+    initialized near zero)::
+
+        gate(x) = |alpha_p2| * x**2 + |alpha_p1| * x           (x > 0)
+                = |alpha_n| * softsign(x)                        (x <= 0)
+
+    GXPR's ``beta`` played two roles: an additive floor term present in both branches (so
+    ``gate(0) == |beta|``, meaning the gate is never fully closed), and it was coupled into the
+    negative-branch coefficient (``an = |beta| + |alpha_n|``). Removing it entirely -- rather
+    than just initializing it near zero -- gives ``gate(0) == 0`` by construction, matching
+    standard gated activations (SiLU, GELU-based gates), and makes ``alpha_n`` a fully
+    independent parameter. As with every other coefficient in this activation family, ``alpha_n``
+    is used only via ``abs()``, so it still needs a nonzero init (``d|x|/dx == sign(0) == 0`` in
+    PyTorch -- an exactly-zero init would receive a permanent zero gradient and never move).
+
+    ``forward`` takes *both* GLU halves and returns ``gate(x_glu) * x_linear * [scores]``, same
+    calling convention as :class:`GXPR`. Same per-(local-)expert coefficient /
+    ``tokens_per_expert`` handling as the rest of the family. No fused kernel yet; always runs
+    the (torch.compile-fused) eager implementation.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int = 1,
+        config=None,
+        alpha_p_init: float = 0.8,
+        alpha_p2_init: float = 0.4,
+        alpha_n_init: float = 0.8,
+    ):
+        super().__init__(config=config)
+        self.num_local_experts = num_local_experts
+        self.alpha_p1 = nn.Parameter(torch.full((num_local_experts,), alpha_p_init))
+        self.alpha_p2 = nn.Parameter(torch.full((num_local_experts,), alpha_p2_init))
+        self.alpha_n = nn.Parameter(torch.full((num_local_experts,), alpha_n_init))
+
+    def _coeffs(self, x, tokens_per_expert):
+        """Return ``(alpha_p1, alpha_p2, alpha_n)``, positive and expanded per-token."""
+        alpha_p1 = torch.abs(self.alpha_p1)  # (num_local_experts,)
+        alpha_p2 = torch.abs(self.alpha_p2)
+        alpha_n = torch.abs(self.alpha_n)
+
+        if self.num_local_experts == 1 or tokens_per_expert is None:
+            if self.num_local_experts > 1:
+                raise ValueError(
+                    f"{type(self).__name__} with num_local_experts > 1 requires "
+                    "`tokens_per_expert` so the per-expert coefficients can be mapped onto the "
+                    "concatenated tokens."
+                )
+            return alpha_p1, alpha_p2, alpha_n
+
+        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens, 1).
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+        tpe_tensor = torch.tensor(tokens_per_expert, device=x.device)
+
+        def expand(a):
+            return torch.repeat_interleave(a, tpe_tensor).unsqueeze(-1)
+
+        return expand(alpha_p1), expand(alpha_p2), expand(alpha_n)
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``gate(x_glu) * x_linear * [scores]``.
+
+        Args:
+            x_glu: GLU gate half, ``(..., D)`` (``D`` = local ffn feature dim).
+            x_linear: GLU linear half, same shape/dtype as ``x_glu``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+            scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
+        """
+        alpha_p1, alpha_p2, alpha_n = self._coeffs(x_glu, tokens_per_expert)
+        gate = compiled_gxprv2_gate(x_glu, alpha_p1, alpha_p2, alpha_n)
+        out = gate * x_linear
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
+@jit_fuser
 def compiled_xr2(x, alpha_p1, alpha_n, beta):
     """Core XR2 activation — :func:`compiled_xpr` without the ``x**3`` term.
 
