@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_routing_scores_for_aux_loss,
     expert_load_violation_batchwise,
     get_tokens_per_expert_and_token_count,
+    qb_dual_update,
     router_gating_linear,
     save_to_aux_losses_tracker,
     sinkhorn,
@@ -213,6 +214,38 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
+        # Quantile balancing uses a per-expert bias `qb_beta`; it may be combined with
+        # sequence-level aux loss through the load-balancing type list.
+        # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
+        # and reset each global batch.
+        if "quantile_balancing" in self.routing_type:
+            self.register_buffer(
+                'qb_beta',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+            self.register_buffer(
+                'qb_beta_accum',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_beta_count',
+                torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
+                persistent=False,
+            )
+        else:
+            self.qb_beta = None
+            self.qb_beta_accum = None
+            self.qb_beta_count = None
+
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
@@ -227,6 +260,13 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        # Keep the QB bias in fp32 for the same reason.
+        if hasattr(self, 'qb_beta') and self.qb_beta is not None:
+            if self.qb_beta.dtype != torch.float32:
+                self.qb_beta.data = self.qb_beta.data.to(torch.float32)
+        if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
+            if self.qb_beta_accum.dtype != torch.float32:
+                self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -260,6 +300,87 @@ class TopKRouter(Router):
         map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
         scores = logits * map
         return scores, map
+
+    def quantile_balancing(
+        self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
+        """Apply quantile-balancing (QB) routing to the logits tensor (from https://github.com/NVIDIA/Megatron-LM/pull/5349)."""
+        assert (
+            not self.config.moe_router_fusion
+        ), "Quantile balancing routing does not support moe_router_fusion."
+        assert (
+            self.config.moe_router_num_groups is None and self.config.moe_router_group_topk is None
+        ), "Quantile balancing routing does not support group-limited routing."
+
+        local_num_tokens = logits.shape[0]
+        # Gather logits across TP/CP only for the beta quantile update. Routing itself is
+        # per-token and can use the local logits with the previous global-batch qb_beta.
+        gather_group = self.tp_cp_group
+        gather_size = gather_group.size() if gather_group is not None else 1
+
+        should_update_beta = self.training and torch.is_grad_enabled()
+
+        with torch.no_grad():
+            logits_fp32 = logits.detach().to(dtype=torch.float32)
+            indices = (logits_fp32 - self.qb_beta).topk(self.topk, dim=1).indices
+
+            if should_update_beta:
+                beta_logits = logits_fp32
+                beta_padding_mask = padding_mask
+                if gather_size > 1:
+                    # TODO: we could cache a reusable gather buffer sized for the max token count.
+                    beta_logits = torch.empty(
+                        (local_num_tokens * gather_size, self.config.num_moe_experts),
+                        dtype=logits_fp32.dtype,
+                        device=logits_fp32.device,
+                    )
+                    logits_work = torch.distributed.all_gather_into_tensor(
+                        beta_logits,
+                        logits_fp32.contiguous(),
+                        group=gather_group,
+                        async_op=True,
+                    )
+                    mask_work = None
+                    if padding_mask is not None:
+                        local_padding_mask = padding_mask.to(dtype=torch.uint8)
+                        beta_padding_mask = torch.empty(
+                            local_num_tokens * gather_size,
+                            dtype=local_padding_mask.dtype,
+                            device=local_padding_mask.device,
+                        )
+                        mask_work = torch.distributed.all_gather_into_tensor(
+                            beta_padding_mask,
+                            local_padding_mask,
+                            group=gather_group,
+                            async_op=True,
+                        )
+
+                    logits_work.wait()
+                    if mask_work is not None:
+                        mask_work.wait()
+
+                    if padding_mask is not None:
+                        beta_padding_mask = beta_padding_mask.bool()
+
+                if beta_padding_mask is not None:
+                    beta_logits = beta_logits[~beta_padding_mask]
+                if beta_logits.numel() > 0:
+                    _, beta_local = qb_dual_update(
+                        beta_logits, self.topk, self.qb_beta, update_beta=True
+                    )
+                    self.qb_beta_accum.add_(beta_local)
+                    self.qb_beta_count.add_(1)
+
+        # QB only picks the experts; reuse the shared score function for the probs.
+        return topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            fused=False,
+            precomputed_indices=indices,
+        )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
@@ -612,6 +733,8 @@ class TopKRouter(Router):
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
+        elif "quantile_balancing" in self.routing_type:
+            probs, routing_map = self.quantile_balancing(logits, padding_mask=padding_mask)
         else:
             probs, routing_map = topk_routing_with_score_function(
                 logits,
@@ -812,6 +935,7 @@ class InferenceTopKRouter(TopKRouter):
         fused,
         router_replay,
         dense_output,
+        precomputed_indices,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -825,10 +949,16 @@ class InferenceTopKRouter(TopKRouter):
             fused=fused,
             router_replay=router_replay,
             dense_output=dense_output,
+            precomputed_indices=precomputed_indices,
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+
+        # QB selects on (logits - qb_beta); at inference qb_beta is fixed.
+        precomputed_indices = None
+        if self.qb_beta is not None:
+            precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
 
         probs, top_indices = self._compiled_topk_routing(
             logits,
@@ -842,6 +972,7 @@ class InferenceTopKRouter(TopKRouter):
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
             dense_output=True,
+            precomputed_indices=precomputed_indices,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

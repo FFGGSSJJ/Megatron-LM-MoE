@@ -106,7 +106,9 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'is_router',
     'is_embedding_or_output_parameter',
     'is_embedding_parameter',
-    'is_output_parameter',
+    'is_md_embedding_parameter',
+    'is_md_output_parameter',
+    'merged_offload_expert',
 )
 
 
@@ -401,6 +403,34 @@ class MegatronOptimizer(ABC):
                         state_dict[k] = v.cuda()
 
     @staticmethod
+    def _param_group_key(group: Dict) -> Tuple[Any, ...]:
+        return tuple(
+            group[key] if key in group else group[f"pre_{key}"]
+            for key in param_group_identifier_keys
+        )
+
+    @classmethod
+    def _assert_unique_param_group_keys(
+        cls, groups: List[Dict], source: str
+    ) -> List[Tuple[Any, ...]]:
+        keys = [cls._param_group_key(group) for group in groups]
+        seen = set()
+        duplicates = []
+        for key in keys:
+            if key in seen and key not in duplicates:
+                duplicates.append(key)
+            seen.add(key)
+        if duplicates:
+            duplicate_keys = "\n".join(str(key) for key in duplicates)
+            raise ValueError(
+                f"Cannot match optimizer parameter groups from {source}: "
+                f"param-group identity keys {param_group_identifier_keys} are not unique.\n"
+                f"Duplicate keys:\n{duplicate_keys}\n"
+                "Add a disambiguating key before resuming."
+            )
+        return keys
+
+    @staticmethod
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
@@ -419,23 +449,17 @@ class MegatronOptimizer(ABC):
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
         # Define groups order that is needed in the current optimizer (coming from runtime)
-        needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
-            for g in current_groups
-        ]
+        needed_groups = MegatronOptimizer._assert_unique_param_group_keys(
+            current_groups, "current optimizer"
+        )
+        state_dict_group_keys = MegatronOptimizer._assert_unique_param_group_keys(
+            state_dict_groups, "loaded checkpoint"
+        )
 
         # Keep state_dict param group order since groups are LocalNonpersistentObject
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
-            for group in state_dict_groups
-        }
+        loaded_groups_map = dict(zip(state_dict_group_keys, state_dict_groups))
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
@@ -883,9 +907,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
 
-        # Filter and reorder param groups to match current optimizer
+        # Filter and reorder param groups to match current optimizer. Keep a reference
+        # to the SAVED (pre-reorder) group order — the fp32 master-param copy below is
+        # stored in this order and must be reordered the same way.
+        saved_param_groups = state_dict[optimizer_key]['param_groups']
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
+            self.optimizer.param_groups, saved_param_groups
         )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
@@ -903,13 +930,27 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     'Skipping loading grad scaler ...'
                 )
 
-        # Copy data for the main params.
+        # Copy data for the main params. `self.fp32_from_float16_groups` is in the
+        # CURRENT param-group order, but the saved fp32 master params are stored in the
+        # SAVED order (1:1 with `saved_param_groups`). `param_groups` were reordered to
+        # the current order above, so this list must be reordered the SAME way — else a
+        # param gets its master weights from a differently-ordered saved group, which
+        # crashes on a shape mismatch or (worse) silently loads the wrong state.
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
-        for current_group, saved_group in zip(
-            self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
-        ):
+        saved_fp32_groups = state_dict[fp32_from_float16_params_key]
+
+        if len(saved_fp32_groups) == len(saved_param_groups):
+            key_to_fp32 = {
+                self._param_group_key(g): fp32
+                for g, fp32 in zip(saved_param_groups, saved_fp32_groups)
+            }
+            saved_fp32_groups = [
+                key_to_fp32[self._param_group_key(g)] for g in self.optimizer.param_groups
+            ]
+
+        for current_group, saved_group in zip(self.fp32_from_float16_groups, saved_fp32_groups):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 

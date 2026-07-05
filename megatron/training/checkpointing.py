@@ -35,6 +35,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
@@ -582,13 +583,18 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
 
-    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+    # LayerWiseDistributedOptimizer saves torch-format optimizer state per DP rank.
+    if (
+        ckpt_format == 'torch'
+        and not args.no_save_optim
+        and optimizer is not None
+        and not optimizer.is_stub_optimizer
+        and isinstance(optimizer, LayerWiseDistributedOptimizer)
+    ):
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
         ensure_directory_exists(optim_checkpoint_name)
-        if not optimizer.is_stub_optimizer:
-            optimizer.save_state_dict_to_file(optim_checkpoint_name)
+        optimizer.save_state_dict_to_file(optim_checkpoint_name)
 
     async_save_request = None
     if args.async_save:
@@ -1529,10 +1535,18 @@ def load_args_from_checkpoint(
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('pnglu', force=True)
+    _set_arg('pnglu_fusion', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
+    _set_arg('scale_embeddings_by_sqrt_hidden', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
+    _set_arg('residual_output_scaling', force=True)
+    _set_arg('sandwich_norm', force=True)
+    _set_arg('keel', force=True)
+    _set_arg('keel_alpha', force=True)
     _set_arg('apply_query_key_layer_scaling', force=True)
+    _set_arg('qk_layernorm', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
 
@@ -1925,7 +1939,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+            if (
+                ckpt_format == 'torch'
+                and optimizer is not None
+                and not optimizer.is_stub_optimizer
+                and isinstance(optimizer, LayerWiseDistributedOptimizer)
+            ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
                 dp_rank = mpu.get_data_parallel_rank()
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")

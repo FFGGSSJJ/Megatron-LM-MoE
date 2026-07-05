@@ -1498,6 +1498,12 @@ def validate_args(args, defaults={}):
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
     if args.optimizer == 'md_decoupling':
+        if args.hypersphere_mode == "none":
+            args.hypersphere_mode = None
+        if args.hypersphere_embedding_mode == "external":
+            args.hypersphere_embedding_mode = None
+        if args.hypersphere_gains_mode == "none":
+            args.hypersphere_gains_mode = None
         assert not args.use_distributed_optimizer, (
             "md_decoupling does not support the standard distributed optimizer; use "
             "--use-layer-wise-distributed-optimizer to shard optimizer state.")
@@ -1516,15 +1522,30 @@ def validate_args(args, defaults={}):
             assert not args.overlap_param_gather, (
                 "md_decoupling without --use-layer-wise-distributed-optimizer does not support "
                 "--overlap-param-gather; enable the layer-wise optimizer.")
-        gains_enabled = (
-            args.hypersphere_gains_mode is not None
-            or args.hypersphere_gains_mode_output is not None
-            or args.hypersphere_gains_mode_embedding is not None
-        )
+        gains_enabled = args.hypersphere_gains_mode is not None
         if gains_enabled:
             assert args.ckpt_format == "torch", (
                 "md_decoupling with learnable gains requires --ckpt-format torch (gain state "
                 "tensors differ in shape from their parameter, which torch_dist cannot round-trip).")
+        if args.gains_no_clamp_min and args.gain_parametrization == "softplus":
+            warn_rank_0(
+                "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
+                "softplus gains are positive, so the clamp only changes values below 1e-8."
+            )
+        if args.hypersphere_radius_from_init:
+            assert args.hypersphere_mode == "flat", (
+                "--hypersphere-radius-from-init only applies to --hypersphere-mode flat; "
+                f"got {args.hypersphere_mode}."
+            )
+            warn_rank_0(
+                "--hypersphere-radius-from-init assumes matrix init_std is 1/sqrt(hidden); "
+                "set --init-method-std accordingly."
+            )
+        assert not (args.hypersphere_scale_out_proj_init and args.residual_output_scaling), (
+            "--hypersphere-scale-out-proj-init and --residual-output-scaling both apply the "
+            "1/sqrt(2*num_layers) residual-branch depth scaling to the out-projections (the first "
+            "on the weight-norm/gain, the second as a forward multiplier); enabling both "
+            "double-counts and over-suppresses the residual branches. Enable exactly one.")
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2306,7 +2327,7 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
-    group.add_argument('--muon-momentum', type=float, default=0.9,
+    group.add_argument('--muon-momentum', type=float, default=0.95,
                        help='Momentum factor for Muon optimizer')
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
@@ -2567,10 +2588,11 @@ def _add_training_args(parser):
     # Magnitude-direction decoupling: hypersphere normalization (direction) + learnable per-axis
     # gains (magnitude) + optional Muon orthogonalized updates. Reuses --adam-beta1/--adam-beta2/
     # --adam-eps/--weight-decay and the --muon-* knobs (momentum, nesterov, scale-mode, num-ns-steps,
-    # tp-mode, extra-scale-factor, coefficient-type, fp32-matmul-prec, split-qkv). All defaults off.
+    # tp-mode, extra-scale-factor, coefficient-type, fp32-matmul-prec, split-qkv).
     group.add_argument('--matrix-lr', type=float, default=None,
                        help='Absolute LR for matrix (2D non-embedding/output) params under '
-                       '--optimizer md_decoupling. Overrides muon_lr_factor * lr.')
+                       '--optimizer md_decoupling or muon/dist_muon (the Muon-managed matrices; '
+                       'the scalar Adam/Lion group stays on --lr). Overrides muon_lr_factor * lr.')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '
@@ -2585,22 +2607,21 @@ def _add_training_args(parser):
                        '(config.min_lr / config.lr). "absolute": every group decays to the same '
                        'floor (config.min_lr).')
     group.add_argument('--muon-lr-factor', type=float, default=1.0,
-                       help='When --matrix-lr is unset, matrix-param LR for md_decoupling is '
-                       'muon_lr_factor * lr. Default 1.0.')
-    group.add_argument('--hypersphere-mode', type=str, default=None,
-                       choices=['row', 'col', 'flat', 'embed'],
+                       help='When --matrix-lr is unset, matrix-param LR for md_decoupling and '
+                       'muon/dist_muon is muon_lr_factor * lr. Default 1.0 (matrices track --lr).')
+    group.add_argument('--hypersphere-mode', type=str, default='flat',
+                       choices=['row', 'col', 'flat', 'embed', 'none'],
                        help='Hypersphere normalization mode for non-embedding/output 2D matrices '
                        'under md_decoupling. Applied post-step to project the weight onto the L2 '
-                       'sphere. None = off.')
-    group.add_argument('--hypersphere-embedding-mode', type=str, default=None,
-                       choices=['row', 'col', 'flat', 'embed', 'none'],
+                       "sphere. Defaults to 'flat'; use 'none' to disable.")
+    group.add_argument('--hypersphere-embedding-mode', type=str, default='row',
+                       choices=['row', 'col', 'flat', 'embed', 'none', 'external'],
                        help='Hypersphere mode override for embedding + LM head under md_decoupling. '
-                       'When set, those params stay in MDDecoupling (Adam branch) and get post-step '
-                       'normalization. When None, they route to external Adam with no hypersphere.')
-    group.add_argument('--hypersphere-router-mode', type=str, default=None,
+                       "'external' routes those params to the chained optimizer. Defaults to 'row'.")
+    group.add_argument('--hypersphere-router-mode', type=str, default='row',
                        choices=['row', 'col', 'flat', 'embed', 'none'],
                        help='Hypersphere mode override for MoE router weights under md_decoupling. '
-                       'None disables router-specific normalization.')
+                       "Defaults to 'row'.")
     group.add_argument('--hypersphere-tangential-grad', action='store_true', default=False,
                        help='Project p.grad onto the hypersphere tangent space before the update '
                        '(only effective with an active hypersphere mode).')
@@ -2612,33 +2633,50 @@ def _add_training_args(parser):
                        help='Scale the hypersphere target radius for is_out_proj params '
                        '(linear_proj, linear_fc2) by 1/sqrt(2 * num_layers), matching '
                        'scaled_init_method_normal.')
+    group.add_argument('--hypersphere-radius-from-init', action='store_true', default=False,
+                       help='Place each flat-mode matrix sphere at its init Frobenius norm '
+                       '(init_std=1/sqrt(hidden)) instead of sqrt(max(d_out,d_in)), rescaling both '
+                       'the projection target and the Muon update by sqrt(min(d_out,d_in)/hidden). '
+                       'Keeps narrow matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere.')
     group.add_argument('--md-router-use-orthogonal-updates',
                        type=lambda s: {'true': True, 'false': False}[s.lower()],
                        default=None, choices=[True, False],
                        help='Per-param-group override for use_orthogonal_updates on MoE router '
                        'weights under md_decoupling. "true" forces Muon for routers, "false" forces '
                        'the Adam branch, unset (default) follows --use-orthogonal-updates.')
-    group.add_argument('--hypersphere-gains-mode', type=str, default=None,
-                       choices=['row', 'col', 'rowcol', 'flat', 'embed'],
-                       help='Learnable per-axis gains for matrix params under md_decoupling.')
-    group.add_argument('--hypersphere-gains-mode-output', type=str, default=None,
-                       choices=['row', 'col', 'rowcol', 'flat', 'none'],
-                       help="Gains mode override for the LM head under md_decoupling. 'none' "
-                       'disables gains for the LM head.')
-    group.add_argument('--hypersphere-gains-mode-embedding', type=str, default=None,
-                       choices=['row', 'col', 'rowcol', 'flat', 'none'],
-                       help='Gains mode override for the embedding under md_decoupling.')
+    group.add_argument('--hypersphere-gains-mode', type=str, default='rowcol',
+                       choices=['row', 'col', 'rowcol', 'flat', 'embed', 'none'],
+                       help="Learnable per-axis gains for matrix params under md_decoupling. "
+                       "Defaults to 'rowcol'; use 'none' to disable.")
+    group.add_argument('--hypersphere-gains-mode-output', type=str, default='inherit',
+                       choices=['row', 'col', 'rowcol', 'flat', 'inherit', 'none'],
+                       help="Gains mode override for the LM head under md_decoupling. 'inherit' "
+                       "uses the base gains mode; 'none' disables gains for the LM head.")
+    group.add_argument('--hypersphere-gains-mode-embedding', type=str, default='none',
+                       choices=['row', 'col', 'rowcol', 'flat', 'inherit', 'none'],
+                       help="Gains mode override for the embedding under md_decoupling. "
+                       "Unset or 'inherit' uses the base gains mode. Defaults to 'none'.")
+    group.add_argument('--hypersphere-gains-mode-router', type=str, default='rowcol',
+                       choices=['row', 'col', 'rowcol', 'flat', 'inherit', 'none'],
+                       help="Gains mode override for MoE router weights under md_decoupling. "
+                       "Unset or 'inherit' uses the base gains mode. Defaults to 'rowcol'.")
     group.add_argument('--gains-lr', type=float, default=None,
                        help='Absolute LR for the per-axis gains AdamW under md_decoupling. When '
                        'unset, falls back to --lr (and still tracks the schedule shape of --lr).')
-    group.add_argument('--gain-parametrization', type=str, default='direct',
+    group.add_argument('--gain-parametrization', type=str, default='softplus',
                        choices=['direct', 'softplus'],
                        help='Reparametrize the stored gain g; effective multiplier is phi(g). '
-                       '"direct" (default) keeps phi(g)=g. "softplus" uses phi(g)=softplus(g) '
+                       '"direct" keeps phi(g)=g. "softplus" (default) uses phi(g)=softplus(g) '
                        '(always positive). Applied uniformly to row/col/flat gains.')
-    group.add_argument('--use-orthogonal-updates', action='store_true', default=False,
+    group.add_argument('--gains-no-clamp-min', action='store_true', default=False,
+                       help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
+                       'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
+                       'including small or negative gains.')
+    group.add_argument('--use-orthogonal-updates',
+                       action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '
-                       'md_decoupling. Embedding + LM head ALWAYS use the Adam branch.')
+                       'md_decoupling. Use --no-use-orthogonal-updates to disable. '
+                       'Embedding + LM head ALWAYS use the Adam branch.')
     group.add_argument('--use-layer-wise-distributed-optimizer', action='store_true', default=False,
                        help='For --optimizer md_decoupling: wrap the optimizer with '
                        'LayerWiseDistributedOptimizer to shard optimizer state over the '
@@ -3270,9 +3308,9 @@ def _add_moe_args(parser):
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
-                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
+                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'quantile_balancing', 'none'],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" (QB) uses dual coordinate descent on a per-expert bias to handle load balance internally and can only be combined with "seq_aux_loss"; "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     # Token dispatcher arguments
