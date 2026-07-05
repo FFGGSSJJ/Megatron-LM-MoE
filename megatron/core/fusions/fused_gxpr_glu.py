@@ -21,6 +21,26 @@ RMSNorm reduction and therefore a hand Triton kernel, one block per row, capped 
 codegen (the same mechanism ``swiglu``/``weighted_swiglu`` use) already tiles this optimally
 without any row-alignment padding, and there's no feature-dimension cap to enforce.
 
+Two measured-motivated micro-optimizations vs. the first version of this file (real 3B-model A/B:
+GXPR ran ~14% slower than SwiGLU even with the fusion mechanism unified):
+
+1. **``ap1``/``ap2``/``an``/``beta`` are packed into one ``coeffs`` tensor** before entering the
+   custom autograd Function (via a plain, differentiable ``torch.cat`` -- autograd splits the
+   gradient back into the four original parameter grads automatically, no manual code needed).
+   torch.compile re-validates its guards (dtype/device/shape/stride/etc.) against *every* tensor
+   argument on *every* call; that cost scales with argument count and recurs once per MoE layer
+   per micro-batch, not with the tensor sizes -- so it doesn't amortize away just because the
+   model is bigger, only because there are fewer arguments to guard. Packing 4 small coefficient
+   tensors into 1 cuts that specific overhead roughly 4x.
+2. **The ``+ beta`` term (common to both branches) is hoisted out of the ``torch.where``**, so it
+   is computed once per element instead of once per branch. ``torch.where``/predicated-select
+   does not short-circuit on a GPU -- both branches are always evaluated for every element, so
+   GXPR inherently does more arithmetic per element than SwiGLU's single-formula gate; this
+   doesn't remove that structural cost (nothing implementation-level can, short of changing the
+   math), but it does remove the one clearly redundant operation Inductor wasn't deduplicating on
+   its own (confirmed by reading the generated Triton source: it computed ``+ beta`` twice, once
+   per branch, before the ``where``).
+
 ``ap1``/``ap2``/``an``/``beta`` broadcast against ``x``/``y`` exactly like the eager
 (``compiled_xpr_gate``) path: shape ``(1,)`` for a single shared (dense) coefficient, or
 ``(num_tokens, 1)`` for the grouped-expert case (the owning module, :class:`~megatron.core.
@@ -53,36 +73,42 @@ def _sum_to_shape(grad: torch.Tensor, shape: torch.Size) -> torch.Tensor:
     return grad
 
 
+def _unpack_coeffs(coeffs):
+    """Split the packed ``(..., 4)`` coefficient tensor into ``(ap1, ap2, an, beta)``, each
+    ``(..., 1)``. A cheap view/slice, not a copy -- negligible cost inside the compiled region.
+    """
+    return coeffs[..., 0:1], coeffs[..., 1:2], coeffs[..., 2:3], coeffs[..., 3:4]
+
+
 @jit_fuser
-def gxpr_glu(x, y, ap1, ap2, an, beta):
-    """GXPR GLU gate * y, fused in one compiled pass (mirrors ``swiglu(y)``)."""
+def gxpr_glu(x, y, coeffs):
+    """GXPR GLU gate * y, fused in one compiled pass (mirrors ``swiglu(y)``).
+
+    ``coeffs`` packs ``(ap1, ap2, an, beta)`` along its last dim -- see module docstring for why.
+    """
+    ap1, ap2, an, beta = _unpack_coeffs(coeffs)
     pos = x > 0
-    poly = ap2 * x * x + ap1 * x + beta
-    neg = an * F.softsign(x) + beta
-    gate = torch.where(pos, poly, neg)
-    return gate * y
+    delta = torch.where(pos, ap2 * x * x + ap1 * x, an * F.softsign(x))
+    return (delta + beta) * y
 
 
 @jit_fuser
-def weighted_gxpr_glu(x, y, ap1, ap2, an, beta, score):
+def weighted_gxpr_glu(x, y, coeffs, score):
     dtype = x.dtype
-    res = gxpr_glu(x, y, ap1, ap2, an, beta) * score
+    res = gxpr_glu(x, y, coeffs) * score
     return res.to(dtype)
 
 
 @jit_fuser
-def gxpr_glu_back(g, x, y, ap1, ap2, an, beta):
-    """Analytic backward for ``gxpr_glu``.
-
-    Returns ``(dx, dy, dap1, dap2, dan, dbeta)``, each already reduced to its corresponding
-    input's shape.
-    """
+def gxpr_glu_back(g, x, y, coeffs):
+    """Analytic backward for ``gxpr_glu``. Returns ``(dx, dy, dcoeffs)``, ``dcoeffs`` packed the
+    same way as the input ``coeffs`` (already reduced to that shape)."""
+    ap1, ap2, an, beta = _unpack_coeffs(coeffs)
     pos = x > 0
     inv_denom = 1.0 / (1.0 + torch.abs(x))  # 1/(1+|x|); softsign(x) = x * inv_denom
     softsign = x * inv_denom
-    poly = ap2 * x * x + ap1 * x + beta
-    neg = an * softsign + beta
-    gate = torch.where(pos, poly, neg)
+    delta = torch.where(pos, ap2 * x * x + ap1 * x, an * softsign)
+    gate = delta + beta
 
     dgate = g * y
     dy = g * gate
@@ -99,18 +125,19 @@ def gxpr_glu_back(g, x, y, ap1, ap2, an, beta):
     dap2 = _sum_to_shape(dap2, ap2.shape)
     dan = _sum_to_shape(dan, an.shape)
     dbeta = _sum_to_shape(dbeta, beta.shape)
-    return dx, dy, dap1, dap2, dan, dbeta
+    dcoeffs = torch.cat([dap1, dap2, dan, dbeta], dim=-1)
+    return dx, dy, dcoeffs
 
 
 @jit_fuser
-def weighted_gxpr_glu_back(g, x, y, ap1, ap2, an, beta, score):
+def weighted_gxpr_glu_back(g, x, y, coeffs, score):
     input_dtype = x.dtype
     score_dtype = score.dtype
-    dx, dy, dap1, dap2, dan, dbeta = gxpr_glu_back(g * score, x, y, ap1, ap2, an, beta)
+    dx, dy, dcoeffs = gxpr_glu_back(g * score, x, y, coeffs)
     # d(out)/d(score) = gate(x)*y == the *unweighted* gxpr_glu output.
-    score_grad = gxpr_glu(x, y, ap1, ap2, an, beta) * g.to(score_dtype)
+    score_grad = gxpr_glu(x, y, coeffs) * g.to(score_dtype)
     score_grad = _sum_to_shape(score_grad, score.shape)
-    return dx.to(input_dtype), dy.to(input_dtype), dap1, dap2, dan, dbeta, score_grad.to(score_dtype)
+    return dx.to(input_dtype), dy.to(input_dtype), dcoeffs, score_grad.to(score_dtype)
 
 
 class GXPRGLUFunction(torch.autograd.Function):
@@ -118,15 +145,15 @@ class GXPRGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, x, y, ap1, ap2, an, beta):
-        ctx.save_for_backward(x, y, ap1, ap2, an, beta)
-        return gxpr_glu(x, y, ap1, ap2, an, beta)
+    def forward(ctx, x, y, coeffs):
+        ctx.save_for_backward(x, y, coeffs)
+        return gxpr_glu(x, y, coeffs)
 
     @staticmethod
     @nvtx_decorator()
     def backward(ctx, grad_output):
-        x, y, ap1, ap2, an, beta = ctx.saved_tensors
-        return gxpr_glu_back(grad_output, x, y, ap1, ap2, an, beta)
+        x, y, coeffs = ctx.saved_tensors
+        return gxpr_glu_back(grad_output, x, y, coeffs)
 
 
 class WeightedGXPRGLUFunction(torch.autograd.Function):
@@ -134,15 +161,15 @@ class WeightedGXPRGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, x, y, ap1, ap2, an, beta, score):
-        ctx.save_for_backward(x, y, ap1, ap2, an, beta, score)
-        return weighted_gxpr_glu(x, y, ap1, ap2, an, beta, score)
+    def forward(ctx, x, y, coeffs, score):
+        ctx.save_for_backward(x, y, coeffs, score)
+        return weighted_gxpr_glu(x, y, coeffs, score)
 
     @staticmethod
     @nvtx_decorator()
     def backward(ctx, grad_output):
-        x, y, ap1, ap2, an, beta, score = ctx.saved_tensors
-        return weighted_gxpr_glu_back(grad_output, x, y, ap1, ap2, an, beta, score)
+        x, y, coeffs, score = ctx.saved_tensors
+        return weighted_gxpr_glu_back(grad_output, x, y, coeffs, score)
 
 
 def fused_gxpr_glu_impl(x_glu, x_linear, alpha_p1, alpha_p2, alpha_n, beta, score=None):
@@ -152,7 +179,9 @@ def fused_gxpr_glu_impl(x_glu, x_linear, alpha_p1, alpha_p2, alpha_n, beta, scor
         x_glu, x_linear: ``(..., D)`` gate / linear halves of the fc1 output (same shape & dtype).
         alpha_p1, alpha_p2, alpha_n, beta: positive coefficients, broadcastable against the
             flattened ``(M, D)`` view -- shape ``(1,)`` (shared/dense) or ``(M, 1)`` (per-token,
-            grouped experts).
+            grouped experts). Packed into one tensor here (see module docstring) before entering
+            the compiled/autograd boundary; ordinary ``torch.cat`` autograd splits the combined
+            gradient back into the four original tensors' gradients on the way out.
         score: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
 
     Returns:
@@ -162,11 +191,12 @@ def fused_gxpr_glu_impl(x_glu, x_linear, alpha_p1, alpha_p2, alpha_n, beta, scor
     assert len(ori_shape) in (2, 3)
     x = x_glu.reshape(-1, ori_shape[-1])
     y = x_linear.reshape(-1, ori_shape[-1])
+    coeffs = torch.cat([alpha_p1, alpha_p2, alpha_n, beta], dim=-1)
 
     if score is not None:
         score = score.reshape(-1, 1)
-        out = WeightedGXPRGLUFunction.apply(x, y, alpha_p1, alpha_p2, alpha_n, beta, score)
+        out = WeightedGXPRGLUFunction.apply(x, y, coeffs, score)
     else:
-        out = GXPRGLUFunction.apply(x, y, alpha_p1, alpha_p2, alpha_n, beta)
+        out = GXPRGLUFunction.apply(x, y, coeffs)
 
     return out if len(ori_shape) == 2 else out.view(ori_shape[0], ori_shape[1], -1)
