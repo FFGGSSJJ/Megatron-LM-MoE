@@ -472,7 +472,30 @@ class GXPR(XPR):
     PolyNorm's Triton kernel. There is no tensor-parallel restriction (correct at any TP/ETP
     degree with zero collectives) and no feature-dimension cap (unlike PolyNorm's
     ``MAX_FUSED_FEATURE_DIM``, since there's no per-row register budget to bound).
+
+    ``beta_init`` defaults to ``0.1`` here (vs. :class:`XPR`/:class:`GXPRY`'s ``0.5``): a smaller
+    additive floor term makes ``gate(0)`` closer to 0, more in line with SiLU/GELU-style gates,
+    while staying safely away from the ``abs()``-gradient dead zone at exactly 0 (see
+    :class:`GXPRV2`, which removes ``beta`` -- and therefore this tradeoff -- entirely).
     """
+
+    def __init__(
+        self,
+        num_local_experts: int = 1,
+        config=None,
+        alpha_p_init: float = 0.8,
+        alpha_p2_init: float = 0.4,
+        alpha_n_init: float = 0.8,
+        beta_init: float = 0.1,
+    ):
+        super().__init__(
+            num_local_experts=num_local_experts,
+            config=config,
+            alpha_p_init=alpha_p_init,
+            alpha_p2_init=alpha_p2_init,
+            alpha_n_init=alpha_n_init,
+            beta_init=beta_init,
+        )
 
     def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
         """Return ``gate(x_glu) * x_linear * [scores]``.
