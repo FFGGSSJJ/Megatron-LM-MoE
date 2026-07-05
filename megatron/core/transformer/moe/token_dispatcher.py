@@ -993,17 +993,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
+        hidden_width = permutated_local_input_tokens.shape[-1]
         output = unpermute(
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
-            restore_shape=self.hidden_shape_before_permute,
+            restore_shape=torch.Size([self.hidden_shape_before_permute[0], hidden_width]),
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
 
         # Reshape the output tensor
-        output = output.view(self.hidden_shape)
+        output = output.view(*self.hidden_shape[:-1], hidden_width)
 
         # Add shared experts output
         if self.shared_experts is not None:

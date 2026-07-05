@@ -220,9 +220,13 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        fc1_input_size = self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size
+        if self.config.moe_asymmetric_fc1_latent_size is not None and self.config.moe_asymmetric_fc2_latent_size is not None:
+            fc1_input_size = self.config.moe_asymmetric_fc1_latent_size
+
         self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
-            self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
+            fc1_input_size,
             ffn_hidden_size,
             config=self.config,
             init_method=not_none(self.config.init_method),
@@ -250,8 +254,9 @@ class TEGroupedMLP(MegatronModule):
             )
 
         fc2_output_size = self.config.hidden_size if self.config.moe_latent_size is None else self.config.moe_latent_size
-        if self.config.moe_expert_asymmetric_latent_size is not None:
-            fc2_output_size = self.config.moe_expert_asymmetric_latent_size
+        
+        if self.config.moe_asymmetric_fc2_latent_size is not None and self.config.moe_asymmetric_fc1_latent_size is not None:
+            fc2_output_size = self.config.moe_asymmetric_fc2_latent_size
 
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,

@@ -272,54 +272,36 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
             )
 
-        if self.config.moe_asymmetric_latent_size:
-            assert not self.config.moe_latent_size, (
-                "MoE asymmetric latent projections cannot be used with MoE latent projections."
-            )
-            assert HAVE_TE, "TransformerEngine is required for MoE asymmetric latent projections."
-            linear_cls = TELinear
-
-            self.fc1_latent_proj_down_asymmetric = linear_cls(
-                self.config.hidden_size,
-                self.config.moe_asymmetric_latent_size,
-                parallel_mode="duplicated",
-                config=self.config,
-                init_method=self.config.init_method,
-                bias=self.config.add_bias_linear,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                is_expert=False,
-            )
-
-            self.fc2_latent_proj_up_asymmetric = linear_cls(
-                self.config.moe_asymmetric_latent_size,
-                self.config.hidden_size,
-                parallel_mode="duplicated",
-                config=self.config,
-                init_method=self.config.output_layer_init_method,
-                bias=self.config.add_bias_linear,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                is_expert=False,
-            )
-
-        if self.config.moe_expert_asymmetric_latent_size:
+        if self.config.moe_asymmetric_fc1_latent_size and self.config.moe_asymmetric_fc2_latent_size:
             assert self.config.moe_latent_size is None
-            assert self.config.moe_asymmetric_latent_size is None
-            assert HAVE_TE, "TransformerEngine is required for MoE expert asymmetric latent projections."
+            assert HAVE_TE, "TransformerEngine is required for MoE asymmetric fc1/fc2 latent projections."
             linear_cls = TELinear
 
-            self.fc2_latent_proj_up_expert_asymmetric = linear_cls(
-                self.config.moe_expert_asymmetric_latent_size,
-                self.config.hidden_size,
-                parallel_mode="duplicated",
-                config=self.config,
-                init_method=self.config.output_layer_init_method,
-                bias=self.config.add_bias_linear,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                is_expert=False,
-            )
+            if self.config.moe_asymmetric_fc1_latent_size != self.config.hidden_size:
+                self.fc1_latent_proj_down_asymmetric = linear_cls(
+                    self.config.hidden_size,
+                    self.config.moe_asymmetric_fc1_latent_size,
+                    parallel_mode="duplicated",
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    bias=self.config.add_bias_linear,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    is_expert=False,
+                )
+
+            if self.config.moe_asymmetric_fc2_latent_size != self.config.hidden_size:
+                self.fc2_latent_proj_up_asymmetric = linear_cls(
+                    self.config.moe_asymmetric_fc2_latent_size,
+                    self.config.hidden_size,
+                    parallel_mode="duplicated",
+                    config=self.config,
+                    init_method=self.config.output_layer_init_method,
+                    bias=self.config.add_bias_linear,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    is_expert=False,
+                )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -472,6 +454,13 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
+        if self.config.moe_asymmetric_fc1_latent_size and \
+            self.config.moe_asymmetric_fc1_latent_size != self.config.hidden_size:
+            assert (
+                not self.shared_expert_overlap
+            ), "Shared expert overlap not supported when MoE asymmetric fc1/fc2 latent projections are used."
+            hidden_states, _ = self.fc1_latent_proj_down_asymmetric(hidden_states)
+        
         hidden_states, hidden_states_sf, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -545,9 +534,6 @@ class MoELayer(BaseMoELayer):
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
-        if self.config.moe_asymmetric_latent_size:
-            output, _ = self.fc1_latent_proj_down_asymmetric(output)
-
         return output, mlp_bias
 
     def combine(self, output: torch.Tensor):
@@ -557,10 +543,6 @@ class MoELayer(BaseMoELayer):
         experts (e.g., via an All-to-All communication).
         """
         output = self.token_dispatcher.token_combine(output)
-        if self.config.moe_asymmetric_latent_size:
-            output, _ = self.fc2_latent_proj_up_asymmetric(output)
-        if self.config.moe_expert_asymmetric_latent_size:
-            output, _ = self.fc2_latent_proj_up_expert_asymmetric(output)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
@@ -570,6 +552,9 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
+        if self.config.moe_asymmetric_fc2_latent_size and \
+            self.config.moe_asymmetric_fc2_latent_size != self.config.hidden_size:
+            output, _ = self.fc2_latent_proj_up_asymmetric(output)
 
         if shared_expert_output is not None:
             output = output + shared_expert_output

@@ -912,15 +912,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
-    moe_asymmetric_latent_size: Optional[int] = None
-    """Latent dimension for MoE combine communication. If set, routed expert outputs are
-    projected from hidden_size to moe_asymmetric_latent_size before combine and projected back
-    to hidden_size after combine."""
+    moe_asymmetric_fc1_latent_size: Optional[int] = None
+    
+    moe_asymmetric_fc2_latent_size: Optional[int] = None
 
-    moe_expert_asymmetric_latent_size: Optional[int] = None
-    """Latent dimension for MoE expert computation. If set, expert inputs are projected from
-    hidden_size to moe_expert_asymmetric_latent_size before expert computation and projected back
-    to hidden_size after expert computation."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
