@@ -1086,7 +1086,7 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        if args.swiglu or args.pnglu or args.gxpr or args.gxpry or args.gxr2 or args.pn3glu:
+        if args.swiglu or args.pnglu or args.gxpr or args.gxpry or args.gxr2 or args.xr2glu or args.pn3glu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -1746,6 +1746,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'gxpry': args.gxpry,
         'xr2': args.xr2,
         'gxr2': args.gxr2,
+        'xr2glu': args.xr2glu,
         'polynorm': args.polynorm,
     }
     _all_activation_flags = dict(_other_new_activation_flags)
@@ -1778,6 +1779,10 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.xr2:
         kw_args['bias_activation_fusion'] = False
     if args.gxr2:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xr2glu:
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
@@ -2120,6 +2125,7 @@ def _add_network_size_args(parser):
         "gxpry",
         "xr2",
         "gxr2",
+        "xr2glu",
         "pn3glu",
         "polynorm",
         "sandwich_norm",
@@ -2234,6 +2240,12 @@ def _add_network_size_args(parser):
                        'gate(x_glu) * x_linear, where gate(x) = |ap1|*x + |b| for x>0, and '
                        '(|b|+|an|)*softsign(x) + |b| for x<=0 (== XR2(x)/x). Implies gated '
                        'linear units. Each MoE expert gets its own coefficients.')
+    group.add_argument('--xr2glu', action='store_true',
+                       help='Use XR2GLU: XR2 used directly as a GLU gate (unlike --gxr2, no '
+                       'divide-by-x trick): gate(x_glu) * x_linear, where gate(x) = XR2(x) = '
+                       '|ap1|*x^2 + |b|*x for x>0, and (|b|+|an|)*x*softsign(x) + |b|*x for '
+                       'x<=0. Implies gated linear units. Each MoE expert gets its own '
+                       'coefficients.')
     group.add_argument('--pn3glu', action='store_true',
                        help='Use PN3GLU, --pnglu with an added x^3 term: gate(x) = |a1|*'
                        'RMSNorm(x) + |a2|*RMSNorm(x^2) + |a3|*RMSNorm(x^3). Implies gated '

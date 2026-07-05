@@ -673,6 +673,41 @@ class GXR2(XR2):
         return out
 
 
+class XR2GLU(XR2):
+    """Learnable GLU gate where the gate function is :class:`XR2` itself -- not divided by
+    ``x`` (unlike :class:`GXR2`) -- the direct analogue of plugging XR2 in as a GLU's gate the
+    way SiLU is for SwiGLU::
+
+        XR2GLU(x, y) = XR2(x) * y
+                     = (|alpha_p1|*x**2 + |beta|*x) * y                          (x > 0)
+                     = ((|beta|+|alpha_n|)*x*softsign(x) + |beta|*x) * y         (x <= 0)
+
+    Unlike GXR2 (algebraically ``XR2(x) / x``, built specifically to avoid a ``0/0`` at
+    ``x == 0``), there is no division here and therefore nothing to simplify -- this directly
+    reuses :func:`compiled_xr2` (XR2's own activation) as the gate. Shares :class:`XR2`'s
+    per-(local-)expert coefficients and ``tokens_per_expert`` expansion. No fused kernel yet;
+    always runs the (torch.compile-fused) eager implementation.
+    """
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``XR2(x_glu) * x_linear * [scores]``.
+
+        Args:
+            x_glu: GLU gate half, ``(..., D)`` (``D`` = local ffn feature dim).
+            x_linear: GLU linear half, same shape/dtype as ``x_glu``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+            scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
+        """
+        alpha_p1, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
+        gate = compiled_xr2(x_glu, alpha_p1, alpha_n, beta)
+        out = gate * x_linear
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
 @jit_fuser
 def squared_relu(x: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation"""

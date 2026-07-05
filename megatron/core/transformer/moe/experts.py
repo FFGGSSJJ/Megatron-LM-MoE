@@ -22,6 +22,7 @@ from megatron.core.activations import (
     PolyNormAct,
     XPR,
     XR2,
+    XR2GLU,
     squared_relu,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -278,6 +279,8 @@ class TEGroupedMLP(MegatronModule):
             self.xr2_act = XR2(num_local_experts=self.num_local_experts, config=self.config)
         if self.config.gxr2:
             self.gxr2_glu = GXR2(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.xr2glu:
+            self.xr2glu = XR2GLU(num_local_experts=self.num_local_experts, config=self.config)
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=self.num_local_experts,
@@ -385,8 +388,8 @@ class TEGroupedMLP(MegatronModule):
         ``tokens_per_expert`` (the per-local-expert token counts of ``intermediate_parallel``)
         is only used when one of the learnable per-expert activations (``config.pnglu``,
         ``config.pn3glu``, ``config.xpr``, ``config.gxpr``, ``config.gxpry``, ``config.xr2``,
-        ``config.gxr2``, ``config.polynorm``) is set, to map each expert's coefficients onto its
-        tokens.
+        ``config.gxr2``, ``config.xr2glu``, ``config.polynorm``) is set, to map each expert's
+        coefficients onto its tokens.
         """
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
@@ -469,6 +472,17 @@ class TEGroupedMLP(MegatronModule):
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
+            elif self.config.gated_linear_unit and self.config.xr2glu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.xr2glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
             elif self.config.gated_linear_unit:
 
                 def glu(x):
@@ -534,6 +548,7 @@ class TEGroupedMLP(MegatronModule):
                 or self.config.gxpry
                 or self.config.xr2
                 or self.config.gxr2
+                or self.config.xr2glu
                 or self.config.polynorm
             ):
                 # These all have the same per-expert-coefficient repeat_interleave gradient
@@ -621,9 +636,9 @@ class TEGroupedMLP(MegatronModule):
             module_sharded_offsets = sharded_offsets
             if name in (
                 'polynorm_glu', 'xpr_act', 'gxpr_glu', 'gxpry_glu', 'xr2_act', 'gxr2_glu',
-                'polynorm_act',
+                'xr2glu', 'polynorm_act',
             ) and not singleton_local_shards:
-                # The PolyNorm/XPR/GXPR/XR2/GXR2/PolyNormAct coefficients are stored as a single
+                # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/PolyNormAct coefficients are stored as a single
                 # (num_local_experts,) tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
                 # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
                 # mirroring how the expert weights are mapped to global experts. Without this,
