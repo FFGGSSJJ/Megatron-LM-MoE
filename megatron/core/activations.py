@@ -8,6 +8,7 @@ from megatron.core.fusions.fused_polynorm_glu import (
     HAVE_TRITON as HAVE_FUSED_PNGLU,
     fused_polynorm_glu_impl,
 )
+from megatron.core.fusions.fused_gxpr_glu import fused_gxpr_glu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 
@@ -393,8 +394,14 @@ class XPR(MegatronModule):
         self.alpha_n = nn.Parameter(torch.full((num_local_experts,), alpha_n_init - beta_init))
         self.beta = nn.Parameter(torch.full((num_local_experts,), beta_init))
 
-    def _coeffs(self, x, tokens_per_expert):
-        """Return ``(alpha_p1, alpha_p2, alpha_n, beta)``, positive and expanded per-token."""
+    def _raw_coeffs(self, x, tokens_per_expert):
+        """Return ``(alpha_p1, alpha_p2, alpha_n, beta)``, positive, NOT yet broadcast-shaped.
+
+        Shape is ``(num_local_experts,)`` in the dense/shared case (numel 1) or ``(num_tokens,)``
+        in the grouped case -- not yet unsqueezed to ``(num_tokens, 1)``. :meth:`_broadcast_coeffs`
+        produces that shape for the eager torch path; a fused Triton kernel (see
+        :class:`GXPR`) indexes coefficients by row and wants this flat shape directly.
+        """
         alpha_p1 = torch.abs(self.alpha_p1)  # (num_local_experts,)
         alpha_p2 = torch.abs(self.alpha_p2)
         beta = torch.abs(self.beta)
@@ -409,15 +416,27 @@ class XPR(MegatronModule):
                 )
             return alpha_p1, alpha_p2, alpha_n, beta
 
-        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens, 1).
+        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens,).
         if isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
         tpe_tensor = torch.tensor(tokens_per_expert, device=x.device)
+        return (
+            torch.repeat_interleave(alpha_p1, tpe_tensor),
+            torch.repeat_interleave(alpha_p2, tpe_tensor),
+            torch.repeat_interleave(alpha_n, tpe_tensor),
+            torch.repeat_interleave(beta, tpe_tensor),
+        )
 
-        def expand(a):
-            return torch.repeat_interleave(a, tpe_tensor).unsqueeze(-1)
-
-        return expand(alpha_p1), expand(alpha_p2), expand(alpha_n), expand(beta)
+    def _broadcast_coeffs(self, alpha_p1, alpha_p2, alpha_n, beta):
+        """Unsqueeze per-token coefficients to ``(num_tokens, 1)`` for the eager torch path."""
+        if self.num_local_experts == 1:
+            return alpha_p1, alpha_p2, alpha_n, beta
+        return (
+            alpha_p1.unsqueeze(-1),
+            alpha_p2.unsqueeze(-1),
+            alpha_n.unsqueeze(-1),
+            beta.unsqueeze(-1),
+        )
 
     def forward(self, x, tokens_per_expert=None):
         """Return ``XPR(x)``.
@@ -427,7 +446,9 @@ class XPR(MegatronModule):
             tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
                 per-expert coefficients onto the concatenated tokens.
         """
-        alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x, tokens_per_expert)
+        alpha_p1, alpha_p2, alpha_n, beta = self._broadcast_coeffs(
+            *self._raw_coeffs(x, tokens_per_expert)
+        )
         return compiled_xpr(x, alpha_p1, alpha_p2, alpha_n, beta)
 
 
@@ -442,6 +463,15 @@ class GXPR(XPR):
     ``forward`` takes *both* GLU halves and returns ``gate(x_glu) * x_linear * [scores]``, same
     calling convention as :class:`PolyNorm`. Shares :class:`XPR`'s per-(local-)expert
     coefficients and ``tokens_per_expert`` expansion.
+
+    Unlike PolyNorm, this gate has **no cross-feature reduction** (each output element only
+    depends on the corresponding elements of ``x_glu``/``x_linear``), exactly like SwiGLU. Its
+    fused path (see ``megatron.core.fusions.fused_gxpr_glu``) is therefore built the same way
+    SwiGLU's own fusion is in this codebase -- ``@jit_fuser`` (torch.compile)-fused elementwise
+    math plus a hand-derived analytic backward, not a hand Triton kernel -- rather than mirroring
+    PolyNorm's Triton kernel. There is no tensor-parallel restriction (correct at any TP/ETP
+    degree with zero collectives) and no feature-dimension cap (unlike PolyNorm's
+    ``MAX_FUSED_FEATURE_DIM``, since there's no per-row register budget to bound).
     """
 
     def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
@@ -454,7 +484,14 @@ class GXPR(XPR):
                 per-expert coefficients onto the concatenated tokens.
             scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
         """
-        alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
+        alpha_p1, alpha_p2, alpha_n, beta = self._broadcast_coeffs(
+            *self._raw_coeffs(x_glu, tokens_per_expert)
+        )
+
+        use_fused = x_glu.is_cuda and (self.config is None or getattr(self.config, "gxpr_fusion", True))
+        if use_fused:
+            return fused_gxpr_glu_impl(x_glu, x_linear, alpha_p1, alpha_p2, alpha_n, beta, scores)
+
         gate = compiled_xpr_gate(x_glu, alpha_p1, alpha_p2, alpha_n, beta)
         out = gate * x_linear
         if scores is not None:
@@ -507,7 +544,9 @@ class GXPRY(XPR):
                 per-expert coefficients onto the concatenated tokens.
             scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
         """
-        alpha_p1, alpha_p2, alpha_n, beta = self._coeffs(x_glu, tokens_per_expert)
+        alpha_p1, alpha_p2, alpha_n, beta = self._broadcast_coeffs(
+            *self._raw_coeffs(x_glu, tokens_per_expert)
+        )
         gate = compiled_gxpry_gate(x_glu, x_linear, alpha_p1, alpha_p2, alpha_n, beta)
         out = gate * x_linear
         if scores is not None:

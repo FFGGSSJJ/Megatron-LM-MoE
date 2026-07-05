@@ -233,9 +233,21 @@ class TransformerConfig(ModelParallelConfig):
     counterpart of ``xpr``): ``GXPR(x_glu) * x_linear`` where
     ``gate(x) = |ap2|*x**2 + |ap1|*x + |b|`` for ``x>0`` and
     ``gate(x) = (|b|+|an|)*softsign(x) + |b|`` for ``x<=0``. Requires ``gated_linear_unit=True``.
-    Each (local) expert in an MoE layer gets its own coefficients. No fused kernel yet (always
-    runs eager/torch.compile). Not compatible with ``bias_activation_fusion``,
+    Each (local) expert in an MoE layer gets its own coefficients. Has a fused kernel (see
+    ``gxpr_fusion``), built the same way as SwiGLU's own fusion in this codebase (``@jit_fuser``
+    torch.compile, not a hand Triton kernel), since -- unlike PolyNorm -- this gate has no
+    cross-feature reduction. Not compatible with ``bias_activation_fusion``,
     ``use_te_activation_func``, or the offloading-experts path."""
+
+    gxpr_fusion: bool = True
+    """If True (default), use the fused kernel for GXPR (``gxpr=True``) -- it fuses the gate, the
+    ``* x_linear`` and the optional ``* score`` (MoE probs / per-token scale) multiplies into one
+    ``@jit_fuser``-compiled pass with a hand-derived analytic backward, the same fusion mechanism
+    used by SwiGLU's own fusion (``fused_bias_swiglu.py``) elsewhere in this codebase. Unlike
+    PolyNorm GLU's fused kernel, GXPR's gate has no cross-feature reduction, so this needs no
+    TP/ETP restriction (correct, with zero collectives, at any TP/ETP degree) and no
+    feature-dimension cap. The fused path is used only on CUDA; set False to force the plain torch
+    path (e.g. for debugging or bitwise comparison)."""
 
     gxpry: bool = False
     """If True, replace the gate of a gated linear unit with the learnable GXPRY gate: like

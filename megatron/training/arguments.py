@@ -2116,6 +2116,7 @@ def _add_network_size_args(parser):
         "pnglu_fusion",
         "xpr",
         "gxpr",
+        "gxpr_fusion",
         "gxpry",
         "xr2",
         "gxr2",
@@ -2214,6 +2215,11 @@ def _add_network_size_args(parser):
                        'gate(x_glu) * x_linear, where gate(x) = |ap2|*x^2 + |ap1|*x + |b| for '
                        'x>0, and (|b|+|an|)*softsign(x) + |b| for x<=0 (== XPR(x)/x). Implies '
                        'gated linear units. Each MoE expert gets its own coefficients.')
+    group.add_argument('--no-gxpr-fusion', action='store_false', dest='gxpr_fusion',
+                       help='Disable the fused kernel for --gxpr (built like the SwiGLU fusion '
+                       'via @jit_fuser/torch.compile) and use the plain torch implementation '
+                       'instead (e.g. for debugging). The fused path is on by default and only '
+                       'engages on CUDA.')
     group.add_argument('--gxpry', action='store_true',
                        help='Use GXPRY: like --gxpr (gate(x_glu) * x_linear with the same '
                        'polynomial/softsign pieces) but the piecewise branch is selected by the '
