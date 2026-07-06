@@ -33,6 +33,7 @@ from megatron.core.activations import (
     XPR,
     XR2,
     XR2GLU,
+    XSSSGLU,
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
@@ -269,6 +270,8 @@ class MLP(MegatronModule):
             self.gxr2_glu = GXR2(num_local_experts=1, config=self.config)
         if self.config.xr2glu:
             self.xr2glu = XR2GLU(num_local_experts=1, config=self.config)
+        if self.config.xsssglu:
+            self.xsssglu_glu = XSSSGLU(num_local_experts=1, config=self.config)
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
@@ -415,6 +418,16 @@ class MLP(MegatronModule):
                     x_linear = x_linear + self.config.glu_linear_offset
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.xr2glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.xsssglu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.xsssglu_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit:
 

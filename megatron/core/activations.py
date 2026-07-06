@@ -827,6 +827,74 @@ class XR2GLU(XR2):
 
 
 @jit_fuser
+def compiled_xsssglu(x, y, alpha):
+    """XSSSGLU gate: ``(|alpha| * softsign(x) + 0.5) * x * y``.
+
+    Softsign already smoothly interpolates between the negative- and positive-``x`` regimes
+    (unlike the rest of the XPR/XR2 family, which needs an explicit ``torch.where`` piecewise
+    split), so this is a single formula with no branch.
+    """
+    return (alpha * F.softsign(x) + 0.5) * x * y
+
+
+class XSSSGLU(MegatronModule):
+    """Learnable GLU gate built from a softsign-scaled linear term -- no polynomial term and no
+    piecewise positive/negative branching (softsign already handles both signs smoothly)::
+
+        gate(x) = |alpha| * softsign(x) + 0.5
+        XSSSGLU(x, y) = gate(x) * x * y
+
+    At ``alpha == 0`` this degenerates to a fixed ``0.5 * x * y`` (a plain linear GLU with a
+    constant 0.5 gate); growing ``|alpha|`` pushes ``gate(x)`` toward a soft step between
+    ``0.5 - |alpha|`` and ``0.5 + |alpha|`` -- a differentiable, learnable-slope relative of a
+    ReLU-ish gate, structurally analogous to SiLU's ``sigmoid(x) * x`` but built from
+    ``softsign`` instead of ``sigmoid``. Each (local) expert gets its own coefficient. No fused
+    kernel yet; always runs the (torch.compile-fused) eager implementation.
+    """
+
+    def __init__(self, num_local_experts: int = 1, config=None, alpha_init: float = 0.8):
+        super().__init__(config=config)
+        self.num_local_experts = num_local_experts
+        self.alpha = nn.Parameter(torch.full((num_local_experts,), alpha_init - 0.5))
+
+    def _coeffs(self, x, tokens_per_expert):
+        """Return ``alpha``, positive and expanded per-token."""
+        alpha = 0.5 + torch.abs(self.alpha)  # (num_local_experts,)
+
+        if self.num_local_experts == 1 or tokens_per_expert is None:
+            if self.num_local_experts > 1:
+                raise ValueError(
+                    f"{type(self).__name__} with num_local_experts > 1 requires "
+                    "`tokens_per_expert` so the per-expert coefficients can be mapped onto the "
+                    "concatenated tokens."
+                )
+            return alpha
+
+        # Expand per-expert coefficients to per-token coefficients: shape (num_tokens, 1).
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+        tpe_tensor = torch.tensor(tokens_per_expert, device=x.device)
+        return torch.repeat_interleave(alpha, tpe_tensor).unsqueeze(-1)
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``(|alpha| * softsign(x_glu) + 0.5) * x_glu * x_linear * [scores]``.
+
+        Args:
+            x_glu: GLU gate half, ``(..., D)`` (``D`` = local ffn feature dim).
+            x_linear: GLU linear half, same shape/dtype as ``x_glu``.
+            tokens_per_expert: per-local-expert token counts (grouped experts only); maps the
+                per-expert coefficients onto the concatenated tokens.
+            scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
+        """
+        alpha = self._coeffs(x_glu, tokens_per_expert)
+        out = compiled_xsssglu(x_glu, x_linear, alpha)
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
+@jit_fuser
 def squared_relu(x: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation"""
     return torch.pow(F.relu(x), 2)

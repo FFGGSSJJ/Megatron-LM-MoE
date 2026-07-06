@@ -1088,7 +1088,7 @@ def validate_args(args, defaults={}):
     if args.ffn_hidden_size is None:
         if (
             args.swiglu or args.pnglu or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2
-            or args.xr2glu or args.pn3glu
+            or args.xr2glu or args.xsssglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1751,6 +1751,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'xr2': args.xr2,
         'gxr2': args.gxr2,
         'xr2glu': args.xr2glu,
+        'xsssglu': args.xsssglu,
         'polynorm': args.polynorm,
     }
     _all_activation_flags = dict(_other_new_activation_flags)
@@ -1791,6 +1792,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
     if args.xr2glu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xsssglu:
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
@@ -2135,6 +2140,7 @@ def _add_network_size_args(parser):
         "xr2",
         "gxr2",
         "xr2glu",
+        "xsssglu",
         "pn3glu",
         "polynorm",
         "sandwich_norm",
@@ -2262,6 +2268,11 @@ def _add_network_size_args(parser):
                        '|ap1|*x^2 + |b|*x for x>0, and (|b|+|an|)*x*softsign(x) + |b|*x for '
                        'x<=0. Implies gated linear units. Each MoE expert gets its own '
                        'coefficients.')
+    group.add_argument('--xsssglu', action='store_true',
+                       help='Use XSSSGLU: gate(x_glu) * x_linear, where gate(x) = '
+                       '|alpha|*softsign(x) + 0.5. No piecewise branch (softsign already '
+                       'interpolates smoothly across x=0) and only one learnable coefficient. '
+                       'Implies gated linear units. Each MoE expert gets its own coefficient.')
     group.add_argument('--pn3glu', action='store_true',
                        help='Use PN3GLU, --pnglu with an added x^3 term: gate(x) = |a1|*'
                        'RMSNorm(x) + |a2|*RMSNorm(x^2) + |a3|*RMSNorm(x^3). Implies gated '

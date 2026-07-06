@@ -292,6 +292,16 @@ class TransformerConfig(ModelParallelConfig):
     yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
     offloading-experts path."""
 
+    xsssglu: bool = False
+    """If True, replace the gate of a gated linear unit with the learnable XSSSGLU gate:
+    ``XSSSGLU(x_glu, x_linear) = (|alpha|*softsign(x_glu) + 0.5) * x_glu * x_linear``. Unlike
+    the XPR/XR2 family, this has no piecewise branch (softsign already interpolates smoothly
+    across x==0) and no separate positive/negative coefficients -- a single learnable scalar
+    ``alpha`` scales how far the softsign term pushes the gate away from a flat 0.5. Requires
+    ``gated_linear_unit=True``. Each (local) expert gets its own coefficient. No fused kernel
+    yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
     pn3glu: bool = False
     """If True, replace the gate of a gated linear unit with a learnable 3rd-order PolyNorm GLU
     (``pnglu`` with an added ``x**3`` term): ``PolyNorm(x_glu) * x_linear`` where
@@ -1466,6 +1476,7 @@ class TransformerConfig(ModelParallelConfig):
             'xr2': self.xr2,
             'gxr2': self.gxr2,
             'xr2glu': self.xr2glu,
+            'xsssglu': self.xsssglu,
             'pn3glu': self.pn3glu,
             'polynorm': self.polynorm,
         }
@@ -1477,7 +1488,9 @@ class TransformerConfig(ModelParallelConfig):
             )
         if _active_new_activations:
             _active_name = _active_new_activations[0]
-            _is_gated = _active_name in ('gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'pn3glu')
+            _is_gated = _active_name in (
+                'gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'xsssglu', 'pn3glu',
+            )
             if _is_gated and not self.gated_linear_unit:
                 raise ValueError(
                     f"{_active_name}=True requires gated_linear_unit=True (it replaces the GLU "
