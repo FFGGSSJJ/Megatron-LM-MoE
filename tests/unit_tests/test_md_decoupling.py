@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.md_decoupling import MDDecoupling
+from megatron.core.optimizer.md_decoupling import _get_muon_scale_factor
 from megatron.core.optimizer.md_decoupling import _split_qkv
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -43,8 +44,8 @@ def _record_md_split_output(param, grad, **md_kwargs):
     )
     calls = []
 
-    def record_split(split_grad, tp_group, partition_dim, flat_mode=False):
-        del tp_group, partition_dim, flat_mode
+    def record_split(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
+        del tp_group, partition_dim, flat_mode, is_router
         calls.append(split_grad.detach().clone())
         return torch.full_like(split_grad, float(len(calls)))
 
@@ -137,6 +138,40 @@ def test_md_decoupling_recipe_defaults():
     assert config.hypersphere_gains_mode_router == "rowcol"
     assert config.use_orthogonal_updates is True
     assert config.gain_parametrization == "softplus"
+    assert config.muon_router_scale_mode == "none"
+
+
+def test_md_decoupling_router_scale_mode_resolution():
+    # Default: routers get "none" (constant 1.0) while matrices follow scale_mode. A router of
+    # shape (num_experts, hidden) is non-square, so shape_up would give >1; "none" pins it to 1.
+    optimizer = MDDecoupling(
+        params=[torch.nn.Parameter(torch.ones(2, 2))],
+        lr=0.01,
+        scale_mode="shape_up",
+        pg_collection=None,
+    )
+    assert optimizer.router_scale_mode == "none"
+    assert optimizer._resolve_scale_mode(is_router=True) == "none"
+    assert optimizer._resolve_scale_mode(is_router=False) == "shape_up"
+    # The resolved router mode yields a constant 1.0 regardless of the router's aspect ratio,
+    # so the update is width-invariant (num_experts=128 fixed while hidden scales).
+    for hidden in (128, 768, 1536):
+        assert _get_muon_scale_factor(
+            128, hidden, mode=optimizer._resolve_scale_mode(is_router=True)
+        ) == 1.0
+    # shape_up on a router WOULD track width — this is the behavior being excluded.
+    assert _get_muon_scale_factor(128, 768, mode="shape_up") > 1.0
+
+    # Override: routers can be made to follow a mode explicitly.
+    overridden = MDDecoupling(
+        params=[torch.nn.Parameter(torch.ones(2, 2))],
+        lr=0.01,
+        scale_mode="shape_up",
+        router_scale_mode="spectral",
+        pg_collection=None,
+    )
+    assert overridden._resolve_scale_mode(is_router=True) == "spectral"
+    assert overridden._resolve_scale_mode(is_router=False) == "shape_up"
 
 
 def test_md_decoupling_router_gains_mode_override():

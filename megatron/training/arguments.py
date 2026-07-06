@@ -2347,6 +2347,13 @@ def _add_regularization_args(parser):
                        help='Scale mode for Muon optimizer. With MuP, set '
                        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling.')
+    group.add_argument('--muon-router-scale-mode', type=str, default='none',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'shape_up', 'none'],
+                       help='Muon scale mode for MoE router weights under md_decoupling, '
+                       'overriding --muon-scale-mode for routers only. Defaults to "none" '
+                       '(constant 1.0): the router maps hidden->num_experts, so a shape-derived '
+                       'scale (e.g. shape_up) varies with hidden and breaks LR transfer across '
+                       'width. Set a mode name to make routers follow that scale instead.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
