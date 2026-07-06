@@ -148,6 +148,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+    def _split_partition_dim(self, p, partition_dim):
+        """Return the TP partition dimension that still applies after splitting."""
+        if (
+            self.split_mla_per_head
+            and self.is_q_up_proj_fn is not None
+            and self.is_q_up_proj_fn(p)
+        ):
+            return None
+        return partition_dim
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -286,8 +296,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             assert self.q_up_proj_head_dim is not None
             num_heads = grad_shape[0] // self.q_up_proj_head_dim
             q_grads = grad.view(num_heads, self.q_up_proj_head_dim, -1).unbind(0)
+            split_partition_dim = self._split_partition_dim(p, partition_dim)
             q_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in q_grads
+                self.scaled_orthogonalize_fn(g, tp_group, split_partition_dim) for g in q_grads
             ]
             grad = torch.stack(q_grads, dim=0).view(grad_shape)
         else:

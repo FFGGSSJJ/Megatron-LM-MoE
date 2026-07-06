@@ -731,6 +731,37 @@ def test_muon_optimizer_mla_q_up_proj_split_per_head():
     assert torch.equal(output, expected.expand_as(output))
 
 
+def test_muon_optimizer_mla_q_up_proj_per_head_ignores_head_partition_dim():
+    param = torch.nn.Parameter(torch.empty(12, 4, device='cuda'))
+    param.is_q_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(48, dtype=torch.float32, device='cuda').view(12, 4)
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        num_ns_steps=5,
+        is_q_up_proj_fn=lambda p: getattr(p, 'is_q_up_proj', False),
+        q_up_proj_head_dim=4,
+        split_mla_per_head=True,
+        pg_collection=None,
+        mode="distributed",
+    )
+    partition_dims = []
+
+    def record_partition_dim(split_grad, tp_group, partition_dim):
+        del tp_group
+        partition_dims.append(partition_dim)
+        return torch.full_like(split_grad, float(len(partition_dims)))
+
+    optimizer.scaled_orthogonalize_fn = record_partition_dim
+    output = optimizer.orthogonalize(param, grad)
+
+    assert partition_dims == [None, None, None]
+    expected = torch.tensor([1] * 4 + [2] * 4 + [3] * 4, device='cuda').view(12, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+
 def test_muon_optimizer_mla_qkv_down_proj_split_mechanics():
     param = torch.nn.Parameter(torch.empty(5, 4, device='cuda'))
     param.is_qkv_down_proj = True
