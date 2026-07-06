@@ -16,6 +16,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
+from ..fusions.fused_bias_sssglu import sssilu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
     get_te_version,
@@ -2006,10 +2007,10 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.bias_activation_fusion:
-            if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
+            if self.activation_func not in [F.gelu, F.silu, quick_gelu, sssilu]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
-                    "gelu, swiglu, or quick_geglu"
+                    "gelu, swiglu, quick_geglu, or sssglu"
                 )
             if (
                 self.activation_func == F.gelu
@@ -2053,8 +2054,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_fp8_input_store:
-            if self.activation_func != F.silu or not self.gated_linear_unit:
-                raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
+            if self.activation_func not in (F.silu, sssilu) or not self.gated_linear_unit:
+                raise ValueError(
+                    "Storing activation input in FP8 is supported only for SwiGLU and SSSGLU."
+                )
 
         if self.apply_rope_fusion:
             if self.multi_latent_attention:

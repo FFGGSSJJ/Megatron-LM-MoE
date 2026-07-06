@@ -36,6 +36,11 @@ from megatron.core.activations import (
     XSSSGLU,
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+from megatron.core.fusions.fused_bias_sssglu import (
+    bias_sssglu_impl,
+    sssilu,
+    weighted_bias_sssglu_impl,
+)
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -320,6 +325,14 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
+                elif self.activation_func == sssilu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_sssglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
                         intermediate_parallel,
@@ -331,7 +344,8 @@ class MLP(MegatronModule):
                     )
                 else:
                     raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
+                        "Only support fusion of swiglu, sssglu and quick_gelu with "
+                        "per_token_scale in MLP."
                     )
             else:
                 if self.activation_func == F.gelu:
@@ -351,8 +365,17 @@ class MLP(MegatronModule):
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
                     )
+                elif self.activation_func == sssilu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_sssglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
                 else:
-                    raise ValueError("Only support fusion of gelu and swiglu")
+                    raise ValueError("Only support fusion of gelu, swiglu and sssglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
