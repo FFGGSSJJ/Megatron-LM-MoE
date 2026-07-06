@@ -1868,6 +1868,12 @@ def _add_transformer_engine_args(parser):
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
 
+    group.add_argument('--activation-func-fp8-input-store', action='store_true',
+                       help='Store the fused GLU activation input (the fc1 output) in FP8 '
+                       '(e4m3, direct unscaled cast) for the backward pass, halving that '
+                       'saved-activation memory. Only supported for SwiGLU (--swiglu) and '
+                       'SSSGLU (--sssglu) via their fused kernels.')
+
     # FP4 related arguments
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
@@ -2102,7 +2108,6 @@ def _add_network_size_args(parser):
         "softmax_scale",
         "gated_linear_unit",
         "bias_activation_fusion",
-        "activation_func_fp8_input_store",
         "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
@@ -2140,6 +2145,7 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         # defined explicitly as CLI arguments below
+        "activation_func_fp8_input_store",
         "pnglu",
         "pnglu_fusion",
         "xpr",
