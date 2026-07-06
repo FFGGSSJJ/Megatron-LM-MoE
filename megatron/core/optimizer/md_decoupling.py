@@ -354,6 +354,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             )
         return None
 
+    def _split_partition_dim(self, p, partition_dim):
+        """Return the TP partition dimension that still applies after splitting."""
+        if self.split_mla_per_head and self.is_q_up_proj_fn(p):
+            return None
+        return partition_dim
+
     def _local_dim0_split_shapes(self, p, x, shapes, allow_groups: bool):
         shapes = tuple(shapes)
         total = sum(shapes)
@@ -418,8 +424,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         split = self._split_param_tensor(p, grad, is_qkv)
         if split is not None:
             parts, merge = split
+            split_partition_dim = self._split_partition_dim(p, partition_dim)
             parts = [
-                self._orthogonalize_tensor(g, tp_group, partition_dim, flat_mode)
+                self._orthogonalize_tensor(g, tp_group, split_partition_dim, flat_mode)
                 for g in parts
             ]
             return merge(parts)
@@ -435,6 +442,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         assert grad.ndim == 2
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
+            # Use the global matrix shape for Muon scaling.
             size[partition_dim] *= get_pg_size(tp_group)
         orth = newton_schulz_tp(
             grad,
@@ -548,9 +556,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         split = self._split_param_tensor(p, x, is_qkv)
         if split is not None:
             parts, merge = split
+            split_partition_dim = self._split_partition_dim(p, partition_dim)
             for part in parts:
                 self._normalize_single(
-                    part, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp
+                    part, is_out_proj, mode, radius_scale, split_partition_dim, is_expert_tp
                 )
             x.copy_(merge(parts))
             return
