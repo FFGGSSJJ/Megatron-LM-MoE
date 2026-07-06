@@ -269,9 +269,10 @@ class TransformerConfig(ModelParallelConfig):
     `x = LN_post(alpha * x + Sublayer(LN_pre(x)))`, i.e. the residual ("highway") branch is scaled
     by `alpha` (see `keel_alpha`) and the *summed* output is normalized (Post-LN), while the
     sub-layer input is still pre-normalized (`LN_pre`, reusing the existing input/pre-mlp norms).
-    The very first attention and MLP sub-layers drop both `alpha` and the Post-LN, degrading to
-    plain Pre-LN to keep signal from the embedding well-conditioned. Requires RMSNorm and is
-    mutually exclusive with `sandwich_norm`."""
+    For decoder layer 1, `alpha` is dropped on both sub-layers, and the Post-LN is dropped on the
+    first *attention* sub-layer only: the first attention degrades to plain Pre-LN while the first
+    MLP keeps its Post-LN (a standard Post-LN block), keeping signal from the embedding
+    well-conditioned. Requires RMSNorm and is mutually exclusive with `sandwich_norm`."""
 
     keel_alpha: Optional[float] = None
     """Highway residual-scaling factor for KEEL. When None (default), `alpha` is set to the total
