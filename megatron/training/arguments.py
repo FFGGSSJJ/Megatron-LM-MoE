@@ -2082,6 +2082,7 @@ def _add_network_size_args(parser):
         "pnglu",
         "pnglu_fusion",
         "sandwich_norm",
+        "post_attn_norm_zero_init",
         "keel",
         "keel_alpha",
     ]
@@ -2167,6 +2168,11 @@ def _add_network_size_args(parser):
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
                        'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')
+    group.add_argument('--post-attn-norm-zero-init', action='store_true',
+                       help='Zero-init the gain of the post-attention sandwich norm so attention '
+                       'contributes nothing at init (x = x + 0*Norm(Attn(Norm(x)))); the model '
+                       'starts as a stack of MLP/MoE blocks, which can help MoE routing. Requires '
+                       '--sandwich-norm; only the post-attention norm is zeroed.')
     group.add_argument('--keel', action='store_true',
                        help='Use the KEEL Highway-style Post-LN architecture '
                        '(arXiv:2601.19895): x = LN_post(alpha * x + Sublayer(LN_pre(x))). '

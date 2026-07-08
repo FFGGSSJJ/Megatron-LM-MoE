@@ -456,6 +456,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.residual_output_scaling and not self.keel:
             self.residual_output_scale = 1.0 / math.sqrt(2 * self.config.num_layers)
 
+        # Optionally zero-init the post-attention sandwich-norm gain so the attention sublayer
+        # contributes nothing at init (x = x + 0 * Norm(Attn(Norm(x))) = x); the network then starts
+        # as a pure stack of MLP/MoE blocks, which can help the MoE router settle. Only the
+        # post-attention norm is zeroed (the post-MLP norm keeps its unit gain). Gated on
+        # perform_initialization since checkpoint loads overwrite the gain anyway.
+        if (
+            self.config.post_attn_norm_zero_init
+            and self.config.perform_initialization
+            and not isinstance(self.post_self_attn_layernorm, IdentityOp)
+            and hasattr(self.post_self_attn_layernorm, "weight")
+        ):
+            with torch.no_grad():
+                if self.config.layernorm_zero_centered_gamma:
+                    # Effective gain is (1 + weight), so weight = -1 gives an effective gain of 0.
+                    self.post_self_attn_layernorm.weight.fill_(-1.0)
+                else:
+                    self.post_self_attn_layernorm.weight.zero_()
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
