@@ -1,8 +1,7 @@
 # Copyright (c) 2026, Swiss AI Institute
 """
 This module implements utilities for MoE experts offloading, including:
-1) StreamManager: a singleton class to manage CUDA streams and events for offloading experts, enabling chunk-level interleaving of GPU computation and CPU-GPU communication.
-2) OffloadingExpertsGroupedSwiMLP: an autograd function for the forward and backward pass of the grouped SwiGLU MLP in offloading experts, with chunk-level interleaving of GPU computation and CPU-GPU communication to hide the data transfer latency of expert weights.
+1) OffloadingExpertsGroupedSwiMLP: an autograd function for the forward and backward pass of the grouped SwiGLU MLP in offloading experts, with chunk-level interleaving of GPU computation and CPU-GPU communication to hide the data transfer latency of expert weights.
 """
 from __future__ import annotations
 import torch
@@ -25,87 +24,8 @@ try:
 except ImportError:
     grouped_gemm = None
 
+from megatron.core.transformer.moe.moe_offload import StreamManager
 from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler, MergedSwiGLU, release
-
-
-class StreamManager:
-    '''
-    StreamManager manages CUDA streams and events for offloading experts.
-    It provides methods to get H2D streams and compute streams, and to synchronize between them.
-    '''
-    _instance = None
-
-    def __init__(
-        self, 
-        num_h2d_streams,
-        num_compute_streams=4,
-    ):
-        self.num_compute_streams = num_compute_streams
-        self.num_h2d_streams = num_h2d_streams
-        self.h2d_streams = [torch.cuda.Stream() for _ in range(num_h2d_streams)]
-        # self.h2d_streams.append(torch.cuda.default_stream())
-        self.compute_streams = [torch.cuda.Stream() for _ in range(self.num_compute_streams)]
-        self.compute_cuda_streams = [stream.cuda_stream for stream in self.compute_streams]
-
-    @classmethod
-    def get_instance(
-        cls, 
-        num_h2d_streams=2,
-        num_compute_streams=4,
-    ):
-        if cls._instance is None:
-            cls._instance = StreamManager(num_h2d_streams, num_compute_streams)
-        return cls._instance
-
-    def get_h2d_stream(self, idx) -> torch.cuda.Stream:
-        return self.h2d_streams[idx]
-    
-    def get_compute_streams(self) -> list[int]:
-        return self.compute_cuda_streams
-    
-    def get_launch_streams(self) -> list[torch.cuda.Stream]:
-        # VPP can execute a model chunk on a non-default current stream.
-        current_stream = torch.cuda.current_stream()
-        default_stream = torch.cuda.default_stream()
-        if current_stream.cuda_stream == default_stream.cuda_stream:
-            return [current_stream]
-        return [current_stream, default_stream]
-
-    def launch_streams_wait_compute_streams(self):
-        launch_streams = self.get_launch_streams()
-        for i in range(self.num_compute_streams):
-            for launch_stream in launch_streams:
-                launch_stream.wait_stream(self.compute_streams[i])
-
-    def default_stream_wait_h2d_stream(self, idx):
-        torch.cuda.default_stream().wait_stream(self.get_h2d_stream(idx))
-
-    def compute_streams_wait_launch_streams(self):
-        launch_streams = self.get_launch_streams()
-        for i in range(self.num_compute_streams):
-            for launch_stream in launch_streams:
-                self.compute_streams[i].wait_stream(launch_stream)
-
-    def h2d_stream_wait_consumer_streams(self, idx):
-        h2d_stream = self.get_h2d_stream(idx)
-        for launch_stream in self.get_launch_streams():
-            h2d_stream.wait_stream(launch_stream)
-        for i in range(self.num_compute_streams):
-            h2d_stream.wait_stream(self.compute_streams[i])
-
-    def compute_streams_wait_h2d_stream(self, idx):
-        h2d_stream = self.get_h2d_stream(idx)
-        for i in range(self.num_compute_streams):
-            self.compute_streams[i].wait_stream(h2d_stream)
-
-    def consumer_streams_wait_event(self, event):
-        for launch_stream in self.get_launch_streams():
-            launch_stream.wait_event(event)
-        for i in range(self.num_compute_streams):
-            self.compute_streams[i].wait_event(event)
-
-    def h2d_stream_wait_default_stream(self, idx):
-        self.get_h2d_stream(idx).wait_stream(torch.cuda.default_stream())
 
 
 class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):

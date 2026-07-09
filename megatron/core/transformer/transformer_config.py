@@ -28,6 +28,13 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+# Valid entries for `moe_offload_activations` (which FP8 expert activations to offload to pinned
+# host during the combine window). Kept here so the config validation and the offloader agree on the
+# spelling.
+MOE_OFFLOAD_INPUT = "moe_input"  # fp8_x, the permuted expert input (saved on all paths)
+MOE_OFFLOAD_FC1_OUTPUT = "moe_fc1_output"  # fp8_fc1_output, the gated pre-activation (non-recompute)
+MOE_OFFLOAD_ACTIVATION_CHOICES = (MOE_OFFLOAD_INPUT, MOE_OFFLOAD_FC1_OUTPUT)
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -839,6 +846,20 @@ class TransformerConfig(ModelParallelConfig):
     moe_offloading_chunk_size: int = -1
     """Chunk size for offloading. If set to a positive value, it will override the chunk size calculated"""
 
+    moe_offload_activations: Optional[List[str]] = None
+    """Which saved MoE expert activations to offload to pinned host memory when the expert forward
+    finishes (overlapping the D2H with the combine phase) and reload just before the expert backward
+    (overlapping the H2D with the combine-backward phase). Reduces peak activation memory for the
+    offloading-experts path. A list of:
+
+      - "moe_input": the permuted expert input (saved on all paths).
+      - "moe_fc1_output": the gated first-linear output. Only takes effect on the
+        non-recompute path (when moe_act recompute is on, fc1_output is dropped and recomputed
+        instead). 
+    None or [] disables offload. Only supported with the inplace-FP8 offloading-experts path
+    (moe_use_offloading_experts + moe_use_inplace_fp8_param) and incompatible with moe_layer_recompute
+    (the activation is not held across the pipeline gap under full-layer recompute)."""
+
     moe_offloading_experts_skip_post_backward_hook: bool = False
     """Whether the offloading experts MLP should skip the post backward hook."""
 
@@ -1631,6 +1652,38 @@ class TransformerConfig(ModelParallelConfig):
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
+
+        if self.moe_offload_activations:
+            invalid = set(self.moe_offload_activations) - set(MOE_OFFLOAD_ACTIVATION_CHOICES)
+            if invalid:
+                raise ValueError(
+                    f"Invalid choices for moe_offload_activations: {sorted(invalid)}. "
+                    f"Valid entries: {list(MOE_OFFLOAD_ACTIVATION_CHOICES)}."
+                )
+            if not (self.moe_use_offloading_experts and self.moe_use_inplace_fp8_param):
+                raise ValueError(
+                    "moe_offload_activations requires moe_use_offloading_experts and "
+                    "moe_use_inplace_fp8_param (the inplace-FP8 offloading-experts path)."
+                )
+            if self.moe_layer_recompute or (
+                self.recompute_granularity == "selective"
+                and self.recompute_modules is not None
+                and "moe_layer" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_offload_activations is incompatible with full-layer MoE recompute "
+                    "(moe_layer_recompute / recompute_modules=['moe_layer']): the input activation "
+                    "is recomputed in backward rather than held across the pipeline gap."
+                )
+            if (
+                MOE_OFFLOAD_FC1_OUTPUT in self.moe_offload_activations
+                and MOE_OFFLOAD_INPUT not in self.moe_offload_activations
+            ):
+                raise ValueError(
+                    f"moe_offload_activations={self.moe_offload_activations!r}: "
+                    f"'{MOE_OFFLOAD_FC1_OUTPUT}' requires '{MOE_OFFLOAD_INPUT}' -- the fc1 reload "
+                    "rides the same ActivationOffloadHandle / MoEActReloadTrigger as fp8_x."
+                )
 
         if self.moe_layer_recompute:
             warnings.warn(
