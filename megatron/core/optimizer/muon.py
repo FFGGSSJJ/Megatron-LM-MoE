@@ -437,15 +437,15 @@ def get_megatron_muon_optimizer(
         ]
         mla_config = model_chunk.config
         is_mla = getattr(mla_config, 'multi_latent_attention', False)
-        if is_mla and config.muon_split_mla_per_head:
+        if is_mla:
+            # MLA views KV as [num_heads, qk_head_dim + v_head_dim], so these
+            # shapes describe the K/V layout within each repeated head group.
             kv_up_proj_split_shapes = (mla_config.qk_head_dim, mla_config.v_head_dim)
-            q_up_proj_head_dim = mla_config.qk_head_dim + mla_config.qk_pos_emb_head_dim
-        elif is_mla:
-            kv_up_proj_split_shapes = (
-                num_attention_heads * mla_config.qk_head_dim,
-                num_attention_heads * mla_config.v_head_dim,
+            q_up_proj_head_dim = (
+                mla_config.qk_head_dim + mla_config.qk_pos_emb_head_dim
+                if config.muon_split_mla_per_head
+                else None
             )
-            q_up_proj_head_dim = None
         else:
             kv_up_proj_split_shapes = None
             q_up_proj_head_dim = None

@@ -1290,15 +1290,15 @@ def get_megatron_mddecoupling_optimizer(
             kv_channels,
         ]
         is_mla = getattr(cfg, 'multi_latent_attention', False)
-        if is_mla and config.muon_split_mla_per_head:
+        if is_mla:
+            # MLA views KV as [num_heads, qk_head_dim + v_head_dim], so these
+            # shapes describe the K/V layout within each repeated head group.
             kv_up_proj_split_shapes = (cfg.qk_head_dim, cfg.v_head_dim)
-            q_up_proj_head_dim = cfg.qk_head_dim + cfg.qk_pos_emb_head_dim
-        elif is_mla:
-            kv_up_proj_split_shapes = (
-                num_attention_heads * cfg.qk_head_dim,
-                num_attention_heads * cfg.v_head_dim,
+            q_up_proj_head_dim = (
+                cfg.qk_head_dim + cfg.qk_pos_emb_head_dim
+                if config.muon_split_mla_per_head
+                else None
             )
-            q_up_proj_head_dim = None
         else:
             kv_up_proj_split_shapes = None
             q_up_proj_head_dim = None

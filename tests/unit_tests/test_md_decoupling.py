@@ -840,20 +840,20 @@ def test_md_decoupling_gqa_split_gain_modes_preserve_bare_split_norms(
     )
 
 def test_md_decoupling_mla_kv_up_proj_split():
-    param = torch.nn.Parameter(torch.empty(14, 4))
+    param = torch.nn.Parameter(torch.empty(10, 4))
     param.is_kv_up_proj = True
-    grad = torch.arange(56, dtype=torch.float32).view(14, 4)
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
 
     output, calls = _record_md_split_output(
         param,
         grad,
         is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
-        kv_up_proj_split_shapes=(8, 6),
+        kv_up_proj_split_shapes=(3, 2),
     )
 
-    assert [call.shape for call in calls] == [torch.Size([8, 4]), torch.Size([6, 4])]
-    assert torch.equal(output[:8], torch.ones_like(output[:8]))
-    assert torch.equal(output[8:], torch.full_like(output[8:], 2.0))
+    assert [call.shape for call in calls] == [torch.Size([6, 4]), torch.Size([4, 4])]
+    expected = torch.tensor([1, 1, 1, 2, 2, 1, 1, 1, 2, 2]).view(10, 1)
+    assert torch.equal(output, expected.expand_as(output))
 
 def test_md_decoupling_mla_kv_up_proj_split_uses_local_dim0_tp_shapes():
     param = torch.nn.Parameter(torch.empty(10, 4))
@@ -999,7 +999,13 @@ def test_md_decoupling_mla_param_tags_copy_to_main_param():
     assert main_param.is_q_up_proj
     assert main_param.is_qkv_down_proj
 
-def test_md_decoupling_builder_tags_mla_and_gqa_parameters(monkeypatch):
+@pytest.mark.parametrize(
+    ("split_mla_per_head", "expected_q_up_proj_head_dim"),
+    [(False, None), (True, 8)],
+)
+def test_md_decoupling_builder_tags_mla_and_gqa_parameters(
+    monkeypatch, split_mla_per_head, expected_q_up_proj_head_dim
+):
     class _FakeModelChunk:
         def __init__(self):
             self.config = SimpleNamespace(
@@ -1070,7 +1076,7 @@ def test_md_decoupling_builder_tags_mla_and_gqa_parameters(monkeypatch):
     config.hypersphere_router_mode = None
     config.hypersphere_gains_mode = None
     config.muon_split_qkv = True
-    config.muon_split_mla_per_head = True
+    config.muon_split_mla_per_head = split_mla_per_head
     config.use_distributed_optimizer = False
     config.fp16 = False
     config.bf16 = False
@@ -1084,13 +1090,23 @@ def test_md_decoupling_builder_tags_mla_and_gqa_parameters(monkeypatch):
 
     optimizer = chained.chained_optimizers[0].optimizer
     assert optimizer.qkv_split_shapes == [16, 4, 4]
-    assert optimizer.kv_up_proj_split_shapes == (6, 5)
-    assert optimizer.q_up_proj_head_dim == 8
+    assert optimizer.q_up_proj_head_dim == expected_q_up_proj_head_dim
     assert optimizer.qkv_down_proj_split_shapes == (3, 9)
     assert model_chunk.qkv.is_qkv
     assert model_chunk.kv_up.is_kv_up_proj
     assert model_chunk.q_up.is_q_up_proj
     assert model_chunk.qkv_down.is_qkv_down_proj
+
+    kv_grad = torch.arange(88 * 5, dtype=torch.float32).view(88, 5)
+    kv_parts, _ = optimizer._split_param_tensor(model_chunk.kv_up, kv_grad)
+    # MultiLatentAttention.forward views linear_kv_up_proj output as
+    # [tokens, num_heads, qk_head_dim + v_head_dim] before splitting K and V.
+    kv_per_head = kv_grad.view(8, 11, 5)
+    expected_k = kv_per_head[:, :6].reshape(48, 5)
+    expected_v = kv_per_head[:, 6:].reshape(40, 5)
+    torch.testing.assert_close(kv_parts[0], expected_k)
+    torch.testing.assert_close(kv_parts[1], expected_v)
+    assert optimizer.kv_up_proj_split_shapes == (6, 5)
 
 def test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags(monkeypatch):
     class _FakeOptimizer:
