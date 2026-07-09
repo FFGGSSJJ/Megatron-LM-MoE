@@ -43,10 +43,11 @@ def _step_sum_loss(model, input_tensor):
 
 
 def _record_md_split_output(param, grad, **md_kwargs):
+    split_qkv = md_kwargs.pop("split_qkv", True)
     optimizer = MDDecoupling(
         params=[param],
         lr=0.01,
-        split_qkv=True,
+        split_qkv=split_qkv,
         pg_collection=None,
         tp_mode="duplicated",
         **md_kwargs,
@@ -688,7 +689,7 @@ def test_md_decoupling_mla_split_flat_normalization_is_block_local():
         optimizer._normalize(param, param, is_qkv=False)
 
     _assert_split_flat_norms(optimizer, param, param, expected_norm=8**0.5)
-    torch.testing.assert_close(torch.linalg.vector_norm(param), torch.tensor(4.0))
+    torch.testing.assert_close(torch.linalg.vector_norm(param), torch.tensor(32**0.5))
 
 @requires_cuda
 def test_md_decoupling_mla_split_gains_step_preserves_bare_split_norms():
@@ -872,7 +873,8 @@ def test_md_decoupling_mla_kv_up_proj_split_uses_local_dim0_tp_shapes():
     assert torch.equal(output[:6], torch.ones_like(output[:6]))
     assert torch.equal(output[6:], torch.full_like(output[6:], 2.0))
 
-def test_md_decoupling_mla_kv_up_proj_split_per_head():
+@pytest.mark.parametrize("split_qkv", [False, True])
+def test_md_decoupling_mla_kv_up_proj_split_per_head(split_qkv):
     param = torch.nn.Parameter(torch.empty(10, 4))
     param.is_kv_up_proj = True
     grad = torch.arange(40, dtype=torch.float32).view(10, 4)
@@ -883,11 +885,59 @@ def test_md_decoupling_mla_kv_up_proj_split_per_head():
         is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
         kv_up_proj_split_shapes=(3, 2),
         split_mla_per_head=True,
+        split_qkv=split_qkv,
     )
 
-    assert [call.shape for call in calls] == [torch.Size([6, 4]), torch.Size([4, 4])]
-    expected = torch.tensor([1, 1, 1, 2, 2, 1, 1, 1, 2, 2]).view(10, 1)
+    assert [call.shape for call in calls] == [
+        torch.Size([3, 4]),
+        torch.Size([2, 4]),
+        torch.Size([3, 4]),
+        torch.Size([2, 4]),
+    ]
+    expected = torch.tensor([1] * 3 + [2] * 2 + [3] * 3 + [4] * 2).view(10, 1)
     assert torch.equal(output, expected.expand_as(output))
+
+def test_md_decoupling_mla_kv_up_proj_per_head_ignores_head_partition_dim(monkeypatch):
+    param = torch.nn.Parameter(torch.arange(1, 41, dtype=torch.float32).view(10, 4))
+    param.is_kv_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(3, 2),
+        split_mla_per_head=True,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="distributed",
+    )
+    partition_dims = []
+
+    def record_partition_dim(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
+        del tp_group, flat_mode, is_router
+        partition_dims.append(partition_dim)
+        return torch.full_like(split_grad, float(len(partition_dims)))
+
+    optimizer._orthogonalize_tensor = record_partition_dim
+    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, flat_mode=True)
+
+    assert partition_dims == [None, None, None, None]
+    expected = torch.tensor([1] * 3 + [2] * 2 + [3] * 3 + [4] * 2).view(10, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+    def fail_all_reduce(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("KV-up per-head splits should not all-reduce across TP ranks")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fail_all_reduce)
+
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_qkv=False)
+
+    _assert_split_flat_norms(optimizer, param, param, expected_norm=2.0)
 
 def test_md_decoupling_mla_q_up_proj_split_per_head():
     param = torch.nn.Parameter(torch.empty(12, 4))
@@ -1098,14 +1148,25 @@ def test_md_decoupling_builder_tags_mla_and_gqa_parameters(
     assert model_chunk.qkv_down.is_qkv_down_proj
 
     kv_grad = torch.arange(88 * 5, dtype=torch.float32).view(88, 5)
-    kv_parts, _ = optimizer._split_param_tensor(model_chunk.kv_up, kv_grad)
+    kv_parts, merge_kv_parts = optimizer._split_param_tensor(model_chunk.kv_up, kv_grad)
     # MultiLatentAttention.forward views linear_kv_up_proj output as
     # [tokens, num_heads, qk_head_dim + v_head_dim] before splitting K and V.
     kv_per_head = kv_grad.view(8, 11, 5)
-    expected_k = kv_per_head[:, :6].reshape(48, 5)
-    expected_v = kv_per_head[:, 6:].reshape(40, 5)
-    torch.testing.assert_close(kv_parts[0], expected_k)
-    torch.testing.assert_close(kv_parts[1], expected_v)
+    if split_mla_per_head:
+        expected_parts = [
+            part
+            for head in kv_per_head.unbind(0)
+            for part in torch.split(head, (6, 5), dim=0)
+        ]
+    else:
+        expected_parts = [
+            kv_per_head[:, :6].reshape(48, 5),
+            kv_per_head[:, 6:].reshape(40, 5),
+        ]
+    assert len(kv_parts) == len(expected_parts)
+    for actual, expected in zip(kv_parts, expected_parts):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(merge_kv_parts(kv_parts), kv_grad)
     assert optimizer.kv_up_proj_split_shapes == (6, 5)
 
 def test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags(monkeypatch):

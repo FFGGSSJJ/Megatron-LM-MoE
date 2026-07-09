@@ -322,15 +322,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
 
     def _split_param_tensor(self, p, x, is_qkv: bool = False):
         """Return split views and a merge function for grouped QKV/MLA weights."""
-        if not self.split_qkv:
-            return None
-        if is_qkv:
+        if self.split_qkv and is_qkv:
             assert self.qkv_split_shapes is not None
             return (
                 _split_qkv(x, self.qkv_split_shapes),
                 lambda parts: _merge_qkv(parts, x.shape, self.qkv_split_shapes),
             )
-        if self.is_qkv_down_proj_fn(p):
+        if self.split_qkv and self.is_qkv_down_proj_fn(p):
             assert self.qkv_down_proj_split_shapes is not None
             shapes = self._local_dim0_split_shapes(
                 p, x, self.qkv_down_proj_split_shapes, allow_groups=False
@@ -339,11 +337,16 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 list(torch.split(x, shapes, dim=0)),
                 lambda parts: torch.cat(parts, dim=0),
             )
-        if self.is_kv_up_proj_fn(p):
+        if (self.split_qkv or self.split_mla_per_head) and self.is_kv_up_proj_fn(p):
             assert self.kv_up_proj_split_shapes is not None
             shapes = self._local_dim0_split_shapes(
                 p, x, self.kv_up_proj_split_shapes, allow_groups=True
             )
+            if self.split_mla_per_head:
+                return (
+                    _split_grouped_dim0_per_head(x, shapes),
+                    lambda parts: _merge_grouped_dim0_per_head(parts, x.shape, shapes),
+                )
             return (
                 _split_grouped_dim0(x, shapes),
                 lambda parts: _merge_grouped_dim0(parts, x.shape, shapes),
@@ -358,7 +361,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
 
     def _split_partition_dim(self, p, partition_dim):
         """Return the TP partition dimension that still applies after splitting."""
-        if self.split_mla_per_head and self.is_q_up_proj_fn(p):
+        if self.split_mla_per_head and (
+            self.is_q_up_proj_fn(p) or self.is_kv_up_proj_fn(p)
+        ):
             return None
         return partition_dim
 
@@ -1099,6 +1104,24 @@ def _merge_grouped_dim0(parts, xshape: tuple[int, int], shapes: tuple[int, int])
     num_groups = xshape[0] // sum(shapes)
     parts = [g.view(num_groups, -1, xshape[-1]) for g in parts]
     return torch.cat(parts, dim=1).view(xshape)
+
+
+def _split_grouped_dim0_per_head(x, shapes: tuple[int, int]) -> list[torch.Tensor]:
+    """Split each head in a grouped dim-0 layout into independent logical blocks."""
+    num_heads = x.shape[0] // sum(shapes)
+    heads = x.view(num_heads, sum(shapes), -1).unbind(0)
+    return [part for head in heads for part in torch.split(head, shapes, dim=0)]
+
+
+def _merge_grouped_dim0_per_head(
+    parts, xshape: tuple[int, int], shapes: tuple[int, int]
+) -> torch.Tensor:
+    blocks_per_head = len(shapes)
+    heads = [
+        torch.cat(parts[i : i + blocks_per_head], dim=0)
+        for i in range(0, len(parts), blocks_per_head)
+    ]
+    return torch.stack(heads, dim=0).view(xshape)
 
 
 def _split_heads_dim0(x, head_dim: int) -> list[torch.Tensor]:

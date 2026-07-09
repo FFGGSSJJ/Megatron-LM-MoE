@@ -638,10 +638,11 @@ def test_muon_optimizer_qkv_split():
 
 
 def _record_muon_split_output(param, grad, **muon_kwargs):
+    split_qkv = muon_kwargs.pop("split_qkv", True)
     optimizer = TensorParallelMuon(
         params=[param],
         lr=0.01,
-        split_qkv=True,
+        split_qkv=split_qkv,
         num_ns_steps=5,
         pg_collection=None,
         mode="duplicated",
@@ -767,7 +768,8 @@ def test_muon_optimizer_mla_kv_up_proj_split_uses_local_dim0_tp_shapes():
     assert torch.equal(output[6:], torch.full_like(output[6:], 2.0))
 
 
-def test_muon_optimizer_mla_kv_up_proj_split_per_head():
+@pytest.mark.parametrize("split_qkv", [False, True])
+def test_muon_optimizer_mla_kv_up_proj_split_per_head(split_qkv):
     param = torch.nn.Parameter(torch.empty(10, 4, device='cuda'))
     param.is_kv_up_proj = True
     grad = torch.arange(40, dtype=torch.float32, device='cuda').view(10, 4)
@@ -778,10 +780,51 @@ def test_muon_optimizer_mla_kv_up_proj_split_per_head():
         is_kv_up_proj_fn=lambda p: getattr(p, 'is_kv_up_proj', False),
         kv_up_proj_split_shapes=(3, 2),
         split_mla_per_head=True,
+        split_qkv=split_qkv,
     )
 
-    assert [call.shape for call in calls] == [torch.Size([6, 4]), torch.Size([4, 4])]
-    expected = torch.tensor([1, 1, 1, 2, 2, 1, 1, 1, 2, 2], device='cuda').view(10, 1)
+    assert [call.shape for call in calls] == [
+        torch.Size([3, 4]),
+        torch.Size([2, 4]),
+        torch.Size([3, 4]),
+        torch.Size([2, 4]),
+    ]
+    expected = torch.tensor(
+        [1] * 3 + [2] * 2 + [3] * 3 + [4] * 2, device='cuda'
+    ).view(10, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+
+def test_muon_optimizer_mla_kv_up_proj_per_head_ignores_head_partition_dim():
+    param = torch.nn.Parameter(torch.empty(10, 4, device='cuda'))
+    param.is_kv_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(40, dtype=torch.float32, device='cuda').view(10, 4)
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        num_ns_steps=5,
+        is_kv_up_proj_fn=lambda p: getattr(p, 'is_kv_up_proj', False),
+        kv_up_proj_split_shapes=(3, 2),
+        split_mla_per_head=True,
+        pg_collection=None,
+        mode="distributed",
+    )
+    partition_dims = []
+
+    def record_partition_dim(split_grad, tp_group, partition_dim):
+        del tp_group
+        partition_dims.append(partition_dim)
+        return torch.full_like(split_grad, float(len(partition_dims)))
+
+    optimizer.scaled_orthogonalize_fn = record_partition_dim
+    output = optimizer.orthogonalize(param, grad)
+
+    assert partition_dims == [None, None, None, None]
+    expected = torch.tensor(
+        [1] * 3 + [2] * 2 + [3] * 3 + [4] * 2, device='cuda'
+    ).view(10, 1)
     assert torch.equal(output, expected.expand_as(output))
 
 

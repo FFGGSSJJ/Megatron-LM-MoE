@@ -150,12 +150,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
     def _split_partition_dim(self, p, partition_dim):
         """Return the TP partition dimension that still applies after splitting."""
-        if (
-            self.split_mla_per_head
-            and self.is_q_up_proj_fn is not None
-            and self.is_q_up_proj_fn(p)
-        ):
-            return None
+        if self.split_mla_per_head:
+            is_q_up_proj = self.is_q_up_proj_fn is not None and self.is_q_up_proj_fn(p)
+            is_kv_up_proj = (
+                self.is_kv_up_proj_fn is not None and self.is_kv_up_proj_fn(p)
+            )
+            if is_q_up_proj or is_kv_up_proj:
+                return None
         return partition_dim
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -235,7 +236,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             ]
             grad = torch.cat(qkv_down_grads, dim=0)
         elif (
-            self.split_qkv
+            (self.split_qkv or self.split_mla_per_head)
             and self.is_kv_up_proj_fn is not None
             and self.is_kv_up_proj_fn(p)
         ):
@@ -252,19 +253,21 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
             if self.split_mla_per_head:
                 num_heads = grad_shape[0] // sum(split_shapes)
-                kv_grads = torch.split(
-                    grad.view(num_heads, sum(split_shapes), -1),
-                    split_shapes,
-                    dim=1,
-                )
-                kv_grads = [g.reshape(-1, grad_shape[-1]) for g in kv_grads]
+                heads = grad.view(num_heads, sum(split_shapes), -1).unbind(0)
                 kv_grads = [
-                    self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                        num_heads, -1, grad_shape[-1]
-                    )
+                    block for head in heads for block in torch.split(head, split_shapes, dim=0)
+                ]
+                split_partition_dim = self._split_partition_dim(p, partition_dim)
+                kv_grads = [
+                    self.scaled_orthogonalize_fn(g, tp_group, split_partition_dim)
                     for g in kv_grads
                 ]
-                grad = torch.cat(kv_grads, dim=1).view(grad_shape)
+                blocks_per_head = len(split_shapes)
+                heads = [
+                    torch.cat(kv_grads[i : i + blocks_per_head], dim=0)
+                    for i in range(0, len(kv_grads), blocks_per_head)
+                ]
+                grad = torch.stack(heads, dim=0).view(grad_shape)
             else:
                 num_groups = grad_shape[0] // sum(split_shapes)
                 kv_grads = torch.split(
@@ -281,8 +284,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 ]
                 grad = torch.cat(kv_grads, dim=1).view(grad_shape)
         elif (
-            self.split_qkv
-            and self.split_mla_per_head
+            self.split_mla_per_head
             and self.is_q_up_proj_fn is not None
             and self.is_q_up_proj_fn(p)
         ):
