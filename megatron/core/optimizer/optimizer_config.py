@@ -277,6 +277,13 @@ class OptimizerConfig:
     muon_scale_mode: str = "spectral"
     """The mode to use for the scale factor. Defaults to "spectral"."""
 
+    muon_router_scale_mode: str = "none"
+    """Muon scale-factor mode for MoE router weights under md_decoupling, overriding
+    ``muon_scale_mode`` for routers only. Defaults to "none" (constant 1.0): the router maps
+    hidden -> num_experts, so its aspect ratio — and hence the shape-derived scale factor
+    (e.g. shape_up) — tracks hidden even when the matrix LR is held fixed, which breaks LR
+    transfer across width. Set to a mode name to make routers follow that scale instead."""
+
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 

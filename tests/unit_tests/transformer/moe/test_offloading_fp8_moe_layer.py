@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.moe.experts_util import MergedSwiGLU
-from megatron.core.transformer.moe.experts_offloading_util import StreamManager
+from megatron.core.transformer.moe.moe_offload import StreamManager
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
     offloading_fp8_grouped_swiglu_mlp,

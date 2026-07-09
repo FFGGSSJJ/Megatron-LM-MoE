@@ -125,6 +125,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
         scale_mode: str = "spectral",
+        router_scale_mode: str = "none",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
@@ -174,6 +175,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.coefficient_type = coefficient_type
         self.num_ns_steps = num_ns_steps
         self.scale_mode = scale_mode
+        self.router_scale_mode = router_scale_mode
         self.extra_scale_factor = extra_scale_factor
 
         self.pg_collection = pg_collection
@@ -280,7 +282,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 grad = exp_avg
             flat_mode = self._resolve_mode(is_embedding, is_router) == "flat"
             with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, flat_mode=flat_mode, is_merged_offload_expert=is_merged_offload_expert)
+                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, flat_mode=flat_mode, is_merged_offload_expert=is_merged_offload_expert, is_router=is_router)
             # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
             # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
             # target radius 1/sqrt(2L) the bare update needs the same shrink factor.
@@ -405,11 +407,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_qkv: bool = False,
         flat_mode: bool = False,
         is_merged_offload_expert: bool = False,
+        is_router: bool = False,
     ):
         """Newton-Schulz orthogonalization, with optional QKV/MLA/expert splitting.
 
         ``flat_mode`` enables the init-radius rescale (see _init_radius_scale); it is per-block
-        so each Q/K/V, MLA, or expert block gets its own factor.
+        so each Q/K/V, MLA, or expert block gets its own factor. ``is_router`` selects
+        router_scale_mode over scale_mode (see _resolve_scale_mode).
         """
         if self.pg_collection is not None:
             tp_group = (self.pg_collection.expt_tp
@@ -426,7 +430,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             parts, merge = split
             split_partition_dim = self._split_partition_dim(p, partition_dim)
             parts = [
-                self._orthogonalize_tensor(g, tp_group, split_partition_dim, flat_mode)
+                self._orthogonalize_tensor(
+                    g,
+                    tp_group,
+                    split_partition_dim,
+                    flat_mode,
+                    is_router=is_router,
+                )
                 for g in parts
             ]
             return merge(parts)
@@ -434,11 +444,18 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if is_merged_offload_expert:
             experts = _split_experts(grad)
             for i, expert in enumerate(experts):
-                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, flat_mode)
+                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, flat_mode, is_router=is_router)
             return _merge_experts(experts)
-        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode)
+        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode, is_router=is_router)
 
-    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False):
+    def _resolve_scale_mode(self, is_router: bool) -> str:
+        """Muon scale-factor mode for this param. Routers use ``router_scale_mode`` (default
+        "none" → scale factor 1.0); everything else uses ``scale_mode``. The router maps
+        hidden -> num_experts, so a shape-derived scale (e.g. shape_up) tracks hidden and would
+        modulate the router update with width even when the matrix LR is held fixed."""
+        return self.router_scale_mode if is_router else self.scale_mode
+
+    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False, is_router: bool = False):
         assert grad.ndim == 2
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
@@ -452,7 +469,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             partition_dim=partition_dim,
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
-        scale = _get_muon_scale_factor(size[0], size[1], mode=self.scale_mode)
+        scale = _get_muon_scale_factor(size[0], size[1], mode=self._resolve_scale_mode(is_router))
         if flat_mode:
             scale *= self._init_radius_scale(size[0], size[1])
         return orth * scale * self.extra_scale_factor
@@ -1383,6 +1400,7 @@ def get_megatron_mddecoupling_optimizer(
         coefficient_type=config.muon_coefficient_type,
         num_ns_steps=config.muon_num_ns_steps,
         scale_mode=config.muon_scale_mode,
+        router_scale_mode=config.muon_router_scale_mode,
         extra_scale_factor=config.muon_extra_scale_factor,
         pg_collection=pg_collection,
         tp_mode=config.muon_tp_mode,

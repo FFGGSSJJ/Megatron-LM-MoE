@@ -428,9 +428,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         #   x = LN_post(alpha * x + Sublayer(LN_pre(x)))
         # where LN_pre is the existing input/pre-mlp norm and LN_post is the post_*_layernorm slot
         # built by the spec. The residual ("highway") branch is scaled by alpha (applied in
-        # _forward_attention / _forward_post_mlp). The very first attention and MLP sub-layers
-        # (decoder layer 1) drop alpha and LN_post, degrading to plain Pre-LN so that signal out of
-        # the embedding stays well-conditioned.
+        # _forward_attention / _forward_post_mlp).
+        # Input-layer init (paper Sec 3.1): for decoder layer 1, drop alpha on BOTH the attention
+        # and MLP sub-layers, but drop the Post-LN on the first *attention* sub-layer only. The
+        # first attention thus degrades to a plain Pre-LN block, while the first MLP keeps its
+        # Post-LN and becomes a standard Post-LN block ("degrade to standard Pre-LN or Post-LN
+        # blocks"). This keeps signal out of the embedding well-conditioned.
         self.keel = self.config.keel
         if self.keel:
             keel_is_first_layer = (self.layer_number == 1) and not self.is_mtp_layer
@@ -441,9 +444,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 keel_alpha = float(2 * self.config.num_layers)
             self.keel_residual_scale = 1.0 if keel_is_first_layer else keel_alpha
             if keel_is_first_layer:
-                # Remove the Post-LN: these sub-layers act as standard Pre-LN blocks.
+                # First attention only -> Pre-LN block (no Post-LN). The first MLP retains its
+                # Post-LN (built by the spec) and stays a Post-LN block, per the paper.
                 self.post_self_attn_layernorm = IdentityOp()
-                self.post_mlp_layernorm = IdentityOp()
 
         # Fixed residual-branch multiplier: each sublayer computes x = x + alpha * f(x) with
         # alpha = 1/sqrt(2 * num_layers) (2 sublayers per layer -> 2*num_layers residual branches).
@@ -452,6 +455,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.residual_output_scale = None
         if self.config.residual_output_scaling and not self.keel:
             self.residual_output_scale = 1.0 / math.sqrt(2 * self.config.num_layers)
+
+        # Optionally zero-init the post-attention sandwich-norm gain so the attention sublayer
+        # contributes nothing at init (x = x + 0 * Norm(Attn(Norm(x))) = x); the network then starts
+        # as a pure stack of MLP/MoE blocks, which can help the MoE router settle. Only the
+        # post-attention norm is zeroed (the post-MLP norm keeps its unit gain). Gated on
+        # perform_initialization since checkpoint loads overwrite the gain anyway.
+        if (
+            self.config.post_attn_norm_zero_init
+            and self.config.perform_initialization
+            and not isinstance(self.post_self_attn_layernorm, IdentityOp)
+            and hasattr(self.post_self_attn_layernorm, "weight")
+        ):
+            with torch.no_grad():
+                if self.config.layernorm_zero_centered_gamma:
+                    # Effective gain is (1 + weight), so weight = -1 gives an effective gain of 0.
+                    self.post_self_attn_layernorm.weight.fill_(-1.0)
+                else:
+                    self.post_self_attn_layernorm.weight.zero_()
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
