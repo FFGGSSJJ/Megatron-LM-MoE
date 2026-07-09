@@ -38,7 +38,7 @@ from megatron.core.activations import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_sssglu import (
     bias_sssglu_impl,
-    sssilu,
+    ssslu,
     weighted_bias_sssglu_impl,
 )
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
@@ -325,7 +325,7 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
-                elif self.activation_func == sssilu and self.config.gated_linear_unit:
+                elif self.activation_func == ssslu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
                     intermediate_parallel = weighted_bias_sssglu_impl(
                         intermediate_parallel,
@@ -365,7 +365,7 @@ class MLP(MegatronModule):
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
                     )
-                elif self.activation_func == sssilu and self.config.gated_linear_unit:
+                elif self.activation_func == ssslu and self.config.gated_linear_unit:
                     intermediate_parallel = bias_sssglu_impl(
                         intermediate_parallel,
                         bias_parallel,

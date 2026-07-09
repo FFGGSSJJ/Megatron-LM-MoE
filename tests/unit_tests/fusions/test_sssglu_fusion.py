@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from megatron.core.fusions.fused_bias_sssglu import (
     bias_sssglu_impl,
-    sssilu,
+    ssslu,
     weighted_bias_sssglu_impl,
 )
 
@@ -20,17 +20,17 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 def _ref(x, bias=None):
-    """Pure-torch autograd reference: sssilu(y1) * y2 with sssilu(y) = y*(0.5+0.5*softsign(y))."""
+    """Pure-torch autograd reference: ssslu(y1) * y2 with ssslu(y) = y*(0.5+0.5*softsign(y))."""
     if bias is not None:
         x = x + bias
     y_1, y_2 = torch.chunk(x, 2, -1)
     return (y_1 * (0.5 + 0.5 * F.softsign(y_1))) * y_2
 
 
-def test_sssilu_matches_gate_definition():
+def test_ssslu_matches_gate_definition():
     x = torch.randn(1024, dtype=torch.float64, device="cuda")
     gate = 0.5 * (1 + F.softsign(x))
-    assert torch.allclose(sssilu(x), x * gate)
+    assert torch.allclose(ssslu(x), x * gate)
     # gate is softsign rescaled to (0, 1)
     assert gate.min() > 0 and gate.max() < 1
 

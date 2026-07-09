@@ -21,6 +21,11 @@ from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
     swiglu_backward,
 )
+from megatron.core.transformer.moe.sssglu_jit import (
+    sssglu_forward,
+    sssglu_backward,
+)
+from megatron.core.fusions.fused_bias_sssglu import ssslu
 
 class FP8GPUExpertsParameterManager:
     """Caches FP8-quantized expert weights for GPU-resident bf16 parameters.
@@ -168,7 +173,8 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         fp8_w2, fp8_w2_scale = fp8_parameter_manager.get_fp8_weights(w2, transposed=False)
 
-        s = swiglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
+        glu_forward = sssglu_forward if config.activation_func == ssslu else swiglu_forward
+        s = glu_forward(fc1_output, permuted_probs.unsqueeze(-1))
         # s = MergedSwiGLU.call_forward(fc1_output, permuted_probs.unsqueeze(-1))
         fp8_s = per_token_cast_to_fp8(s, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
 
@@ -215,7 +221,8 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             output=grad_s,
         )
         # return MergedSwiGLU.call_backward(grad_s, a, permuted_probs.unsqueeze(-1))
-        return swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+        glu_backward = sssglu_backward if config.activation_func == ssslu else swiglu_backward
+        return glu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
 
     @classmethod
     def call_backward_grad_x(
@@ -262,13 +269,15 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert_cumsum: torch.Tensor,
         num_local_experts: int,
         fuse_gradient_accumulation: bool = False,
+        use_sssglu: bool = False,
     ):
         """dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
         With k-grouped fp8: grad_y [m, h] @ s [m, H]."""
         assert fuse_gradient_accumulation, \
             "ExpertsFP8GroupedSwiMLP currently only supports fuse_gradient_accumulation."
 
-        s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
+        glu_forward = sssglu_forward if use_sssglu else swiglu_forward
+        s = glu_forward(a, permuted_probs.unsqueeze(-1))
         # s = MergedSwiGLU.call_forward(a, permuted_probs.unsqueeze(-1))
         fp8_s = per_channel_cast_to_fp8(s, use_ue8m0=False, gran_k=128, transpose=False)
 
@@ -389,7 +398,8 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         config: TransformerConfig,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """BF16 reference for ``call_forward_y``: swiglu then fc2 = s @ w2[e].T."""
-        s = swiglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
+        glu_forward = sssglu_forward if config.activation_func == ssslu else swiglu_forward
+        s = glu_forward(fc1_output, permuted_probs.unsqueeze(-1))
         # s = MergedSwiGLU.call_forward(fc1_output, permuted_probs.unsqueeze(-1))
         E = w2.shape[0]
         fc2_output = torch.empty(
@@ -435,7 +445,8 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 continue
             grad_s[off:off + n] = gy_chunks[e] @ w2[e]
             off += n
-        return swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+        glu_backward = sssglu_backward if config.activation_func == ssslu else swiglu_backward
+        return glu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
         # return MergedSwiGLU.call_backward(grad_s, a, permuted_probs.unsqueeze(-1))
 
     @classmethod
@@ -472,13 +483,15 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         permuted_probs: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         fuse_gradient_accumulation: bool = False,
+        use_sssglu: bool = False,
     ) -> torch.Tensor:
         """BF16 reference for ``call_backward_grad_w2``.
 
         dw2[e] = grad_y[e].T @ s[e], shape (h, H). If fuse_gradient_accumulation,
         accumulate into w2.main_grad in-place (matching the FP8 path).
         """
-        s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
+        glu_forward = sssglu_forward if use_sssglu else swiglu_forward
+        s = glu_forward(a, permuted_probs.unsqueeze(-1))
         # s = MergedSwiGLU.call_forward(a, permuted_probs.unsqueeze(-1))
         E = w2.shape[0]
         tpe = tokens_per_expert.tolist()
@@ -652,6 +665,7 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_grad_y_t, fc1_output, w2, permuted_probs,
             tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
             ctx.num_local_experts, config.gradient_accumulation_fusion,
+            use_sssglu=(config.activation_func == ssslu),
         )
         # ExpertsFP8GroupedSwiMLP.call_backward_grad_w2_ref(
         #     grad_y, fc1_output, w2, permuted_probs, tokens_per_expert, config.gradient_accumulation_fusion,

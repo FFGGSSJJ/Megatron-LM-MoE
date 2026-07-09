@@ -31,7 +31,7 @@ from megatron.core.utils import (
 )
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.core.fusions.fused_bias_sssglu import sssilu
+from megatron.core.fusions.fused_bias_sssglu import ssslu
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1088,8 +1088,8 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.ffn_hidden_size is None:
         if (
-            args.swiglu or args.sssglu or args.pnglu or args.gxpr or args.gxpry or args.gxprv2
-            or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
+            args.swiglu or args.sssglu or args.reglu or args.pnglu or args.gxpr or args.gxpry
+            or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1731,11 +1731,18 @@ def core_transformer_config_from_args(args, config_class=None):
     elif args.sssglu:
         # SwiGLU with the sigmoid inside SiLU replaced by softsign scaled to (0, 1). Non-learnable
         # and structurally identical to SwiGLU, so it reuses the same fusion switch
-        # (--no-bias-swiglu-fusion) and dispatches on activation_func == sssilu.
+        # (--no-bias-swiglu-fusion) and dispatches on activation_func == ssslu.
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
-        kw_args['activation_func'] = sssilu
+        kw_args['activation_func'] = ssslu
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.reglu:
+        # ReLU-gated linear unit: relu(x_glu) * x_linear. Non-learnable and has no fused kernel;
+        # runs through the generic (non-fused) GLU path with activation_func == F.relu.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.relu
+        kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -1767,6 +1774,7 @@ def core_transformer_config_from_args(args, config_class=None):
     _all_activation_flags.update({
         'swiglu': args.swiglu,
         'sssglu': args.sssglu,
+        'reglu': args.reglu,
         'squared_relu': args.squared_relu,
         'quick_geglu': args.quick_geglu,
         'pnglu': args.pnglu,
@@ -2233,10 +2241,14 @@ def _add_network_size_args(parser):
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--sssglu', action='store_true',
                        help='Use SSSGLU: SwiGLU with the sigmoid inside SiLU replaced by '
-                       'softsign scaled to (0,1): sssilu(x_glu) * x_linear, where '
-                       'sssilu(x) = x * (0.5 + 0.5*softsign(x)). Non-learnable (cf. the '
+                       'softsign scaled to (0,1): ssslu(x_glu) * x_linear, where '
+                       'ssslu(x) = x * (0.5 + 0.5*softsign(x)). Non-learnable (cf. the '
                        'learnable --xsssglu) and fused the same way as SwiGLU '
                        '(honors --no-bias-swiglu-fusion). Implies gated linear units.')
+    group.add_argument('--reglu', action='store_true',
+                       help='Use ReGLU: ReLU-gated linear unit, relu(x_glu) * x_linear. '
+                       'Non-learnable; implies gated linear units. No fused kernel (runs '
+                       'through the generic GLU path).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '

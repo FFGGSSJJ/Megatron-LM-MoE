@@ -16,7 +16,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
-from ..fusions.fused_bias_sssglu import sssilu
+from ..fusions.fused_bias_sssglu import ssslu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
     get_te_version,
@@ -1513,6 +1513,25 @@ class TransformerConfig(ModelParallelConfig):
                     f"{_active_name}=True is not wired into the offloading-experts path yet."
                 )
 
+        # SSSGLU (activation_func == ssslu) is wired into the offloading experts' fp8 lane
+        # (moe_use_inplace_fp8_param, via sssglu_jit) but not the bf16 lane, which hardcodes
+        # SiLU. Guard so selecting SSSGLU + bf16 offloading fails loudly instead of silently
+        # running SwiGLU. Mirrors the pnglu offloading assert above.
+        if self.activation_func == ssslu and self.moe_use_offloading_experts:
+            assert self.moe_use_inplace_fp8_param, (
+                "SSSGLU (--sssglu) with offloading experts is only supported on the fp8 path; "
+                "enable --moe-use-inplace-fp8-param."
+            )
+
+        # ReGLU (gated relu) has no fused kernel and is not wired into the offloading-experts
+        # path (which hardcodes SiLU/SwiGLU); guard so it fails loudly instead of silently
+        # running SwiGLU. Same treatment as the learnable-activation offloading guard above.
+        if self.gated_linear_unit and self.activation_func == F.relu and self.moe_use_offloading_experts:
+            raise ValueError(
+                "ReGLU (--reglu) is not wired into the offloading-experts path "
+                "(moe_use_offloading_experts=True)."
+            )
+
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
@@ -2007,7 +2026,7 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.bias_activation_fusion:
-            if self.activation_func not in [F.gelu, F.silu, quick_gelu, sssilu]:
+            if self.activation_func not in [F.gelu, F.silu, quick_gelu, ssslu]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
                     "gelu, swiglu, quick_geglu, or sssglu"
@@ -2054,7 +2073,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_fp8_input_store:
-            if self.activation_func not in (F.silu, sssilu) or not self.gated_linear_unit:
+            if self.activation_func not in (F.silu, ssslu) or not self.gated_linear_unit:
                 raise ValueError(
                     "Storing activation input in FP8 is supported only for SwiGLU and SSSGLU."
                 )

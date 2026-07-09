@@ -31,7 +31,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_sssglu import sssilu, weighted_bias_sssglu_impl
+from megatron.core.fusions.fused_bias_sssglu import ssslu, weighted_bias_sssglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -418,7 +418,7 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,
                     self.config.activation_func_fp8_input_store,
                 )
-            elif self.activation_func == sssilu and self.config.gated_linear_unit:
+            elif self.activation_func == ssslu and self.config.gated_linear_unit:
                 # dtype is handled inside the fused kernel
                 intermediate_parallel = weighted_bias_sssglu_impl(
                     intermediate_parallel,

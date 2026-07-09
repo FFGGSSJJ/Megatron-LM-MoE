@@ -1536,6 +1536,7 @@ def load_args_from_checkpoint(
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('sssglu', force=True)
+    _set_arg('reglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)

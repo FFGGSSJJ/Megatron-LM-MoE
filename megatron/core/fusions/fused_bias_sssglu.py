@@ -11,13 +11,13 @@ from megatron.core.utils import nvtx_decorator
 ###### BIAS SSSGLU FUSION/ NO AUTOGRAD ################
 # SSSGLU is SwiGLU with the sigmoid inside SiLU replaced by softsign rescaled to (0, 1):
 #   gate(x) = 0.5 * (1 + softsign(x)) = 0.5 + 0.5 * x / (1 + |x|)
-#   sssilu(x) = x * gate(x)
-#   SSSGLU(y_1, y_2) = sssilu(y_1) * y_2
+#   ssslu(x) = x * gate(x)
+#   SSSGLU(y_1, y_2) = ssslu(y_1) * y_2
 # Built exactly like the SwiGLU fusion in fused_bias_swiglu.py (@jit_fuser forward/backward
 # pairs wrapped in torch.autograd.Function), since the gate has no cross-feature reduction.
 
 
-def sssilu(y):
+def ssslu(y):
     """Scaled-softsign counterpart of SiLU: ``y * (0.5 + 0.5 * softsign(y))``.
 
     Also serves as the ``config.activation_func`` identity that routes the MLP/TEGroupedMLP
@@ -35,7 +35,7 @@ def sssglu(y):
         y (torch.Tensor): Input tensor to be split into two halves along the last dimension.
 
     Returns:
-        torch.Tensor: Result of SSSGLU activation: sssilu(y1) * y2, where y1, y2 are the
+        torch.Tensor: Result of SSSGLU activation: ssslu(y1) * y2, where y1, y2 are the
             split halves.
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
@@ -69,7 +69,7 @@ def sssglu_back(g, y):
     """Computes the gradient for the SSSGLU activation function.
 
     With gate(x) = 0.5 + 0.5 * x / (1 + |x|) and gate'(x) = 0.5 / (1 + |x|)**2:
-    d/dx sssilu(x) = gate(x) + x * gate'(x).
+    d/dx ssslu(x) = gate(x) + x * gate'(x).
 
     Args:
         g (torch.Tensor): Gradient tensor from the subsequent layer.
@@ -81,8 +81,8 @@ def sssglu_back(g, y):
     y_1, y_2 = torch.chunk(y, 2, -1)
     denom = 1 + torch.abs(y_1)
     gate = 0.5 + 0.5 * y_1 / denom
-    d_sssilu = gate + 0.5 * y_1 / (denom * denom)
-    return torch.cat((g * d_sssilu * y_2, g * (y_1 * gate)), -1)
+    d_ssslu = gate + 0.5 * y_1 / (denom * denom)
+    return torch.cat((g * d_ssslu * y_2, g * (y_1 * gate)), -1)
 
 
 @jit_fuser

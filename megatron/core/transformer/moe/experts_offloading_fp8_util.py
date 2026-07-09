@@ -40,10 +40,15 @@ from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
     swiglu_backward,
 )
+from megatron.core.transformer.moe.sssglu_jit import (
+    sssglu_forward,
+    sssglu_backward,
+)
 from megatron.core.fusions.fused_polynorm_glu import (
     fused_polynorm_glu_forward,
     fused_polynorm_glu_backward,
 )
+from megatron.core.fusions.fused_bias_sssglu import ssslu
 
 @dataclass(frozen=True)
 class OffloadingFP8Config:
@@ -62,6 +67,9 @@ class OffloadingFP8Config:
     moe_ffn_hidden_size: int
     gated_linear_unit: bool
     gated_polynorm_linear_unit: bool
+    # SSSGLU: GLU with the SiLU gate replaced by scaled softsign (activation_func == ssslu);
+    # routed through its own Triton kernels in sssglu_jit.py (sibling of swiglu_jit.py).
+    gated_sssglu_linear_unit: bool = False
     polynorm_eps: float = 1e-6
     fc1_out_size: int = 0
 
@@ -102,6 +110,7 @@ class OffloadingFP8Config:
             moe_ffn_hidden_size=config.moe_ffn_hidden_size,
             gated_linear_unit=config.gated_linear_unit,
             gated_polynorm_linear_unit=config.pnglu,
+            gated_sssglu_linear_unit=(config.activation_func == ssslu),
             polynorm_eps=getattr(config, "polynorm_eps", 1e-6),
             moe_offloading_chunk_size=config.moe_offloading_chunk_size,
             moe_offloading_num_chunks=config.moe_offloading_num_chunks,
@@ -625,11 +634,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 config.polynorm_eps,
                 permuted_probs.unsqueeze(-1),
             )
+        elif config.gated_sssglu_linear_unit:
+            s = sssglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
         else:
-            s = swiglu_forward(
-                fc1_output,
-                permuted_probs.unsqueeze(-1)
-            )
+            s = swiglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
 
         # quantize the swiglu output to FP8
         # fp8_s = per_token_cast_to_fp8(s, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
@@ -748,6 +756,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
             return grad_a, grad_probs, grad_a1, grad_a2
+        elif config.gated_sssglu_linear_unit:
+            grad_a, grad_probs = sssglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+            return grad_a, grad_probs, None, None
         else:
             grad_a, grad_probs = swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
             return grad_a, grad_probs, None, None
@@ -854,6 +865,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             s, _ = fused_polynorm_glu_forward(
                 a, a1, a2, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
+        elif config.gated_sssglu_linear_unit:
+            s = sssglu_forward(a, permuted_probs.unsqueeze(-1))
         else:
             s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
         fp8_s = guarded_per_channel_cast_to_fp8_pack_kmajor(
