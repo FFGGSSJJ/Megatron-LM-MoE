@@ -906,6 +906,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
+    moe_router_bias_metrics: bool = False
+    """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
+    aux-loss-free (DeepSeek-style) router biases."""
+
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""

@@ -169,6 +169,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
+    "moe_router_bias_metrics": False,
     "moe_router_bias_update_rate": 0.001,
     "moe_router_dtype": "fp64",
     "moe_router_enable_expert_bias": True,
