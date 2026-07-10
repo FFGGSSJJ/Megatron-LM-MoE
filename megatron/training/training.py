@@ -605,6 +605,35 @@ def num_floating_point_operations(args, batch_size):
                         * v_dim
                     )
                 )
+            elif args.experimental_attention_variant == "kda":
+                # Kimi Delta Attention: vector channel-wise decay alpha in R^{d_k}, so
+                # alpha occupies qk_dim slots (instead of num_v_heads). Plus sigmoid
+                # output gate. FLOPs accounting follows GDN with the alpha slot resized.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj (qk*2 + v*2 + scalar beta + vector alpha=qk_dim)
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + num_v_heads + qk_dim)
+                        ## conv1d
+                        + args.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
+                        ## kda chunkwise (KK^T, VK^T, S a + S b k k^T, SQ)
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
