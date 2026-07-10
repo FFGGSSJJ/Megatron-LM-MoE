@@ -2195,6 +2195,18 @@ def training_log(
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
+        if args.moe_router_ep_violation_metrics:
+            track_names.append("ep_expert_max_violation")
+            track_names.append("ep_expert_min_violation")
+            track_names.append("ep_expert_median_violation")
+        if args.moe_router_bias_metrics:
+            uses_quantile_balancing = "quantile_balancing" in args.moe_router_load_balancing_type
+            if args.moe_router_enable_expert_bias and not uses_quantile_balancing:
+                track_names.extend(
+                    ['expert_bias_mean', 'expert_bias_std', 'expert_bias_min', 'expert_bias_max']
+                )
+            if uses_quantile_balancing:
+                track_names.extend(['qb_beta_mean', 'qb_beta_std', 'qb_beta_min', 'qb_beta_max'])
 
         if is_hybrid_model(args):
             from operator import itemgetter
