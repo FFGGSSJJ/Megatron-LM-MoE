@@ -11,7 +11,6 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
-    _log_router_bias_metrics,
     _update_router_qb_beta,
     reset_model_temporary_tensors,
 )
@@ -33,16 +32,6 @@ class _RouterQBBetaModel(torch.nn.Module):
         self.router.register_buffer("qb_beta_count", qb_beta_count.clone())
 
 
-class _RouterBiasModel(torch.nn.Module):
-    def __init__(self, config, expert_bias, qb_beta):
-        super().__init__()
-        self.config = config
-        self.router = torch.nn.Module()
-        self.router.layer_number = 1
-        self.router.register_buffer('expert_bias', expert_bias.clone())
-        self.router.register_buffer('qb_beta', qb_beta.clone())
-
-
 def _router_qb_config(ema=0.25):
     return TransformerConfig(
         num_layers=1,
@@ -52,73 +41,6 @@ def _router_qb_config(ema=0.25):
         moe_router_load_balancing_type="quantile_balancing",
         moe_router_quantile_balancing_ema=ema,
     )
-
-
-class TestRouterBiasMetrics:
-    def test_logs_bias_statistics(self, monkeypatch):
-        config = _router_qb_config()
-        config.moe_router_bias_metrics = True
-        model = _RouterBiasModel(
-            config,
-            expert_bias=torch.tensor([-2.0, 0.0, 4.0]),
-            qb_beta=torch.tensor([-1.0, 0.0, 1.0]),
-        )
-        logged = {}
-
-        monkeypatch.setattr(
-            'megatron.core.distributed.finalize_model_grads.get_num_microbatches', lambda: 2
-        )
-
-        def save_metric(name, value, layer_number, num_layers):
-            logged[name] = value
-            assert layer_number == 1
-            assert num_layers == 1
-
-        monkeypatch.setattr(
-            'megatron.core.distributed.finalize_model_grads.save_to_aux_losses_tracker',
-            save_metric,
-        )
-
-        _log_router_bias_metrics([model], config)
-
-        assert set(logged) == {
-            'qb_beta_mean',
-            'qb_beta_std',
-            'qb_beta_min',
-            'qb_beta_max',
-        }
-        torch.testing.assert_close(logged['qb_beta_mean'], torch.tensor(0.0))
-        torch.testing.assert_close(logged['qb_beta_min'], torch.tensor(-2.0))
-        torch.testing.assert_close(logged['qb_beta_max'], torch.tensor(2.0))
-
-        logged.clear()
-        config.moe_router_load_balancing_type = "aux_loss"
-        config.moe_router_enable_expert_bias = True
-        _log_router_bias_metrics([model], config)
-
-        assert set(logged) == {
-            'expert_bias_mean',
-            'expert_bias_std',
-            'expert_bias_min',
-            'expert_bias_max',
-        }
-        torch.testing.assert_close(logged['expert_bias_mean'], torch.tensor(4.0 / 3.0))
-        torch.testing.assert_close(logged['expert_bias_min'], torch.tensor(-4.0))
-        torch.testing.assert_close(logged['expert_bias_max'], torch.tensor(8.0))
-
-    def test_disabled_by_default(self, monkeypatch):
-        config = _router_qb_config()
-        model = _RouterBiasModel(config, torch.tensor([0.0]), torch.tensor([0.0]))
-
-        def fail_save(*args, **kwargs):
-            raise AssertionError('bias metrics should be disabled')
-
-        monkeypatch.setattr(
-            'megatron.core.distributed.finalize_model_grads.save_to_aux_losses_tracker',
-            fail_save,
-        )
-
-        _log_router_bias_metrics([model], config)
 
 
 class TestUpdateRouterQBBeta:

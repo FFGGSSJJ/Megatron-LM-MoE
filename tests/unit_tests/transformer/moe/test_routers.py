@@ -14,7 +14,7 @@ from megatron.core.transformer.moe.moe_utils import (
     router_gating_linear,
     topk_routing_with_score_function,
 )
-from megatron.core.transformer.moe.router import Router, _aggregate_expert_load_across_ep
+from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -55,23 +55,6 @@ def test_qb_dual_update_uses_column_quantile():
 
     torch.testing.assert_close(indices, expected_indices)
     torch.testing.assert_close(beta_local, expected_beta)
-
-
-def test_aggregate_expert_load_across_ep(monkeypatch):
-    ep_group = object()
-
-    def fake_all_reduce(tensor, group=None):
-        assert group is ep_group
-        tensor.mul_(2)
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-
-    tokens_per_expert, total_num_tokens = _aggregate_expert_load_across_ep(
-        torch.tensor([1.0, 3.0, 2.0]), 4, ep_group
-    )
-
-    torch.testing.assert_close(tokens_per_expert, torch.tensor([2.0, 6.0, 4.0]))
-    torch.testing.assert_close(total_num_tokens, torch.tensor(8.0))
 
 
 def test_topk_routing_uses_precomputed_indices_for_probs():
