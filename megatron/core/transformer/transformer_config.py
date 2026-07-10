@@ -910,6 +910,10 @@ class TransformerConfig(ModelParallelConfig):
     """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
     aux-loss-free (DeepSeek-style) router biases."""
 
+    moe_router_ep_violation_metrics: bool = False
+    """Log per-microbatch expert-load violation metrics after aggregating token counts across
+    the expert-parallel group (an effective batch size of EP times MBS)."""
+
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""

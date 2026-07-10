@@ -28,6 +28,17 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _aggregate_expert_load_across_ep(
+    tokens_per_expert: torch.Tensor,
+    total_num_tokens: int,
+    ep_group: torch.distributed.ProcessGroup,
+):
+    """Aggregate expert and valid-token counts over the expert-parallel group."""
+    counts = torch.cat((tokens_per_expert, tokens_per_expert.new_tensor([total_num_tokens])))
+    torch.distributed.all_reduce(counts, group=ep_group)
+    return counts[:-1], counts[-1]
+
+
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -55,6 +66,7 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
+        self.ep_group = pg_collection.ep
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -825,6 +837,33 @@ class TopKRouter(Router):
                         num_layers,
                         reduce_group=self.tp_cp_group,
                     )
+
+                if self.config.moe_router_ep_violation_metrics:
+                    ep_tokens_per_expert, ep_total_num_tokens = (
+                        _aggregate_expert_load_across_ep(
+                            tokens_per_expert, total_num_tokens, self.ep_group
+                        )
+                    )
+                    ep_max_violation, ep_min_violation, ep_median_violation = (
+                        expert_load_violation_batchwise(
+                            tokens_per_expert=ep_tokens_per_expert,
+                            num_experts=self.config.num_moe_experts,
+                            total_num_tokens=ep_total_num_tokens,
+                            topk=self.topk,
+                        )
+                    )
+                    for name, value in (
+                        ("ep_expert_max_violation", ep_max_violation),
+                        ("ep_expert_min_violation", ep_min_violation),
+                        ("ep_expert_median_violation", ep_median_violation),
+                    ):
+                        save_to_aux_losses_tracker(
+                            name,
+                            value,
+                            self.layer_number,
+                            num_layers,
+                            reduce_group=self.tp_cp_group,
+                        )
 
         return probs, routing_map
 

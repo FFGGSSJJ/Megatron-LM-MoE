@@ -2195,6 +2195,10 @@ def training_log(
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
+        if args.moe_router_ep_violation_metrics:
+            track_names.append("ep_expert_max_violation")
+            track_names.append("ep_expert_min_violation")
+            track_names.append("ep_expert_median_violation")
         if args.moe_router_bias_metrics:
             uses_quantile_balancing = "quantile_balancing" in args.moe_router_load_balancing_type
             if args.moe_router_enable_expert_bias and not uses_quantile_balancing:
