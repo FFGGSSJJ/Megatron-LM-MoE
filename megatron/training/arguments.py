@@ -29,7 +29,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
+from megatron.core.activations import squared_relu, rlglu_act
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_sssglu import ssslu
 from megatron.training.utils import (
@@ -1088,8 +1088,8 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.ffn_hidden_size is None:
         if (
-            args.swiglu or args.sssglu or args.reglu or args.pnglu or args.gxpr or args.gxpry
-            or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
+            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.gxpr
+            or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1743,6 +1743,13 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.relu
         kw_args['bias_activation_fusion'] = False
+    elif args.rlglu:
+        # RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. Non-learnable,
+        # no fused kernel (yet) -> generic GLU path with activation_func == rlglu_act.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = rlglu_act
+        kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -1775,6 +1782,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'swiglu': args.swiglu,
         'sssglu': args.sssglu,
         'reglu': args.reglu,
+        'rlglu': args.rlglu,
         'squared_relu': args.squared_relu,
         'quick_geglu': args.quick_geglu,
         'pnglu': args.pnglu,
@@ -2249,6 +2257,10 @@ def _add_network_size_args(parser):
                        help='Use ReGLU: ReLU-gated linear unit, relu(x_glu) * x_linear. '
                        'Non-learnable; implies gated linear units. No fused kernel (runs '
                        'through the generic GLU path).')
+    group.add_argument('--rlglu', action='store_true',
+                       help='Use RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. '
+                       'Non-learnable; implies gated linear units. No fused kernel (runs through '
+                       'the generic GLU path).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '

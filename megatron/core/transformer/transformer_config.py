@@ -1532,6 +1532,16 @@ class TransformerConfig(ModelParallelConfig):
                 "(moe_use_offloading_experts=True)."
             )
 
+        # RLGLU (gate max(x,0)-0.5*ln(1+|x|)) likewise has no offloading-experts kernel yet.
+        # Lazy import avoids a transformer_config <- activations <- module <- transformer_config cycle.
+        if self.gated_linear_unit and self.moe_use_offloading_experts:
+            from megatron.core.activations import rlglu_act as _rlglu_act
+            if self.activation_func == _rlglu_act:
+                raise ValueError(
+                    "RLGLU (--rlglu) is not wired into the offloading-experts path "
+                    "(moe_use_offloading_experts=True)."
+                )
+
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 

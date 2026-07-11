@@ -900,6 +900,18 @@ def squared_relu(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(F.relu(x), 2)
 
 
+def rlglu_act(x: torch.Tensor) -> torch.Tensor:
+    """RLGLU gate: ``f(x) = max(x, 0) - 0.5 * ln(1 + |x|)``.
+
+    Used as the gate of a gated linear unit (``rlglu_act(x_glu) * x_linear``) via the generic
+    (non-fused) GLU path — dispatched by ``activation_func == rlglu_act`` with
+    ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. No fused kernel yet, so it
+    runs eager. Its derivative decays like ``1/(1+|x|)`` (relative-gradient-error condition
+    number -> 1), at the cost of an unbounded (logarithmic) negative tail.
+    """
+    return torch.relu(x) - 0.5 * torch.log1p(x.abs())
+
+
 @jit_fuser
 def quick_gelu(x: torch.Tensor) -> torch.Tensor:
     """Quick GELU activation"""
