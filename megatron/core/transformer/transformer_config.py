@@ -29,6 +29,13 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+# Valid entries for `moe_offload_activations` (which FP8 expert activations to offload to pinned
+# host during the combine window). Kept here so the config validation and the offloader agree on the
+# spelling.
+MOE_OFFLOAD_INPUT = "moe_input"  # fp8_x, the permuted expert input (saved on all paths)
+MOE_OFFLOAD_FC1_OUTPUT = "moe_fc1_output"  # fp8_fc1_output, the gated pre-activation (non-recompute)
+MOE_OFFLOAD_ACTIVATION_CHOICES = (MOE_OFFLOAD_INPUT, MOE_OFFLOAD_FC1_OUTPUT)
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -346,6 +353,16 @@ class TransformerConfig(ModelParallelConfig):
     while leaving the residual stream itself untouched, which bounds activation growth in deep
     networks. Applies to the self-attention and MLP sublayers."""
 
+    post_attn_norm_zero_init: bool = False
+    """If True (requires `sandwich_norm`), zero-initialize the gain of the post-attention sandwich
+    norm (`post_self_attn_layernorm`) so the attention sublayer contributes nothing to the residual
+    stream at init (`x = x + 0 * Norm(Attn(Norm(x))) = x`). The network therefore starts as a pure
+    stack of MLP/MoE blocks, which can help the MoE router settle before attention starts
+    contributing. Only the post-attention norm is zeroed; the post-MLP sandwich norm keeps its
+    default (unit) gain, and the gains train normally afterwards. When
+    `layernorm_zero_centered_gamma` is set (effective gain = `1 + weight`), the gain is zeroed via
+    `weight = -1` so the effective gain is still 0."""
+
     scale_embeddings_by_sqrt_hidden: bool = False
     """If True, multiply the output of the embedding by ``sqrt(hidden_size)``. Combined with an
     embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the
@@ -367,9 +384,10 @@ class TransformerConfig(ModelParallelConfig):
     `x = LN_post(alpha * x + Sublayer(LN_pre(x)))`, i.e. the residual ("highway") branch is scaled
     by `alpha` (see `keel_alpha`) and the *summed* output is normalized (Post-LN), while the
     sub-layer input is still pre-normalized (`LN_pre`, reusing the existing input/pre-mlp norms).
-    The very first attention and MLP sub-layers drop both `alpha` and the Post-LN, degrading to
-    plain Pre-LN to keep signal from the embedding well-conditioned. Requires RMSNorm and is
-    mutually exclusive with `sandwich_norm`."""
+    For decoder layer 1, `alpha` is dropped on both sub-layers, and the Post-LN is dropped on the
+    first *attention* sub-layer only: the first attention degrades to plain Pre-LN while the first
+    MLP keeps its Post-LN (a standard Post-LN block), keeping signal from the embedding
+    well-conditioned. Requires RMSNorm and is mutually exclusive with `sandwich_norm`."""
 
     keel_alpha: Optional[float] = None
     """Highway residual-scaling factor for KEEL. When None (default), `alpha` is set to the total
@@ -926,6 +944,20 @@ class TransformerConfig(ModelParallelConfig):
     moe_offloading_chunk_size: int = -1
     """Chunk size for offloading. If set to a positive value, it will override the chunk size calculated"""
 
+    moe_offload_activations: Optional[List[str]] = None
+    """Which saved MoE expert activations to offload to pinned host memory when the expert forward
+    finishes (overlapping the D2H with the combine phase) and reload just before the expert backward
+    (overlapping the H2D with the combine-backward phase). Reduces peak activation memory for the
+    offloading-experts path. A list of:
+
+      - "moe_input": the permuted expert input (saved on all paths).
+      - "moe_fc1_output": the gated first-linear output. Only takes effect on the
+        non-recompute path (when moe_act recompute is on, fc1_output is dropped and recomputed
+        instead). 
+    None or [] disables offload. Only supported with the inplace-FP8 offloading-experts path
+    (moe_use_offloading_experts + moe_use_inplace_fp8_param) and incompatible with moe_layer_recompute
+    (the activation is not held across the pipeline gap under full-layer recompute)."""
+
     moe_offloading_experts_skip_post_backward_hook: bool = False
     """Whether the offloading experts MLP should skip the post backward hook."""
 
@@ -971,6 +1003,14 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
+
+    moe_router_bias_metrics: bool = False
+    """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
+    aux-loss-free (DeepSeek-style) router biases."""
+
+    moe_router_ep_violation_metrics: bool = False
+    """Log per-microbatch expert-load violation metrics after aggregating token counts across
+    the expert-parallel group (an effective batch size of EP times MBS)."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
@@ -1256,6 +1296,13 @@ class TransformerConfig(ModelParallelConfig):
                 "fused TP inference kernel folds the residual add into the attention/MLP output "
                 "projection, leaving no point at which to normalize the sublayer output before "
                 "the residual add."
+            )
+
+        if self.post_attn_norm_zero_init and not self.sandwich_norm:
+            raise ValueError(
+                "post_attn_norm_zero_init requires sandwich_norm: it zero-inits the gain of the "
+                "post-attention sandwich norm (post_self_attn_layernorm), which is an IdentityOp "
+                "(no gain) unless sandwich_norm is enabled."
             )
 
         if self.keel:
@@ -1806,6 +1853,38 @@ class TransformerConfig(ModelParallelConfig):
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
+
+        if self.moe_offload_activations:
+            invalid = set(self.moe_offload_activations) - set(MOE_OFFLOAD_ACTIVATION_CHOICES)
+            if invalid:
+                raise ValueError(
+                    f"Invalid choices for moe_offload_activations: {sorted(invalid)}. "
+                    f"Valid entries: {list(MOE_OFFLOAD_ACTIVATION_CHOICES)}."
+                )
+            if not (self.moe_use_offloading_experts and self.moe_use_inplace_fp8_param):
+                raise ValueError(
+                    "moe_offload_activations requires moe_use_offloading_experts and "
+                    "moe_use_inplace_fp8_param (the inplace-FP8 offloading-experts path)."
+                )
+            if self.moe_layer_recompute or (
+                self.recompute_granularity == "selective"
+                and self.recompute_modules is not None
+                and "moe_layer" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_offload_activations is incompatible with full-layer MoE recompute "
+                    "(moe_layer_recompute / recompute_modules=['moe_layer']): the input activation "
+                    "is recomputed in backward rather than held across the pipeline gap."
+                )
+            if (
+                MOE_OFFLOAD_FC1_OUTPUT in self.moe_offload_activations
+                and MOE_OFFLOAD_INPUT not in self.moe_offload_activations
+            ):
+                raise ValueError(
+                    f"moe_offload_activations={self.moe_offload_activations!r}: "
+                    f"'{MOE_OFFLOAD_FC1_OUTPUT}' requires '{MOE_OFFLOAD_INPUT}' -- the fc1 reload "
+                    "rides the same ActivationOffloadHandle / MoEActReloadTrigger as fp8_x."
+                )
 
         if self.moe_layer_recompute:
             warnings.warn(

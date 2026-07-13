@@ -58,8 +58,8 @@ from megatron.core.transformer.moe.experts_util import (
 from megatron.core.transformer.moe.experts_fp8_util import (
     fp8_grouped_swiglu_mlp,
 )
+from megatron.core.transformer.moe.moe_offload import StreamManager
 from megatron.core.transformer.moe.experts_offloading_util import (
-    StreamManager, 
     offloading_grouped_swiglu_mlp,
 )
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
@@ -1436,6 +1436,9 @@ class OffloadingExpertsMLP(MegatronModule):
         # store hooks after wgrad reduce
         self.wgrad_accumulation_and_reduce_hooks = []
 
+        # Transient activation-offload handle (moe_offload_activations); see forward().
+        self._act_offload_handle = None
+
         # padding function
         if self.config.moe_use_inplace_fp8_param:
             self.quantization_padding = Fp8Padding(self.num_local_experts, 128)
@@ -1596,6 +1599,10 @@ class OffloadingExpertsMLP(MegatronModule):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ):
+        # Transient slot for the activation-offload handle (moe_offload_activations). Set by the
+        # inplace-FP8 path below and read by the enclosing MoE layer to wire MoEActReloadTrigger on
+        # the combine output. Reset each forward so a disabled/empty path leaves no stale handle.
+        self._act_offload_handle = None
         if permuted_local_hidden_states.nelement() != 0:
             if self.config.moe_offloading_experts_debug_mode:
                 return self._forward_debug(
@@ -1623,7 +1630,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 # Per-token PolyNorm coefficients computation
                 a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert_padded)
 
-                output = offloading_fp8_grouped_swiglu_mlp(
+                output, self._act_offload_handle = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
                     self.weight1_list,
@@ -1682,7 +1689,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 # Empty input: counts sum to 0, so a1/a2 are length-0 (None on the SwiGLU path).
                 a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert)
 
-                output = offloading_fp8_grouped_swiglu_mlp(
+                output, self._act_offload_handle = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
                     self.weight1_list,

@@ -59,6 +59,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_embedding_mode(mode):
+    return None if mode == "external" else mode
+
+
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
@@ -86,7 +90,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
         hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
-        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
+        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none", "external"]] = None,
         hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
@@ -110,10 +114,18 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         qkv_split_shapes: Optional[tuple[int, int, int]] = None,
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        is_kv_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        kv_up_proj_split_shapes: Optional[tuple[int, int]] = None,
+        is_qkv_down_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        qkv_down_proj_split_shapes: Optional[tuple[int, int]] = None,
+        split_mla_per_head: bool = False,
+        is_q_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        q_up_proj_head_dim: Optional[int] = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
         scale_mode: str = "spectral",
+        router_scale_mode: str = "none",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
@@ -122,7 +134,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.use_nesterov = use_nesterov
 
         self.hypersphere_mode = hypersphere_mode
-        self.hypersphere_embedding_mode = hypersphere_embedding_mode
+        self.hypersphere_embedding_mode = _normalize_embedding_mode(hypersphere_embedding_mode)
         self.hypersphere_router_mode = hypersphere_router_mode
         self.hypersphere_eps = hypersphere_eps
         self.hypersphere_tangential_grad = hypersphere_tangential_grad
@@ -146,10 +158,24 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
         self.qkv_split_shapes = qkv_split_shapes
         self.qkv_dim = qkv_dim
+        self.is_kv_up_proj_fn = (
+            is_kv_up_proj_fn if is_kv_up_proj_fn is not None else (lambda p: False)
+        )
+        self.kv_up_proj_split_shapes = kv_up_proj_split_shapes
+        self.is_qkv_down_proj_fn = (
+            is_qkv_down_proj_fn if is_qkv_down_proj_fn is not None else (lambda p: False)
+        )
+        self.qkv_down_proj_split_shapes = qkv_down_proj_split_shapes
+        self.split_mla_per_head = split_mla_per_head
+        self.is_q_up_proj_fn = (
+            is_q_up_proj_fn if is_q_up_proj_fn is not None else (lambda p: False)
+        )
+        self.q_up_proj_head_dim = q_up_proj_head_dim
 
         self.coefficient_type = coefficient_type
         self.num_ns_steps = num_ns_steps
         self.scale_mode = scale_mode
+        self.router_scale_mode = router_scale_mode
         self.extra_scale_factor = extra_scale_factor
 
         self.pg_collection = pg_collection
@@ -256,7 +282,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 grad = exp_avg
             flat_mode = self._resolve_mode(is_embedding, is_router) == "flat"
             with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, flat_mode=flat_mode, is_merged_offload_expert=is_merged_offload_expert)
+                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, flat_mode=flat_mode, is_merged_offload_expert=is_merged_offload_expert, is_router=is_router)
             # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
             # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
             # target radius 1/sqrt(2L) the bare update needs the same shrink factor.
@@ -294,11 +320,106 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if weight_decay != 0:
             p.add_(p, alpha=-weight_decay * group["lr"])
 
+    def _split_param_tensor(self, p, x, is_qkv: bool = False):
+        """Return split views and a merge function for grouped QKV/MLA weights."""
+        if self.split_qkv and is_qkv:
+            assert self.qkv_split_shapes is not None
+            return (
+                _split_qkv(x, self.qkv_split_shapes),
+                lambda parts: _merge_qkv(parts, x.shape, self.qkv_split_shapes),
+            )
+        if self.split_qkv and self.is_qkv_down_proj_fn(p):
+            assert self.qkv_down_proj_split_shapes is not None
+            shapes = self._local_dim0_split_shapes(
+                p, x, self.qkv_down_proj_split_shapes, allow_groups=False
+            )
+            return (
+                list(torch.split(x, shapes, dim=0)),
+                lambda parts: torch.cat(parts, dim=0),
+            )
+        if (self.split_qkv or self.split_mla_per_head) and self.is_kv_up_proj_fn(p):
+            assert self.kv_up_proj_split_shapes is not None
+            shapes = self._local_dim0_split_shapes(
+                p, x, self.kv_up_proj_split_shapes, allow_groups=True
+            )
+            if self.split_mla_per_head:
+                return (
+                    _split_grouped_dim0_per_head(x, shapes),
+                    lambda parts: _merge_grouped_dim0_per_head(parts, x.shape, shapes),
+                )
+            return (
+                _split_grouped_dim0(x, shapes),
+                lambda parts: _merge_grouped_dim0(parts, x.shape, shapes),
+            )
+        if self.split_mla_per_head and self.is_q_up_proj_fn(p):
+            assert self.q_up_proj_head_dim is not None
+            return (
+                _split_heads_dim0(x, self.q_up_proj_head_dim),
+                lambda parts: _merge_heads_dim0(parts, x.shape),
+            )
+        return None
 
-    def _orthogonalize_param(self, p, grad, is_qkv: bool = False, flat_mode: bool = False, is_merged_offload_expert: bool = False):
-        """Newton-Schulz orthogonalization, with optional QKV split. ``flat_mode`` enables the
-        init-radius rescale (see _init_radius_scale); it is per-block so Q/K/V get their own factor
-        under split_qkv."""
+    def _split_partition_dim(self, p, partition_dim):
+        """Return the TP partition dimension that still applies after splitting."""
+        if self.split_mla_per_head and (
+            self.is_q_up_proj_fn(p) or self.is_kv_up_proj_fn(p)
+        ):
+            return None
+        return partition_dim
+
+    def _local_dim0_split_shapes(self, p, x, shapes, allow_groups: bool):
+        shapes = tuple(shapes)
+        total = sum(shapes)
+        dim0 = x.size(0)
+        if dim0 == total or (allow_groups and dim0 % total == 0):
+            return shapes
+        if getattr(p, "partition_dim", None) != 0:
+            return shapes
+
+        tp_size = 1
+        if self.pg_collection is not None:
+            tp_group = (
+                self.pg_collection.expt_tp
+                if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp
+            )
+            tp_size = get_pg_size(tp_group)
+        if tp_size == 1 and total % dim0 == 0:
+            tp_size = total // dim0
+        if tp_size <= 1:
+            raise ValueError(
+                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"tensor dim0 {dim0} and global split shapes {shapes}"
+            )
+        if any(shape % tp_size != 0 for shape in shapes):
+            raise ValueError(
+                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"over TP size {tp_size}"
+            )
+
+        local_shapes = tuple(shape // tp_size for shape in shapes)
+        local_total = sum(local_shapes)
+        if dim0 != local_total and not (allow_groups and dim0 % local_total == 0):
+            raise ValueError(
+                f"Local split shapes {local_shapes} do not match tensor dim0 {dim0}"
+            )
+        return local_shapes
+
+    def _orthogonalize_param(
+        self,
+        p,
+        grad,
+        is_qkv: bool = False,
+        flat_mode: bool = False,
+        is_merged_offload_expert: bool = False,
+        is_router: bool = False,
+    ):
+        """Newton-Schulz orthogonalization, with optional QKV/MLA/expert splitting.
+
+        ``flat_mode`` enables the init-radius rescale (see _init_radius_scale); it is per-block
+        so each Q/K/V, MLA, or expert block gets its own factor. ``is_router`` selects
+        router_scale_mode over scale_mode (see _resolve_scale_mode).
+        """
         if self.pg_collection is not None:
             tp_group = (self.pg_collection.expt_tp
                         if getattr(p, "expert_tp", False)
@@ -309,24 +430,41 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        if self.split_qkv and is_qkv:
-            qs, ks, vs = _split_qkv(grad, self.qkv_split_shapes)
-            qs = self._orthogonalize_tensor(qs, tp_group, partition_dim, flat_mode)
-            ks = self._orthogonalize_tensor(ks, tp_group, partition_dim, flat_mode)
-            vs = self._orthogonalize_tensor(vs, tp_group, partition_dim, flat_mode)
-            return _merge_qkv((qs, ks, vs), grad.shape, self.qkv_split_shapes)
+        split = self._split_param_tensor(p, grad, is_qkv)
+        if split is not None:
+            parts, merge = split
+            split_partition_dim = self._split_partition_dim(p, partition_dim)
+            parts = [
+                self._orthogonalize_tensor(
+                    g,
+                    tp_group,
+                    split_partition_dim,
+                    flat_mode,
+                    is_router=is_router,
+                )
+                for g in parts
+            ]
+            return merge(parts)
 
         if is_merged_offload_expert:
             experts = _split_experts(grad)
             for i, expert in enumerate(experts):
-                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, flat_mode)
+                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, flat_mode, is_router=is_router)
             return _merge_experts(experts)
-        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode)
+        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode, is_router=is_router)
 
-    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False):
+    def _resolve_scale_mode(self, is_router: bool) -> str:
+        """Muon scale-factor mode for this param. Routers use ``router_scale_mode`` (default
+        "none" → scale factor 1.0); everything else uses ``scale_mode``. The router maps
+        hidden -> num_experts, so a shape-derived scale (e.g. shape_up) tracks hidden and would
+        modulate the router update with width even when the matrix LR is held fixed."""
+        return self.router_scale_mode if is_router else self.scale_mode
+
+    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False, is_router: bool = False):
         assert grad.ndim == 2
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
+            # Use the global matrix shape for Muon scaling.
             size[partition_dim] *= get_pg_size(tp_group)
         orth = newton_schulz_tp(
             grad,
@@ -336,7 +474,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             partition_dim=partition_dim,
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
-        scale = _get_muon_scale_factor(size[0], size[1], mode=self.scale_mode)
+        scale = _get_muon_scale_factor(size[0], size[1], mode=self._resolve_scale_mode(is_router))
         if flat_mode:
             scale *= self._init_radius_scale(size[0], size[1])
         return orth * scale * self.extra_scale_factor
@@ -382,12 +520,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         mode = self._resolve_mode(is_embedding, is_router)
         if mode is None:
             return
-        if is_qkv and self.split_qkv:
-            ps = _split_qkv(p, self.qkv_split_shapes)
-            gs = _split_qkv(grad, self.qkv_split_shapes)
+        split_p = self._split_param_tensor(p, p, is_qkv)
+        if split_p is not None:
+            ps, _ = split_p
+            gs, merge = self._split_param_tensor(p, grad, is_qkv)
             for pi, gi in zip(ps, gs):
                 self._project_tangent_single_(pi, gi, is_out_proj, mode)
-            grad.copy_(_merge_qkv(gs, grad.size(), self.qkv_split_shapes))
+            grad.copy_(merge(gs))
             return
         if is_merged_offload_expert:
             ps = _split_experts(p)
@@ -418,7 +557,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         grad.sub_(p * radial)
 
     def _normalize(self, p, x, is_qkv: bool = False, is_out_proj: bool = False,
-                   is_embedding: bool = False, is_router: bool = False, 
+                   is_embedding: bool = False, is_router: bool = False,
                    is_merged_offload_expert: bool = False):
         """In-place L2-sphere projection of a 2D tensor `x` (sized like `p`).
 
@@ -436,16 +575,19 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         radius_scale = self._resolve_radius_scale(is_out_proj)
 
         is_expert_tp = getattr(p, "expert_tp", False)
-        if is_qkv and self.split_qkv:
-            qs, ks, vs = _split_qkv(x, self.qkv_split_shapes)
-            self._normalize_single(qs, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            self._normalize_single(ks, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            self._normalize_single(vs, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            x.copy_(_merge_qkv((qs, ks, vs), x.size(), self.qkv_split_shapes))
+        split = self._split_param_tensor(p, x, is_qkv)
+        if split is not None:
+            parts, merge = split
+            split_partition_dim = self._split_partition_dim(p, partition_dim)
+            for part in parts:
+                self._normalize_single(
+                    part, is_out_proj, mode, radius_scale, split_partition_dim, is_expert_tp
+                )
+            x.copy_(merge(parts))
             return
-        
+
         # TODO(fuguan): for now merged experts follow the same pipeline of normalization
-        # as qkv. But it might introduce high memory cost. 
+        # as qkv. But it might introduce high memory cost.
         if is_merged_offload_expert:
             experts = _split_experts(x)
             for expert in experts:
@@ -510,10 +652,10 @@ class MDDecoupling(_MDDecouplingBase):
     def __init__(
         self,
         params,
-        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed"]] = None,
-        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
-        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
-        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "none"]] = None,
+        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed", "none"]] = None,
+        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
         gains_lr: Optional[float] = None,
         gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
@@ -523,15 +665,19 @@ class MDDecoupling(_MDDecouplingBase):
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
-        # Drop the 1e-8 clamp_min on phi(g) in _preprocess_gains so gains can shrink through 1e-8
-        # or flip sign (only meaningful for gain_parametrization="direct"; no-op for softplus).
         gains_no_clamp_min: bool = False,
         **kwargs,
     ):
-        self.hypersphere_gains_mode = hypersphere_gains_mode
-        self.hypersphere_gains_mode_output = hypersphere_gains_mode_output
-        self.hypersphere_gains_mode_embedding = hypersphere_gains_mode_embedding
-        self.hypersphere_gains_mode_router = hypersphere_gains_mode_router
+        self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
+        self.hypersphere_gains_mode_output = (
+            None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
+        )
+        self.hypersphere_gains_mode_embedding = (
+            None if hypersphere_gains_mode_embedding == "inherit" else hypersphere_gains_mode_embedding
+        )
+        self.hypersphere_gains_mode_router = (
+            None if hypersphere_gains_mode_router == "inherit" else hypersphere_gains_mode_router
+        )
         self.gains_no_clamp_min = gains_no_clamp_min
         self.gains_lr = gains_lr  # None → follow group["lr"] verbatim
         self.gains_min_lr = gains_min_lr  # gains LR floor (matches the group's min_lr policy)
@@ -607,8 +753,8 @@ class MDDecoupling(_MDDecouplingBase):
         A 3D merged offload-expert weight (num_local_experts, out, in) is a stack of
         independent (out, in) expert weights: row_gain (E, out), col_gain (E, in),
         flat_gain (E,). The reduced axes shift up by one (in-axis -> dim 2, out-axis -> dim 1)
-        and the per-expert flat norm reduces over (1, 2) instead of the whole tensor. 
-        The *_bk entries are the slice tuples used to broadcast the effective gains back onto p: 
+        and the per-expert flat norm reduces over (1, 2) instead of the whole tensor.
+        The *_bk entries are the slice tuples used to broadcast the effective gains back onto p:
         2D uses [:, None] / [None, :]; 3D adds a leading expert axis.
         """
         if getattr(p, "merged_offload_expert", False):
@@ -767,7 +913,7 @@ class MDDecoupling(_MDDecouplingBase):
             p.div_(col_eff[layout["col_bk"]].clamp_min(eps) if clamp else col_eff[layout["col_bk"]])
 
         # Compute ∂L/∂phi(g) from bare p and the gain-baked grad still on p.grad.
-        # Reduction dims shift up by one for 3D experts (in-axis dim 2, out-axis dim 1) 
+        # Reduction dims shift up by one for 3D experts (in-axis dim 2, out-axis dim 1)
         # so the sums land on the per-expert gain axes (E, out) / (E, in).
         p_times_pgrad = p * p.grad
         gain_grads = {}
@@ -886,15 +1032,17 @@ class MDDecoupling(_MDDecouplingBase):
             p.mul_(self._phi(col)[lay["col_bk"]])
 
     def _resolve_gains_mode(self, p):
-        is_output = getattr(p, "is_output_parameter", False)
-        is_embedding = getattr(p, "is_embedding_parameter", False)
+        if self.hypersphere_gains_mode is None:
+            return None
+        is_output = getattr(p, "is_md_output_parameter", False)
+        is_embedding = getattr(p, "is_md_embedding_parameter", False)
         is_router = getattr(p, "is_router", False)
         if is_router and self.hypersphere_gains_mode_router is not None:
             return self.hypersphere_gains_mode_router
-        if is_output and self.hypersphere_gains_mode_output is not None:
-            return self.hypersphere_gains_mode_output
         if is_embedding and self.hypersphere_gains_mode_embedding is not None:
             return self.hypersphere_gains_mode_embedding
+        if is_output and self.hypersphere_gains_mode_output is not None:
+            return self.hypersphere_gains_mode_output
         return self.hypersphere_gains_mode
 
 
@@ -944,6 +1092,48 @@ def _merge_experts(experts: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(experts, dim=0)
 
 
+def _split_grouped_dim0(x, shapes: tuple[int, int]) -> list[torch.Tensor]:
+    """Split a dim-0 grouped projection layout into its logical blocks."""
+    xshape = x.shape
+    num_groups = xshape[0] // sum(shapes)
+    parts = torch.split(x.view(num_groups, sum(shapes), -1), shapes, dim=1)
+    return [g.reshape(-1, xshape[-1]) for g in parts]
+
+
+def _merge_grouped_dim0(parts, xshape: tuple[int, int], shapes: tuple[int, int]) -> torch.Tensor:
+    num_groups = xshape[0] // sum(shapes)
+    parts = [g.view(num_groups, -1, xshape[-1]) for g in parts]
+    return torch.cat(parts, dim=1).view(xshape)
+
+
+def _split_grouped_dim0_per_head(x, shapes: tuple[int, int]) -> list[torch.Tensor]:
+    """Split each head in a grouped dim-0 layout into independent logical blocks."""
+    num_heads = x.shape[0] // sum(shapes)
+    heads = x.view(num_heads, sum(shapes), -1).unbind(0)
+    return [part for head in heads for part in torch.split(head, shapes, dim=0)]
+
+
+def _merge_grouped_dim0_per_head(
+    parts, xshape: tuple[int, int], shapes: tuple[int, int]
+) -> torch.Tensor:
+    blocks_per_head = len(shapes)
+    heads = [
+        torch.cat(parts[i : i + blocks_per_head], dim=0)
+        for i in range(0, len(parts), blocks_per_head)
+    ]
+    return torch.stack(heads, dim=0).view(xshape)
+
+
+def _split_heads_dim0(x, head_dim: int) -> list[torch.Tensor]:
+    xshape = x.shape
+    num_heads = xshape[0] // head_dim
+    return list(x.view(num_heads, head_dim, -1).unbind(0))
+
+
+def _merge_heads_dim0(parts, xshape: tuple[int, int]) -> torch.Tensor:
+    return torch.stack(parts, dim=0).view(xshape)
+
+
 # ===========================================================================
 # Optimizer builder
 # ===========================================================================
@@ -986,7 +1176,8 @@ def _mddecoupling_config_overrides(
     # MDDecoupling on the Adam branch (use_orthogonal_updates=False) + post-step normalization.
     # When it is None they are routed to the external chained Adam (see the param partition in
     # get_megatron_mddecoupling_optimizer), so no MDDecoupling override is needed here.
-    if config.hypersphere_embedding_mode is not None:
+    hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
+    if hypersphere_embedding_mode is not None:
         overrides[ParamKey(attr='is_embedding_or_output_parameter')] = {
             'use_orthogonal_updates': False
         }
@@ -1009,7 +1200,7 @@ def _mddecoupling_config_overrides(
 
     # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
     # get base lr from the router_override above.
-    # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in), 
+    # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
         name="md_non_embedding_or_output_matrix",
@@ -1022,10 +1213,10 @@ def _mddecoupling_config_overrides(
         'min_lr': _group_min_lr(config, matrix_lr),
     }
 
-    # Embedding LR (embedding + tied LM head share is_embedding_parameter).
+    # Embedding LR (embedding + tied LM head).
     if config.embedding_lr_multiplier is not None:
         emb_lr = config.embedding_lr_multiplier * config.lr
-        overrides[ParamKey(attr='is_embedding_parameter')] = {
+        overrides[ParamKey(attr='is_md_embedding_parameter')] = {
             'max_lr': emb_lr,
             'min_lr': _group_min_lr(config, emb_lr),
         }
@@ -1034,8 +1225,8 @@ def _mddecoupling_config_overrides(
     if config.output_lr is not None:
         output_only = ParamPredicate(
             name="md_output_not_embedding",
-            fn=lambda p: (getattr(p, "is_output_parameter", False)
-                          and not getattr(p, "is_embedding_parameter", False)),
+            fn=lambda p: (getattr(p, "is_md_output_parameter", False)
+                          and not getattr(p, "is_md_embedding_parameter", False)),
         )
         overrides[ParamKey(predicate=output_only)] = {
             'max_lr': config.output_lr,
@@ -1108,36 +1299,79 @@ def get_megatron_mddecoupling_optimizer(
 
     # Tag parameters with optimizer-specific attributes and compute qkv split shapes.
     qkv_split_shapes: Optional[List[int]] = None
+    kv_up_proj_split_shapes: Optional[tuple[int, int]] = None
+    qkv_down_proj_split_shapes: Optional[tuple[int, int]] = None
+    q_up_proj_head_dim: Optional[int] = None
     for model_chunk in model_chunks:
         cfg = model_chunk.config
+        num_attention_heads = cfg.num_attention_heads
+        num_query_groups = cfg.num_query_groups
+        kv_channels = cfg.kv_channels
         qkv_split_shapes = [
-            cfg.num_attention_heads // cfg.num_query_groups * cfg.kv_channels,
-            cfg.kv_channels,
-            cfg.kv_channels,
+            num_attention_heads // num_query_groups * kv_channels,
+            kv_channels,
+            kv_channels,
         ]
+        is_mla = getattr(cfg, 'multi_latent_attention', False)
+        if is_mla:
+            # MLA views KV as [num_heads, qk_head_dim + v_head_dim], so these
+            # shapes describe the K/V layout within each repeated head group.
+            kv_up_proj_split_shapes = (cfg.qk_head_dim, cfg.v_head_dim)
+            q_up_proj_head_dim = (
+                cfg.qk_head_dim + cfg.qk_pos_emb_head_dim
+                if config.muon_split_mla_per_head
+                else None
+            )
+        else:
+            kv_up_proj_split_shapes = None
+            q_up_proj_head_dim = None
+
+        qkv_down_proj_split_shapes = (
+            cfg.q_lora_rank,
+            cfg.kv_lora_rank + cfg.qk_pos_emb_head_dim,
+        ) if is_mla and getattr(cfg, 'q_lora_rank', None) is not None else None
+
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'experts' in name and 'shared' not in name:
+            is_expert_param = 'experts' in name and 'shared' not in name
+            is_merged_offload_expert = (
+                is_expert_param
+                and len(param.shape) == 3
+                and getattr(model_chunk.config, "moe_use_offloading_experts", False)
+                and getattr(model_chunk.config, "moe_use_inplace_fp8_param", False)
+            )
+            if is_expert_param:
                 param.expert_tp = True
-            # the merged offloading-expert weight is a single 3D (num_local_experts, out, in) tensor
-            if ('experts' in name and 'shared' not in name and len(param.shape) == 3
-                    and model_chunk.config.moe_use_offloading_experts
-                    and model_chunk.config.moe_use_inplace_fp8_param):
+            if is_merged_offload_expert:
                 param.merged_offload_expert = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+            if len(param.shape) == 2 and 'linear_qkv.weight' in name:
                 param.is_qkv = True
-            if name.endswith('router.weight') and len(param.shape) == 2:
+            if len(param.shape) == 2 and 'linear_kv_up_proj.weight' in name:
+                param.is_kv_up_proj = True
+            if len(param.shape) == 2 and 'linear_q_up_proj.weight' in name:
+                param.is_q_up_proj = True
+            if len(param.shape) == 2 and 'linear_qkv_down_proj.weight' in name:
+                param.is_qkv_down_proj = True
+            if len(param.shape) == 2 and name.endswith('router.weight'):
                 param.is_router = True
-            
-            is_out_proj = (('linear_fc2' in name or 'linear_proj' in name) and len(param.shape) == 2) or \
-                          ('experts.weight2' in name and len(param.shape) == 3)
+            if len(param.shape) == 2 and name.endswith('word_embeddings.weight'):
+                param.is_md_embedding_parameter = True
+            if len(param.shape) == 2 and name.endswith('output_layer.weight'):
+                if getattr(param, "shared_embedding", False):
+                    param.is_md_embedding_parameter = True
+                elif not getattr(param, "is_md_embedding_parameter", False):
+                    param.is_md_output_parameter = True
+            is_out_proj = (
+                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name))
+                or (is_merged_offload_expert and 'experts.weight2' in name)
+            )
             if is_out_proj:
                 param.is_out_proj = True
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
-    emb_in_md = config.hypersphere_embedding_mode is not None
+    hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
+    emb_in_md = hypersphere_embedding_mode is not None
     linear_params = []
     nonlinear_params = []
     for model_chunk in model_chunks:
@@ -1163,7 +1397,7 @@ def get_megatron_mddecoupling_optimizer(
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         hypersphere_mode=config.hypersphere_mode,
-        hypersphere_embedding_mode=config.hypersphere_embedding_mode,
+        hypersphere_embedding_mode=hypersphere_embedding_mode,
         hypersphere_router_mode=config.hypersphere_router_mode,
         hypersphere_tangential_grad=config.hypersphere_tangential_grad,
         hypersphere_preserve_init=config.hypersphere_preserve_init,
@@ -1178,10 +1412,18 @@ def get_megatron_mddecoupling_optimizer(
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=qkv_split_shapes,
         qkv_dim=model_chunks[0].config.kv_channels,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=kv_up_proj_split_shapes,
+        is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
+        qkv_down_proj_split_shapes=qkv_down_proj_split_shapes,
+        split_mla_per_head=config.muon_split_mla_per_head,
+        is_q_up_proj_fn=lambda p: getattr(p, "is_q_up_proj", False),
+        q_up_proj_head_dim=q_up_proj_head_dim,
         fp32_matmul_prec=config.muon_fp32_matmul_prec,
         coefficient_type=config.muon_coefficient_type,
         num_ns_steps=config.muon_num_ns_steps,
         scale_mode=config.muon_scale_mode,
+        router_scale_mode=config.muon_router_scale_mode,
         extra_scale_factor=config.muon_extra_scale_factor,
         pg_collection=pg_collection,
         tp_mode=config.muon_tp_mode,
@@ -1252,6 +1494,7 @@ def get_megatron_mddecoupling_optimizer(
 
     prev_optimizer = config.optimizer
     config.optimizer = 'adam'
+    # TODO: should adam also get the md_decoupling pg_collection passed to it?
     chained_adam = get_megatron_optimizer(
         config,
         model_chunks,

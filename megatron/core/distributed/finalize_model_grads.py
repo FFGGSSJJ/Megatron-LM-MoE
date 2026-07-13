@@ -433,6 +433,46 @@ def _update_router_qb_beta(
         qb_beta.copy_(new_beta)
 
 
+def _log_router_bias_metrics(model: List[torch.nn.Module], config: TransformerConfig):
+    """Log post-update statistics for the enabled MoE router biases."""
+    if not config.moe_router_bias_metrics:
+        return
+
+    num_layers = config.num_layers
+    if config.mtp_num_layers is not None:
+        num_layers += config.mtp_num_layers
+
+    # These statistics are recorded once per global batch. Cancel the microbatch scaling
+    # applied by track_moe_metrics.
+    num_microbatches = get_num_microbatches()
+    uses_quantile_balancing = "quantile_balancing" in config.moe_router_load_balancing_type
+    with torch.no_grad():
+        for model_chunk in model:
+            for module in get_attr_wrapped_model(model_chunk, 'modules')():
+                if not module.training:
+                    continue
+                active_biases = []
+                if config.moe_router_enable_expert_bias and not uses_quantile_balancing:
+                    active_biases.append(('expert_bias', getattr(module, 'expert_bias', None)))
+                if uses_quantile_balancing:
+                    active_biases.append(('qb_beta', getattr(module, 'qb_beta', None)))
+                for metric_prefix, bias in active_biases:
+                    if bias is None:
+                        continue
+                    for statistic, value in (
+                        ('mean', bias.mean()),
+                        ('std', bias.std(correction=0)),
+                        ('min', bias.min()),
+                        ('max', bias.max()),
+                    ):
+                        save_to_aux_losses_tracker(
+                            f'{metric_prefix}_{statistic}',
+                            value * num_microbatches,
+                            module.layer_number,
+                            num_layers,
+                        )
+
+
 def _allreduce_non_tensor_model_parallel_grads(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -598,6 +638,8 @@ def finalize_model_grads(
 
     if "quantile_balancing" in config.moe_router_load_balancing_type:
         _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
+
+    _log_router_bias_metrics(model, config)
 
     reset_model_temporary_tensors(config, model)
 

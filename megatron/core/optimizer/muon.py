@@ -148,6 +148,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+    def _split_partition_dim(self, p, partition_dim):
+        """Return the TP partition dimension that still applies after splitting."""
+        if self.split_mla_per_head:
+            is_q_up_proj = self.is_q_up_proj_fn is not None and self.is_q_up_proj_fn(p)
+            is_kv_up_proj = (
+                self.is_kv_up_proj_fn is not None and self.is_kv_up_proj_fn(p)
+            )
+            if is_q_up_proj or is_kv_up_proj:
+                return None
+        return partition_dim
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -215,14 +226,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'split shapes {self.qkv_down_proj_split_shapes}',
             )
             assert self.qkv_down_proj_split_shapes is not None
-            qkv_down_grads = torch.split(grad, self.qkv_down_proj_split_shapes, dim=0)
+            split_shapes = self._local_dim0_split_shapes(
+                p, grad, self.qkv_down_proj_split_shapes, allow_groups=False
+            )
+            qkv_down_grads = torch.split(grad, split_shapes, dim=0)
             qkv_down_grads = [
                 self.scaled_orthogonalize_fn(g, tp_group, partition_dim)
                 for g in qkv_down_grads
             ]
             grad = torch.cat(qkv_down_grads, dim=0)
         elif (
-            self.split_qkv
+            (self.split_qkv or self.split_mla_per_head)
             and self.is_kv_up_proj_fn is not None
             and self.is_kv_up_proj_fn(p)
         ):
@@ -234,26 +248,31 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'split shapes {self.kv_up_proj_split_shapes}',
             )
             assert self.kv_up_proj_split_shapes is not None
+            split_shapes = self._local_dim0_split_shapes(
+                p, grad, self.kv_up_proj_split_shapes, allow_groups=True
+            )
             if self.split_mla_per_head:
-                num_heads = grad_shape[0] // sum(self.kv_up_proj_split_shapes)
-                kv_grads = torch.split(
-                    grad.view(num_heads, sum(self.kv_up_proj_split_shapes), -1),
-                    self.kv_up_proj_split_shapes,
-                    dim=1,
-                )
-                kv_grads = [g.reshape(-1, grad_shape[-1]) for g in kv_grads]
+                num_heads = grad_shape[0] // sum(split_shapes)
+                heads = grad.view(num_heads, sum(split_shapes), -1).unbind(0)
                 kv_grads = [
-                    self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                        num_heads, -1, grad_shape[-1]
-                    )
+                    block for head in heads for block in torch.split(head, split_shapes, dim=0)
+                ]
+                split_partition_dim = self._split_partition_dim(p, partition_dim)
+                kv_grads = [
+                    self.scaled_orthogonalize_fn(g, tp_group, split_partition_dim)
                     for g in kv_grads
                 ]
-                grad = torch.cat(kv_grads, dim=1).view(grad_shape)
+                blocks_per_head = len(split_shapes)
+                heads = [
+                    torch.cat(kv_grads[i : i + blocks_per_head], dim=0)
+                    for i in range(0, len(kv_grads), blocks_per_head)
+                ]
+                grad = torch.stack(heads, dim=0).view(grad_shape)
             else:
-                num_groups = grad_shape[0] // sum(self.kv_up_proj_split_shapes)
+                num_groups = grad_shape[0] // sum(split_shapes)
                 kv_grads = torch.split(
-                    grad.view(num_groups, sum(self.kv_up_proj_split_shapes), -1),
-                    self.kv_up_proj_split_shapes,
+                    grad.view(num_groups, sum(split_shapes), -1),
+                    split_shapes,
                     dim=1,
                 )
                 kv_grads = [g.reshape(-1, grad_shape[-1]) for g in kv_grads]
@@ -265,8 +284,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 ]
                 grad = torch.cat(kv_grads, dim=1).view(grad_shape)
         elif (
-            self.split_qkv
-            and self.split_mla_per_head
+            self.split_mla_per_head
             and self.is_q_up_proj_fn is not None
             and self.is_q_up_proj_fn(p)
         ):
@@ -280,13 +298,52 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             assert self.q_up_proj_head_dim is not None
             num_heads = grad_shape[0] // self.q_up_proj_head_dim
             q_grads = grad.view(num_heads, self.q_up_proj_head_dim, -1).unbind(0)
+            split_partition_dim = self._split_partition_dim(p, partition_dim)
             q_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in q_grads
+                self.scaled_orthogonalize_fn(g, tp_group, split_partition_dim) for g in q_grads
             ]
             grad = torch.stack(q_grads, dim=0).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
+
+    def _local_dim0_split_shapes(self, p, x, shapes, allow_groups: bool):
+        shapes = tuple(shapes)
+        total = sum(shapes)
+        dim0 = x.size(0)
+        if dim0 == total or (allow_groups and dim0 % total == 0):
+            return shapes
+        if getattr(p, "partition_dim", None) != 0:
+            return shapes
+
+        tp_size = 1
+        if self.pg_collection is not None:
+            tp_group = (
+                self.pg_collection.expt_tp
+                if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp
+            )
+            tp_size = get_pg_size(tp_group)
+        if tp_size == 1 and total % dim0 == 0:
+            tp_size = total // dim0
+        if tp_size <= 1:
+            raise ValueError(
+                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"tensor dim0 {dim0} and global split shapes {shapes}"
+            )
+        if any(shape % tp_size != 0 for shape in shapes):
+            raise ValueError(
+                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"over TP size {tp_size}"
+            )
+
+        local_shapes = tuple(shape // tp_size for shape in shapes)
+        local_total = sum(local_shapes)
+        if dim0 != local_total and not (allow_groups and dim0 % local_total == 0):
+            raise ValueError(
+                f"Local split shapes {local_shapes} do not match tensor dim0 {dim0}"
+            )
+        return local_shapes
 
 
 def get_megatron_muon_optimizer(
@@ -382,15 +439,15 @@ def get_megatron_muon_optimizer(
         ]
         mla_config = model_chunk.config
         is_mla = getattr(mla_config, 'multi_latent_attention', False)
-        if is_mla and config.muon_split_mla_per_head:
+        if is_mla:
+            # MLA views KV as [num_heads, qk_head_dim + v_head_dim], so these
+            # shapes describe the K/V layout within each repeated head group.
             kv_up_proj_split_shapes = (mla_config.qk_head_dim, mla_config.v_head_dim)
-            q_up_proj_head_dim = mla_config.qk_head_dim + mla_config.qk_pos_emb_head_dim
-        elif is_mla:
-            kv_up_proj_split_shapes = (
-                num_attention_heads * mla_config.qk_head_dim,
-                num_attention_heads * mla_config.v_head_dim,
+            q_up_proj_head_dim = (
+                mla_config.qk_head_dim + mla_config.qk_pos_emb_head_dim
+                if config.muon_split_mla_per_head
+                else None
             )
-            q_up_proj_head_dim = None
         else:
             kv_up_proj_split_shapes = None
             q_up_proj_head_dim = None
