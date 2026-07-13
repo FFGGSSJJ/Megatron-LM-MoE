@@ -14,11 +14,26 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import PolyNorm, squared_relu
+from megatron.core.activations import (
+    GXPR,
+    GXPRY,
+    GXPRV2,
+    GXR2,
+    PolyNorm,
+    PolyNormAct,
+    XPR,
+    XR2,
+    XR2GLU,
+    XSSSGLU,
+    squared_relu,
+    rlglu_act,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
+from megatron.core.fusions.fused_bias_rlglu import weighted_bias_rlglu_impl
+from megatron.core.fusions.fused_bias_sssglu import ssslu, weighted_bias_sssglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -248,6 +263,41 @@ class TEGroupedMLP(MegatronModule):
                 config=self.config,
                 tp_group=self.tp_group,
             )
+        if self.config.pn3glu:
+            self.polynorm_glu = PolyNorm(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+                num_terms=3,
+            )
+
+        # XPR/GXPR/XR2/GXR2/PolyNormAct: the grouped path runs all local experts in one call, so
+        # we hold one coefficient set per local expert and expand it per-token via
+        # tokens_per_expert.
+        if self.config.xpr:
+            self.xpr_act = XPR(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.gxpr:
+            self.gxpr_glu = GXPR(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.gxpry:
+            self.gxpry_glu = GXPRY(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.gxprv2:
+            self.gxprv2_glu = GXPRV2(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.xr2:
+            self.xr2_act = XR2(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.gxr2:
+            self.gxr2_glu = GXR2(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.xr2glu:
+            self.xr2glu = XR2GLU(num_local_experts=self.num_local_experts, config=self.config)
+        if self.config.xsssglu:
+            self.xsssglu_glu = XSSSGLU(
+                num_local_experts=self.num_local_experts, config=self.config
+            )
+        if self.config.polynorm:
+            self.polynorm_act = PolyNormAct(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+            )
 
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
@@ -297,6 +347,30 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
     @staticmethod
+    def _zero_fp8_padding_rows(hidden_states, probs, actual_tokens_per_expert, padded_tokens_per_expert):
+        """Zero the FP8-padding rows that TE's Fp8Padding leaves uninitialized.
+
+        Fp8Padding allocates its output with ``torch.empty`` and only writes the real rows
+        (see ``transformer_engine.pytorch.module.fp8_padding``); padding rows hold whatever was
+        previously in that memory. That's harmless for the padded output rows themselves --
+        Fp8Unpadding slices them away before they reach the loss, so their incoming gradient is
+        exactly zero -- but PolyNorm's alpha_1/alpha_2 (and XPR/GXPR's coefficients) are
+        per-expert parameters whose gradient sums over every row mapped to that expert (real and
+        padding alike) via repeat_interleave, and a stray NaN/Inf in an uninitialized padding row
+        can poison that whole-expert gradient (``0 * NaN == NaN``) even though the row's own
+        output is unused.
+        Zeroing both operands in place before they reach the gate/GLU multiply guarantees every
+        padding row contributes exactly zero to the forward output and to every downstream
+        gradient (the gate's, and transitively fc1/fc2's weight gradients).
+        """
+        offset = 0
+        for actual, padded in zip(actual_tokens_per_expert, padded_tokens_per_expert):
+            if padded > actual:
+                hidden_states[offset + actual : offset + padded].zero_()
+                probs[offset + actual : offset + padded].zero_()
+            offset += padded
+
+    @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
@@ -323,8 +397,11 @@ class TEGroupedMLP(MegatronModule):
         Applies bias and activation function to the output of linear_fc1.
 
         ``tokens_per_expert`` (the per-local-expert token counts of ``intermediate_parallel``)
-        is only used when ``config.pnglu`` is set, to map each expert's PolyNorm
-        coefficients onto its tokens.
+        is only used when one of the learnable per-expert activations (``config.pnglu``,
+        ``config.pn3glu``, ``config.xpr``, ``config.gxpr``, ``config.gxpry``, ``config.gxprv2``,
+        ``config.xr2``, ``config.gxr2``, ``config.xr2glu``, ``config.xsssglu``,
+        ``config.polynorm``) is set, to map
+        each expert's coefficients onto its tokens.
         """
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
@@ -343,6 +420,22 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,
                     self.config.activation_func_fp8_input_store,
                 )
+            elif self.activation_func == ssslu and self.config.gated_linear_unit:
+                # dtype is handled inside the fused kernel
+                intermediate_parallel = weighted_bias_sssglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                )
+            elif self.activation_func == rlglu_act and self.config.gated_linear_unit:
+                # dtype is handled inside the fused kernel
+                intermediate_parallel = weighted_bias_rlglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                )
             elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                 intermediate_parallel = weighted_bias_quick_geglu_impl(
                     intermediate_parallel,
@@ -353,7 +446,9 @@ class TEGroupedMLP(MegatronModule):
                     self.config.activation_func_clamp_value,
                 )
             else:
-                raise ValueError("Only support fusion of swiglu and quick_gelu in TEGroupedMLP.")
+                raise ValueError(
+                    "Only support fusion of swiglu, sssglu, rlglu and quick_gelu in TEGroupedMLP."
+                )
         elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
             assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
             intermediate_parallel = weighted_squared_relu_impl(
@@ -363,7 +458,7 @@ class TEGroupedMLP(MegatronModule):
             # When PolyNorm fuses the permuted_probs multiply into its kernel we skip the
             # eager post-multiply below.
             probs_fused = False
-            if self.config.gated_linear_unit and self.config.pnglu:
+            if self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)
@@ -371,6 +466,72 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.glu_linear_offset != 0.0:
                     x_linear = x_linear + self.config.glu_linear_offset
                 intermediate_parallel = self.polynorm_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and self.config.gxpr:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.gxpr_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and self.config.gxpry:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.gxpry_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and self.config.gxprv2:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.gxprv2_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and self.config.gxr2:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.gxr2_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and self.config.xr2glu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.xr2glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
+            elif self.config.gated_linear_unit and self.config.xsssglu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.xsssglu_glu(
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
@@ -385,6 +546,18 @@ class TEGroupedMLP(MegatronModule):
                     return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
+            elif self.config.xpr:
+                intermediate_parallel = self.xpr_act(
+                    intermediate_parallel, tokens_per_expert=tokens_per_expert
+                )
+            elif self.config.xr2:
+                intermediate_parallel = self.xr2_act(
+                    intermediate_parallel, tokens_per_expert=tokens_per_expert
+                )
+            elif self.config.polynorm:
+                intermediate_parallel = self.polynorm_act(
+                    intermediate_parallel, tokens_per_expert=tokens_per_expert
+                )
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
             if not probs_fused:
@@ -419,6 +592,27 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
+            if (
+                self.config.pnglu
+                or self.config.pn3glu
+                or self.config.xpr
+                or self.config.gxpr
+                or self.config.gxpry
+                or self.config.gxprv2
+                or self.config.xr2
+                or self.config.gxr2
+                or self.config.xr2glu
+                or self.config.xsssglu
+                or self.config.polynorm
+            ):
+                # These all have the same per-expert-coefficient repeat_interleave gradient
+                # exposure as PolyNorm (see the docstring below) -- zero their padding rows too.
+                self._zero_fp8_padding_rows(
+                    permuted_local_hidden_states,
+                    permuted_probs,
+                    actual_tokens_per_expert,
+                    tokens_per_expert,
+                )
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
 
@@ -494,9 +688,12 @@ class TEGroupedMLP(MegatronModule):
         sharded_state_dict = {}
         for name, module in self._modules.items():
             module_sharded_offsets = sharded_offsets
-            if name == 'polynorm_glu' and not singleton_local_shards:
-                # The PolyNorm coefficients are stored as a single (num_local_experts,)
-                # tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
+            if name in (
+                'polynorm_glu', 'xpr_act', 'gxpr_glu', 'gxpry_glu', 'gxprv2_glu', 'xr2_act',
+                'gxr2_glu', 'xr2glu', 'xsssglu_glu', 'polynorm_act',
+            ) and not singleton_local_shards:
+                # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/XSSSGLU/PolyNormAct coefficients are stored as a single
+                # (num_local_experts,) tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
                 # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
                 # mirroring how the expert weights are mapped to global experts. Without this,
                 # every EP rank would write the same key with identical offsets/replica_id and

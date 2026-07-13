@@ -16,6 +16,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
+from ..fusions.fused_bias_sssglu import ssslu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
     get_te_version,
@@ -227,6 +228,103 @@ class TransformerConfig(ModelParallelConfig):
     (``tp_size == 1``, e.g. ETP=1 experts); TP/ETP-sharded layers, CPU, or missing Triton fall back
     to the torch implementation automatically regardless of this flag. Set False to force the torch
     path (e.g. for debugging or bitwise comparison)."""
+
+    xpr: bool = False
+    """If True, replace the MLP activation with the learnable elementwise XPR activation:
+    ``|ap2|*x**3 + |ap1|*x**2 + |b|*x`` for ``x>0``, ``(|b|+|an|)*x*softsign(x) + |b|*x`` for
+    ``x<=0``. Not a gated unit. Each (local) expert in an MoE layer gets its own coefficients.
+    No fused kernel yet (always runs eager/torch.compile). Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
+    gxpr: bool = False
+    """If True, replace the gate of a gated linear unit with the learnable GXPR gate (the GLU
+    counterpart of ``xpr``): ``GXPR(x_glu) * x_linear`` where
+    ``gate(x) = |ap2|*x**2 + |ap1|*x + |b|`` for ``x>0`` and
+    ``gate(x) = (|b|+|an|)*softsign(x) + |b|`` for ``x<=0``. Requires ``gated_linear_unit=True``.
+    Each (local) expert in an MoE layer gets its own coefficients. Has a fused kernel (see
+    ``gxpr_fusion``), built the same way as SwiGLU's own fusion in this codebase (``@jit_fuser``
+    torch.compile, not a hand Triton kernel), since -- unlike PolyNorm -- this gate has no
+    cross-feature reduction. Not compatible with ``bias_activation_fusion``,
+    ``use_te_activation_func``, or the offloading-experts path."""
+
+    gxpr_fusion: bool = True
+    """If True (default), use the fused kernel for GXPR (``gxpr=True``) -- it fuses the gate, the
+    ``* x_linear`` and the optional ``* score`` (MoE probs / per-token scale) multiplies into one
+    ``@jit_fuser``-compiled pass with a hand-derived analytic backward, the same fusion mechanism
+    used by SwiGLU's own fusion (``fused_bias_swiglu.py``) elsewhere in this codebase. Unlike
+    PolyNorm GLU's fused kernel, GXPR's gate has no cross-feature reduction, so this needs no
+    TP/ETP restriction (correct, with zero collectives, at any TP/ETP degree) and no
+    feature-dimension cap. The fused path is used only on CUDA; set False to force the plain torch
+    path (e.g. for debugging or bitwise comparison)."""
+
+    gxpry: bool = False
+    """If True, replace the gate of a gated linear unit with the learnable GXPRY gate: like
+    ``gxpr`` (``GXPRY(x_glu) * x_linear`` with
+    ``gate(x) = |ap2|*x**2 + |ap1|*x + |b|`` or ``gate(x) = (|b|+|an|)*softsign(x) + |b|``) but
+    the piecewise branch is selected by the sign of ``x_linear`` instead of ``x_glu``. Requires
+    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own coefficients.
+    No fused kernel yet (always runs eager/torch.compile). Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
+    gxprv2: bool = False
+    """If True, replace the gate of a gated linear unit with the GXPRV2 gate: ``gxpr`` with
+    ``beta`` removed entirely (not just initialized near zero) -- no additive floor term, and
+    the negative-branch coefficient ``an`` is no longer coupled to ``beta``:
+    ``GXPRV2(x_glu) * x_linear`` where ``gate(x) = |ap2|*x**2 + |ap1|*x`` for ``x>0`` and
+    ``gate(x) = |an|*softsign(x)`` for ``x<=0``. Unlike ``gxpr`` (``gate(0) == |beta|``), here
+    ``gate(0) == 0``, matching standard gated activations. Requires
+    ``gated_linear_unit=True``. Each (local) expert in an MoE layer gets its own coefficients.
+    No fused kernel yet (always runs eager/torch.compile). Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
+    xr2: bool = False
+    """If True, replace the MLP activation with XR2 -- ``xpr`` without the ``x**3`` term:
+    ``|ap1|*x**2 + |b|*x`` for ``x>0``, ``(|b|+|an|)*x*softsign(x) + |b|*x`` for ``x<=0``. Not a
+    gated unit. Each (local) expert gets its own coefficients. No fused kernel yet. Not
+    compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
+    gxr2: bool = False
+    """If True, replace the gate of a gated linear unit with the GXR2 gate (the GLU counterpart
+    of ``xr2``): ``GXR2(x_glu) * x_linear`` where ``gate(x) = |ap1|*x + |b|`` for ``x>0`` and
+    ``gate(x) = (|b|+|an|)*softsign(x) + |b|`` for ``x<=0``. Requires ``gated_linear_unit=True``.
+    Each (local) expert gets its own coefficients. No fused kernel yet. Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
+    xr2glu: bool = False
+    """If True, replace the gate of a gated linear unit with XR2 itself (not divided by ``x``,
+    unlike ``gxr2``): ``XR2GLU(x_glu) * x_linear`` where
+    ``XR2(x) = |ap1|*x**2 + |b|*x`` for ``x>0`` and
+    ``XR2(x) = (|b|+|an|)*x*softsign(x) + |b|*x`` for ``x<=0``. Requires
+    ``gated_linear_unit=True``. Each (local) expert gets its own coefficients. No fused kernel
+    yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
+    xsssglu: bool = False
+    """If True, replace the gate of a gated linear unit with the learnable XSSSGLU gate:
+    ``XSSSGLU(x_glu, x_linear) = (|alpha|*softsign(x_glu) + 0.5) * x_glu * x_linear``. Unlike
+    the XPR/XR2 family, this has no piecewise branch (softsign already interpolates smoothly
+    across x==0) and no separate positive/negative coefficients -- a single learnable scalar
+    ``alpha`` scales how far the softsign term pushes the gate away from a flat 0.5. Requires
+    ``gated_linear_unit=True``. Each (local) expert gets its own coefficient. No fused kernel
+    yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
+    pn3glu: bool = False
+    """If True, replace the gate of a gated linear unit with a learnable 3rd-order PolyNorm GLU
+    (``pnglu`` with an added ``x**3`` term): ``PolyNorm(x_glu) * x_linear`` where
+    ``PolyNorm(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) + |a3|*RMSNorm(x**3)``. Requires
+    ``gated_linear_unit=True``. Each (local) expert gets its own ``(a1, a2, a3)`` coefficients.
+    Unlike ``pnglu`` this has no fused Triton kernel yet and always runs the torch/TP-aware
+    fallback. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
+    offloading-experts path."""
+
+    polynorm: bool = False
+    """If True, replace the MLP activation with the non-gated 3rd-order PolyNorm activation
+    (``pn3glu`` without the GLU multiply): ``|a1|*RMSNorm(x) + |a2|*RMSNorm(x**2) +
+    |a3|*RMSNorm(x**3)``, applied directly to the activation input. Not a gated unit. Each
+    (local) expert gets its own coefficients. No fused kernel yet. Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -1364,8 +1462,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        # PolyNorm GLU (pnglu): the GLU gate becomes a small learnable module, so the fused /
-        # TE / quantized activation kernels (which hardcode SiLU/GELU) cannot be used.
+        # PolyNorm GLU (pnglu): the GLU gate becomes a small learnable module, so kernels that
+        # hardcode SiLU/GELU (TE's fused bias-activation, FlashInfer/mcore inference kernels)
+        # cannot be used. TEGroupedMLP's own fp8/fp4 quantized path is exempt -- its bias_act_func
+        # has a dedicated pnglu branch (see the NOTE below on Fp8Padding for the one correctness
+        # wrinkle that required a fix).
         if self.pnglu:
             if not self.gated_linear_unit:
                 raise ValueError(
@@ -1379,10 +1480,11 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.use_te_activation_func:
                 raise ValueError("pnglu=True is incompatible with use_te_activation_func.")
-            if self.fp8 is not None or self.fp4 is not None:
+            if (self.fp8 is not None or self.fp4 is not None) and self.moe_use_offloading_experts:
                 raise ValueError(
-                    "pnglu=True is not supported with fp8/fp4: the quantized grouped-expert path "
-                    "pads tokens_per_expert and applies fused activation kernels."
+                    "pnglu=True with fp8/fp4 and moe_use_offloading_experts=True is not supported: "
+                    "OffloadingExpertsMLP's fp8 compute is controlled by moe_use_inplace_fp8_param, "
+                    "not fp8/fp4. Use --moe-use-inplace-fp8-param (without --fp8/--fp4) instead."
                 )
             if self.use_fused_weighted_squared_relu:
                 raise ValueError("pnglu=True is incompatible with use_fused_weighted_squared_relu.")
@@ -1393,10 +1495,101 @@ class TransformerConfig(ModelParallelConfig):
                     "pnglu=True is not supported with transformer_impl='inference_optimized' "
                     "(the FlashInfer / mcore fused MoE kernels hardcode the activation type)."
                 )
+            # NOTE: TEGroupedMLP's quantized (fp8/fp4) grouped-expert path pads each expert's
+            # token block to a GEMM alignment boundary via TE's Fp8Padding, which allocates its
+            # output with torch.empty (uninitialized) and never writes the padding rows -- see
+            # transformer_engine.pytorch.module.fp8_padding._Fp8Padding.forward. That's harmless
+            # for the discarded padded output rows themselves (Fp8Unpadding slices them away
+            # before they reach the loss, so their incoming gradient is exactly zero), but
+            # PolyNorm's alpha_1/alpha_2 are per-expert parameters whose gradient sums over every
+            # row mapped to that expert -- real and padding alike -- via repeat_interleave. A
+            # stray NaN/Inf in an uninitialized padding row can poison that whole-expert gradient
+            # even though the row's own output is never used (0 * NaN = NaN). TEGroupedMLP.forward
+            # zeros the padding rows of both the hidden states and permuted_probs in place right
+            # after Fp8Padding (see _zero_fp8_padding_rows) specifically to close this gap for
+            # pnglu; the plain SwiGLU/GeGLU path has no equivalent shared-parameter reduction and
+            # is left as-is.
             # NOTE: PolyNorm reduces over the (TP/ETP-sharded) ffn feature dimension, but it
             # all-reduces the feature statistics and the alpha gradients across the relevant
             # tensor-parallel group, so it is correct (and consistent) at any TP/ETP degree. No
             # parallelism restriction is needed.
+
+        # These are all recently-added, not-yet-fused learnable activations sharing the same
+        # (narrow) compatibility envelope; they are mutually exclusive with each other.
+        _new_activation_flags = {
+            'xpr': self.xpr,
+            'gxpr': self.gxpr,
+            'gxpry': self.gxpry,
+            'gxprv2': self.gxprv2,
+            'xr2': self.xr2,
+            'gxr2': self.gxr2,
+            'xr2glu': self.xr2glu,
+            'xsssglu': self.xsssglu,
+            'pn3glu': self.pn3glu,
+            'polynorm': self.polynorm,
+        }
+        _active_new_activations = [name for name, is_set in _new_activation_flags.items() if is_set]
+        if len(_active_new_activations) > 1:
+            raise ValueError(
+                f"{_active_new_activations} are mutually exclusive; set only one of "
+                f"{list(_new_activation_flags)}."
+            )
+        if _active_new_activations:
+            _active_name = _active_new_activations[0]
+            _is_gated = _active_name in (
+                'gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'xsssglu', 'pn3glu',
+            )
+            if _is_gated and not self.gated_linear_unit:
+                raise ValueError(
+                    f"{_active_name}=True requires gated_linear_unit=True (it replaces the GLU "
+                    "gate)."
+                )
+            if self.bias_activation_fusion:
+                raise ValueError(
+                    f"{_active_name}=True is incompatible with bias_activation_fusion: there is "
+                    "no fused kernel for it yet. Disable bias-activation fusion "
+                    "(e.g. --no-bias-swiglu-fusion)."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    f"{_active_name}=True is incompatible with use_te_activation_func (no TE "
+                    "builder exists for it)."
+                )
+            if self.moe_use_offloading_experts:
+                raise ValueError(
+                    f"{_active_name}=True is not wired into the offloading-experts path yet."
+                )
+
+        # SSSGLU (activation_func == ssslu) is wired into the offloading experts' fp8 lane
+        # (moe_use_inplace_fp8_param, via sssglu_jit) but not the bf16 lane, which hardcodes
+        # SiLU. Guard so selecting SSSGLU + bf16 offloading fails loudly instead of silently
+        # running SwiGLU. Mirrors the pnglu offloading assert above.
+        if self.activation_func == ssslu and self.moe_use_offloading_experts:
+            assert self.moe_use_inplace_fp8_param, (
+                "SSSGLU (--sssglu) with offloading experts is only supported on the fp8 path; "
+                "enable --moe-use-inplace-fp8-param."
+            )
+
+        # ReGLU (gated relu) has no fused kernel and is not wired into the offloading-experts
+        # path (which hardcodes SiLU/SwiGLU); guard so it fails loudly instead of silently
+        # running SwiGLU. Same treatment as the learnable-activation offloading guard above.
+        if self.gated_linear_unit and self.activation_func == F.relu and self.moe_use_offloading_experts:
+            raise ValueError(
+                "ReGLU (--reglu) is not wired into the offloading-experts path "
+                "(moe_use_offloading_experts=True)."
+            )
+
+        # RLGLU (gate max(x,0)-0.5*ln(1+|x|)) has its own Triton kernels (rlglu_jit.py) wired into
+        # the offloading experts' fp8 lane (moe_use_inplace_fp8_param), exactly like SSSGLU; the
+        # bf16 lane hardcodes SiLU, so guard against it and fail loudly instead of silently running
+        # SwiGLU. Lazy import avoids a transformer_config <- activations <- module cycle.
+        if self.gated_linear_unit and self.moe_use_offloading_experts:
+            from megatron.core.activations import rlglu_act as _rlglu_act
+            if self.activation_func == _rlglu_act:
+                assert self.moe_use_inplace_fp8_param, (
+                    "RLGLU (--rlglu) with offloading experts is only supported on the fp8 path; "
+                    "enable --moe-use-inplace-fp8-param."
+                )
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
@@ -1924,10 +2117,14 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.bias_activation_fusion:
-            if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
+            # Lazy import: activations imports (transformer) module which imports transformer_config,
+            # so a top-level import here would create a cycle. Mirrors the rlglu offloading guard.
+            from megatron.core.activations import rlglu_act as _rlglu_act
+
+            if self.activation_func not in [F.gelu, F.silu, quick_gelu, ssslu, _rlglu_act]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
-                    "gelu, swiglu, or quick_geglu"
+                    "gelu, swiglu, quick_geglu, sssglu, or rlglu"
                 )
             if (
                 self.activation_func == F.gelu
@@ -1971,8 +2168,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.activation_func_fp8_input_store:
-            if self.activation_func != F.silu or not self.gated_linear_unit:
-                raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
+            from megatron.core.activations import rlglu_act as _rlglu_act
+
+            if self.activation_func not in (F.silu, ssslu, _rlglu_act) or not self.gated_linear_unit:
+                raise ValueError(
+                    "Storing activation input in FP8 is supported only for SwiGLU, SSSGLU "
+                    "and RLGLU."
+                )
 
         if self.apply_rope_fusion:
             if self.multi_latent_attention:

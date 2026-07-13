@@ -29,8 +29,9 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
+from megatron.core.activations import squared_relu, rlglu_act
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.fusions.fused_bias_sssglu import ssslu
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1086,7 +1087,10 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        if args.swiglu or args.pnglu:
+        if (
+            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.gxpr
+            or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
+        ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -1746,6 +1750,31 @@ def core_transformer_config_from_args(args, config_class=None):
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
+    elif args.sssglu:
+        # SwiGLU with the sigmoid inside SiLU replaced by softsign scaled to (0, 1). Non-learnable
+        # and structurally identical to SwiGLU, so it reuses the same fusion switch
+        # (--no-bias-swiglu-fusion) and dispatches on activation_func == ssslu.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = ssslu
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.reglu:
+        # ReLU-gated linear unit: relu(x_glu) * x_linear. Non-learnable and has no fused kernel;
+        # runs through the generic (non-fused) GLU path with activation_func == F.relu.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.relu
+        kw_args['bias_activation_fusion'] = False
+    elif args.rlglu:
+        # RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. Non-learnable and
+        # structurally identical to SwiGLU (elementwise gate, no cross-feature reduction), so it
+        # reuses the same fusion switch (--no-bias-swiglu-fusion) and dispatches on
+        # activation_func == rlglu_act. Its gate derivative is exactly the SSSGLU gate, which the
+        # fused backward reuses.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = rlglu_act
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -1755,6 +1784,73 @@ def core_transformer_config_from_args(args, config_class=None):
         # activation_func for the (unused) non-pnglu code paths and width-doubling assumptions.
         kw_args['activation_func'] = F.silu
         # Fused bias+activation kernels hardcode SiLU/GELU and cannot run PolyNorm.
+        kw_args['bias_activation_fusion'] = False
+    # xpr/gxpr/xr2/gxr2/pn3glu/polynorm are learnable activations applied by a dedicated module
+    # (see MLP/TEGroupedMLP), not via config.activation_func (the gated ones -- gxpr/gxr2/pn3glu
+    # -- still set activation_func to a harmless SiLU placeholder for width-doubling assumptions
+    # and the unused non-{flag} code paths). All are mutually exclusive with each other and with
+    # the other activation flags above.
+    _other_new_activation_flags = {
+        'pn3glu': args.pn3glu,
+        'xpr': args.xpr,
+        'gxpr': args.gxpr,
+        'gxpry': args.gxpry,
+        'gxprv2': args.gxprv2,
+        'xr2': args.xr2,
+        'gxr2': args.gxr2,
+        'xr2glu': args.xr2glu,
+        'xsssglu': args.xsssglu,
+        'polynorm': args.polynorm,
+    }
+    _all_activation_flags = dict(_other_new_activation_flags)
+    _all_activation_flags.update({
+        'swiglu': args.swiglu,
+        'sssglu': args.sssglu,
+        'reglu': args.reglu,
+        'rlglu': args.rlglu,
+        'squared_relu': args.squared_relu,
+        'quick_geglu': args.quick_geglu,
+        'pnglu': args.pnglu,
+    })
+    for _flag_name, _is_set in _other_new_activation_flags.items():
+        if _is_set:
+            _others = [n for n, v in _all_activation_flags.items() if v and n != _flag_name]
+            assert not _others, \
+                f'--{_flag_name.replace("_", "-")} cannot be combined with other activation ' \
+                f'flags (found: {_others}).'
+    if args.pn3glu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xpr:
+        kw_args['bias_activation_fusion'] = False
+    if args.gxpr:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.gxpry:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.gxprv2:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xr2:
+        kw_args['bias_activation_fusion'] = False
+    if args.gxr2:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xr2glu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xsssglu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.polynorm:
         kw_args['bias_activation_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
@@ -1812,6 +1908,12 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+
+    group.add_argument('--activation-func-fp8-input-store', action='store_true',
+                       help='Store the fused GLU activation input (the fc1 output) in FP8 '
+                       '(e4m3, direct unscaled cast) for the backward pass, halving that '
+                       'saved-activation memory. Only supported for SwiGLU (--swiglu), '
+                       'SSSGLU (--sssglu) and RLGLU (--rlglu) via their fused kernels.')
 
     # FP4 related arguments
     group.add_argument('--te-precision-config-file', default=None,
@@ -2047,7 +2149,6 @@ def _add_network_size_args(parser):
         "softmax_scale",
         "gated_linear_unit",
         "bias_activation_fusion",
-        "activation_func_fp8_input_store",
         "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
@@ -2085,8 +2186,20 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         # defined explicitly as CLI arguments below
+        "activation_func_fp8_input_store",
         "pnglu",
         "pnglu_fusion",
+        "xpr",
+        "gxpr",
+        "gxpr_fusion",
+        "gxpry",
+        "gxprv2",
+        "xr2",
+        "gxr2",
+        "xr2glu",
+        "xsssglu",
+        "pn3glu",
+        "polynorm",
         "sandwich_norm",
         "post_attn_norm_zero_init",
         "keel",
@@ -2160,6 +2273,20 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--sssglu', action='store_true',
+                       help='Use SSSGLU: SwiGLU with the sigmoid inside SiLU replaced by '
+                       'softsign scaled to (0,1): ssslu(x_glu) * x_linear, where '
+                       'ssslu(x) = x * (0.5 + 0.5*softsign(x)). Non-learnable (cf. the '
+                       'learnable --xsssglu) and fused the same way as SwiGLU '
+                       '(honors --no-bias-swiglu-fusion). Implies gated linear units.')
+    group.add_argument('--reglu', action='store_true',
+                       help='Use ReGLU: ReLU-gated linear unit, relu(x_glu) * x_linear. '
+                       'Non-learnable; implies gated linear units. No fused kernel (runs '
+                       'through the generic GLU path).')
+    group.add_argument('--rlglu', action='store_true',
+                       help='Use RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. '
+                       'Non-learnable; implies gated linear units. Fused the same way as SwiGLU '
+                       '(honors --no-bias-swiglu-fusion); its gate derivative is the SSSGLU gate.')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '
@@ -2171,6 +2298,62 @@ def _add_network_size_args(parser):
                        'default and auto-falls-back on CPU / TP-sharded layers / missing Triton.')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
+    group.add_argument('--xpr', action='store_true',
+                       help='Use XPR, a learnable elementwise activation: '
+                       '|ap2|*x^3 + |ap1|*x^2 + |b|*x for x>0, and '
+                       '(|b|+|an|)*x*softsign(x) + |b|*x for x<=0. Not a gated unit. '
+                       'Each MoE expert gets its own coefficients.')
+    group.add_argument('--gxpr', action='store_true',
+                       help='Use GXPR, the gated-linear-unit counterpart of --xpr: '
+                       'gate(x_glu) * x_linear, where gate(x) = |ap2|*x^2 + |ap1|*x + |b| for '
+                       'x>0, and (|b|+|an|)*softsign(x) + |b| for x<=0 (== XPR(x)/x). Implies '
+                       'gated linear units. Each MoE expert gets its own coefficients.')
+    group.add_argument('--no-gxpr-fusion', action='store_false', dest='gxpr_fusion',
+                       help='Disable the fused kernel for --gxpr (built like the SwiGLU fusion '
+                       'via @jit_fuser/torch.compile) and use the plain torch implementation '
+                       'instead (e.g. for debugging). The fused path is on by default and only '
+                       'engages on CUDA.')
+    group.add_argument('--gxpry', action='store_true',
+                       help='Use GXPRY: like --gxpr (gate(x_glu) * x_linear with the same '
+                       'polynomial/softsign pieces) but the piecewise branch is selected by the '
+                       'sign of x_linear instead of x_glu. Implies gated linear units. Each MoE '
+                       'expert gets its own coefficients.')
+    group.add_argument('--gxprv2', action='store_true',
+                       help='Use GXPRV2: --gxpr with beta removed entirely (not just '
+                       'initialized near zero) -- no additive floor term, and an is no longer '
+                       'coupled to beta: gate(x_glu) * x_linear, where gate(x) = |ap2|*x^2 + '
+                       '|ap1|*x for x>0, and |an|*softsign(x) for x<=0. Unlike --gxpr '
+                       '(gate(0) == |beta|), here gate(0) == 0. Implies gated linear units. '
+                       'Each MoE expert gets its own coefficients.')
+    group.add_argument('--xr2', action='store_true',
+                       help='Use XR2, --xpr without the x^3 term: |ap1|*x^2 + |b|*x for x>0, '
+                       'and (|b|+|an|)*x*softsign(x) + |b|*x for x<=0. Not a gated unit. Each '
+                       'MoE expert gets its own coefficients.')
+    group.add_argument('--gxr2', action='store_true',
+                       help='Use GXR2, the gated-linear-unit counterpart of --xr2: '
+                       'gate(x_glu) * x_linear, where gate(x) = |ap1|*x + |b| for x>0, and '
+                       '(|b|+|an|)*softsign(x) + |b| for x<=0 (== XR2(x)/x). Implies gated '
+                       'linear units. Each MoE expert gets its own coefficients.')
+    group.add_argument('--xr2glu', action='store_true',
+                       help='Use XR2GLU: XR2 used directly as a GLU gate (unlike --gxr2, no '
+                       'divide-by-x trick): gate(x_glu) * x_linear, where gate(x) = XR2(x) = '
+                       '|ap1|*x^2 + |b|*x for x>0, and (|b|+|an|)*x*softsign(x) + |b|*x for '
+                       'x<=0. Implies gated linear units. Each MoE expert gets its own '
+                       'coefficients.')
+    group.add_argument('--xsssglu', action='store_true',
+                       help='Use XSSSGLU: gate(x_glu) * x_linear, where gate(x) = '
+                       '|alpha|*softsign(x) + 0.5. No piecewise branch (softsign already '
+                       'interpolates smoothly across x=0) and only one learnable coefficient. '
+                       'Implies gated linear units. Each MoE expert gets its own coefficient.')
+    group.add_argument('--pn3glu', action='store_true',
+                       help='Use PN3GLU, --pnglu with an added x^3 term: gate(x) = |a1|*'
+                       'RMSNorm(x) + |a2|*RMSNorm(x^2) + |a3|*RMSNorm(x^3). Implies gated '
+                       'linear units. Each MoE expert gets its own PolyNorm coefficients. '
+                       'Unlike --pnglu this has no fused Triton kernel yet.')
+    group.add_argument('--polynorm', action='store_true',
+                       help='Use PolyNorm as a standalone (non-gated) activation -- --pn3glu '
+                       'without the GLU: |a1|*RMSNorm(x) + |a2|*RMSNorm(x^2) + '
+                       '|a3|*RMSNorm(x^3). Each MoE expert gets its own coefficients.')
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
                        'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')

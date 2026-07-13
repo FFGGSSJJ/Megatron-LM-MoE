@@ -1535,6 +1535,9 @@ def load_args_from_checkpoint(
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('sssglu', force=True)
+    _set_arg('reglu', force=True)
+    _set_arg('rlglu', force=True)
     _set_arg('pnglu', force=True)
     _set_arg('pnglu_fusion', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
@@ -1597,6 +1600,32 @@ def load_args_from_checkpoint(
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+
+    # Apertus custom architecture flags. These are forward-affecting TransformerConfig fields that
+    # default to False/None, so they need force=True (else _set_arg early-returns because the value
+    # isn't None). Without these, --use-checkpoint-args (inference / generation / ckpt conversion)
+    # silently rebuilds the WRONG model: unscaled embeddings, missing residual/depth scaling, and —
+    # worst — no sandwich-norm/keel norm sublayers, so the checkpoint's extra norm weights fail to
+    # load (missing keys) or are silently dropped. Training resume is unaffected (it re-passes every
+    # flag on the CLI and doesn't set --use-checkpoint-args).
+    _set_arg('scale_embeddings_by_sqrt_hidden', force=True)
+    _set_arg('residual_output_scaling', force=True)
+    _set_arg('sandwich_norm', force=True)
+    _set_arg('keel', force=True)
+    _set_arg('keel_alpha', force=True)
+    _set_arg('pnglu', force=True)
+    _set_arg('pnglu_fusion', force=True)
+    _set_arg('pn3glu', force=True)
+    _set_arg('xpr', force=True)
+    _set_arg('gxpr', force=True)
+    _set_arg('gxpry', force=True)
+    _set_arg('gxprv2', force=True)
+    _set_arg('xr2', force=True)
+    _set_arg('gxr2', force=True)
+    _set_arg('xr2glu', force=True)
+    _set_arg('xsssglu', force=True)
+    _set_arg('polynorm', force=True)
+    _set_arg('qk_layernorm', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
