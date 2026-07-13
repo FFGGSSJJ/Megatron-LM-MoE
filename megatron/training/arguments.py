@@ -1744,12 +1744,15 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.relu
         kw_args['bias_activation_fusion'] = False
     elif args.rlglu:
-        # RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. Non-learnable,
-        # no fused kernel (yet) -> generic GLU path with activation_func == rlglu_act.
+        # RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. Non-learnable and
+        # structurally identical to SwiGLU (elementwise gate, no cross-feature reduction), so it
+        # reuses the same fusion switch (--no-bias-swiglu-fusion) and dispatches on
+        # activation_func == rlglu_act. Its gate derivative is exactly the SSSGLU gate, which the
+        # fused backward reuses.
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = rlglu_act
-        kw_args['bias_activation_fusion'] = False
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -1887,8 +1890,8 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--activation-func-fp8-input-store', action='store_true',
                        help='Store the fused GLU activation input (the fc1 output) in FP8 '
                        '(e4m3, direct unscaled cast) for the backward pass, halving that '
-                       'saved-activation memory. Only supported for SwiGLU (--swiglu) and '
-                       'SSSGLU (--sssglu) via their fused kernels.')
+                       'saved-activation memory. Only supported for SwiGLU (--swiglu), '
+                       'SSSGLU (--sssglu) and RLGLU (--rlglu) via their fused kernels.')
 
     # FP4 related arguments
     group.add_argument('--te-precision-config-file', default=None,
@@ -2259,8 +2262,8 @@ def _add_network_size_args(parser):
                        'through the generic GLU path).')
     group.add_argument('--rlglu', action='store_true',
                        help='Use RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. '
-                       'Non-learnable; implies gated linear units. No fused kernel (runs through '
-                       'the generic GLU path).')
+                       'Non-learnable; implies gated linear units. Fused the same way as SwiGLU '
+                       '(honors --no-bias-swiglu-fusion); its gate derivative is the SSSGLU gate.')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '

@@ -26,11 +26,13 @@ from megatron.core.activations import (
     XR2GLU,
     XSSSGLU,
     squared_relu,
+    rlglu_act,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
+from megatron.core.fusions.fused_bias_rlglu import weighted_bias_rlglu_impl
 from megatron.core.fusions.fused_bias_sssglu import ssslu, weighted_bias_sssglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -426,6 +428,14 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,
                     self.config.activation_func_fp8_input_store,
                 )
+            elif self.activation_func == rlglu_act and self.config.gated_linear_unit:
+                # dtype is handled inside the fused kernel
+                intermediate_parallel = weighted_bias_rlglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                )
             elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                 intermediate_parallel = weighted_bias_quick_geglu_impl(
                     intermediate_parallel,
@@ -437,7 +447,7 @@ class TEGroupedMLP(MegatronModule):
                 )
             else:
                 raise ValueError(
-                    "Only support fusion of swiglu, sssglu and quick_gelu in TEGroupedMLP."
+                    "Only support fusion of swiglu, sssglu, rlglu and quick_gelu in TEGroupedMLP."
                 )
         elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
             assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
