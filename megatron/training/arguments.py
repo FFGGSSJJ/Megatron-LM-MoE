@@ -1482,6 +1482,12 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
+    if args.muon_split_mla_per_head:
+        assert args.optimizer in ['muon', 'dist_muon', 'md_decoupling'], (
+            "--muon-split-mla-per-head is only used by muon, dist_muon, and md_decoupling; "
+            f"optimizer {args.optimizer!r} would ignore it."
+        )
+
     # Muon optimizer check
     if 'muon' in args.optimizer:
 
@@ -2339,7 +2345,8 @@ def _add_regularization_args(parser):
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
     group.add_argument('--muon-split-mla-per-head', action='store_true',
-                       help='Split MLA up-projection parameters per attention head for Muon.')
+                       help='Split MLA up-projection parameters per attention head for Muon or '
+                       'MDDecoupling.')
     group.add_argument('--muon-use-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
