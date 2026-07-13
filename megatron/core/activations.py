@@ -908,8 +908,12 @@ def rlglu_act(x: torch.Tensor) -> torch.Tensor:
     ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. No fused kernel yet, so it
     runs eager. Its derivative decays like ``1/(1+|x|)`` (relative-gradient-error condition
     number -> 1), at the cost of an unbounded (logarithmic) negative tail.
+
+    ``log(1 + |x|)`` is used rather than ``log1p(|x|)`` (equal for |x| >= 0) to match the fused
+    kernels, whose ``log1p`` tripped an inductor cubin failure inside the weighted-backward
+    reduction; see fused_bias_rlglu.py.
     """
-    return torch.relu(x) - 0.5 * torch.log1p(x.abs())
+    return torch.relu(x) - 0.5 * torch.log(1 + x.abs())
 
 
 @jit_fuser

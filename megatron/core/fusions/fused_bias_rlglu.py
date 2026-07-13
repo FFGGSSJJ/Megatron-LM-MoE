@@ -20,6 +20,12 @@ from megatron.core.utils import nvtx_decorator
 # @jit_fuser forward/backward pairs wrapped in torch.autograd.Function, since the gate has no
 # cross-feature reduction. The gate math is inlined here (rather than importing rlglu_act) to keep
 # the jit_fuser scripting self-contained; it must stay in sync with rlglu_act in activations.py.
+#
+# NOTE: the log term is written ``log(1 + |x|)``, NOT ``log1p(|x|)``. They are equal (|x| >= 0, so
+# the argument is >= 1 -- no small-argument cancellation for log1p to protect against), but under
+# @jit_fuser (torch.compile) ``log1p`` lowers to ``libdevice.log1p``, which inductor fails to emit
+# a cubin for when it lands inside the weighted-backward *reduction* kernel on the training Triton
+# stack (Hopper). ``log`` -> ``libdevice.log`` compiles there. Do not "simplify" it back to log1p.
 
 
 @jit_fuser
@@ -34,7 +40,7 @@ def rlglu(y):
             halves and gate(x) = relu(x) - 0.5 * ln(1 + |x|).
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
-    return (torch.relu(y_1) - 0.5 * torch.log1p(torch.abs(y_1))) * y_2
+    return (torch.relu(y_1) - 0.5 * torch.log(1 + torch.abs(y_1))) * y_2
 
 
 @jit_fuser
@@ -75,7 +81,7 @@ def rlglu_back(g, y):
         torch.Tensor: Gradient with respect to the input tensor.
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
-    gate = torch.relu(y_1) - 0.5 * torch.log1p(torch.abs(y_1))
+    gate = torch.relu(y_1) - 0.5 * torch.log(1 + torch.abs(y_1))
     gate_prime = 0.5 + 0.5 * y_1 / (1 + torch.abs(y_1))
     return torch.cat((g * gate_prime * y_2, g * gate), -1)
 
