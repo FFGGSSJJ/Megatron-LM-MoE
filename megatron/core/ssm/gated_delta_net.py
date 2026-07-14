@@ -129,6 +129,8 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: Optional[int] = None,
+        cp_comm_type: Optional[str] = None,
     ):
         """
         Args:
@@ -142,6 +144,12 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            pp_layer_offset: Unused. Accepted for interface parity with TransformerLayer's generic
+                self_attention construction, which conditionally passes this kwarg.
+            cp_comm_type: Unused. GDN/KDA implement their own all-to-all-based context parallel
+                scheme (see tensor_a2a_cp2hp/tensor_a2a_hp2cp below), independent of the
+                ring/p2p/a2a communication types TransformerLayer conditionally passes to
+                TE-based attention when context_parallel_size > 1.
         """
 
         if not HAVE_FLA:

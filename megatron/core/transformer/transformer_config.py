@@ -1477,10 +1477,23 @@ class TransformerConfig(ModelParallelConfig):
                 self.linear_num_value_heads % self.tensor_model_parallel_size == 0
             ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
 
-            # Do not support yet, but coming soon.
-            assert self.context_parallel_size == 1, (
-                f"Gated delta net does not support context parallel for now,"
-                f" but got {self.context_parallel_size=}."
+            # Check context parallelism compatibility. GDN/KDA's CP all-to-all
+            # (megatron/core/ssm/gated_delta_net.py) shards Q/K/V/gate/beta/alpha
+            # along the head dimension across CP ranks, so the per-TP-rank head
+            # counts must themselves divide evenly across CP ranks.
+            assert (
+                self.linear_num_key_heads // self.tensor_model_parallel_size
+            ) % self.context_parallel_size == 0, (
+                "linear_num_key_heads // tensor_model_parallel_size "
+                f"({self.linear_num_key_heads // self.tensor_model_parallel_size}) must be a "
+                f"multiple of context_parallel_size ({self.context_parallel_size})."
+            )
+            assert (
+                self.linear_num_value_heads // self.tensor_model_parallel_size
+            ) % self.context_parallel_size == 0, (
+                "linear_num_value_heads // tensor_model_parallel_size "
+                f"({self.linear_num_value_heads // self.tensor_model_parallel_size}) must be a "
+                f"multiple of context_parallel_size ({self.context_parallel_size})."
             )
 
         if self.fp8:

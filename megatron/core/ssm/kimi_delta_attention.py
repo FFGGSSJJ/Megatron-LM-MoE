@@ -94,12 +94,17 @@ class KimiDeltaAttention(GatedDeltaNet):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: Optional[int] = None,
+        cp_comm_type: Optional[str] = None,
     ):
         if not HAVE_KDA:
             raise ImportError(
                 "FLA's chunk_kda op is required for Kimi Delta Attention. "
                 "Install flash-linear-attention >= 0.5.0."
             )
+
+        # pp_layer_offset/cp_comm_type are unused (see GatedDeltaNet.__init__ docstring);
+        # accepted only so TransformerLayer's generic self_attention construction can pass them.
 
         # Initialize via the GatedDeltaNet path. This builds in_proj/A_log/
         # dt_bias with the GDN scalar-alpha layout. We resize them below.
@@ -437,8 +442,10 @@ class KimiDeltaAttention(GatedDeltaNet):
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
 
-        # alpha: [b, s, num_v_heads, key_head_dim]
-        alpha = alpha.reshape(batch, seq_len, self.num_v_heads_local_tp, self.key_head_dim)
+        # alpha: [b, s, num_v_heads, key_head_dim]. Use -1 (not self.num_v_heads_local_tp)
+        # since alpha is already CP-sharded by this point (see alpha_local in forward()):
+        # the local head count is num_v_heads_local_tp // cp_size, not num_v_heads_local_tp.
+        alpha = alpha.reshape(batch, seq_len, -1, self.key_head_dim)
 
         query = query.contiguous()
         key = key.contiguous()

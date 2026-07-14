@@ -45,7 +45,6 @@ except ImportError:
         (1, False, 1),
         (2, False, 1),
         (2, True, 1),
-        # GDN does not support CP for now. Leave it for future work.
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -147,7 +146,6 @@ class TestGatedDeltaNet:
     [
         (4, False, 1),  # TP w/o SP
         (4, True, 1),  # TP w/ SP
-        # CP does not support GDN for now. Add it once it is supported.
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
