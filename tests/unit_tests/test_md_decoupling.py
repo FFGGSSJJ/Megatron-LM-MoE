@@ -1,18 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedObject
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing import load
 from megatron.core.dist_checkpointing import save
+import megatron.core.optimizer.layer_wise_optimizer as layer_wise_module
+import megatron.core.optimizer.md_decoupling as md_module
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.md_decoupling import MDDecoupling
+from megatron.core.optimizer.md_decoupling import _get_muon_scale_factor
 from megatron.core.optimizer.md_decoupling import _md_init_state_fn
 from megatron.core.optimizer.md_decoupling import _split_qkv
+from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
 from megatron.core.optimizer.optimizer import FP32Optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -26,6 +33,11 @@ requires_cuda_and_emerging = pytest.mark.skipif(
 )
 
 
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for this MDDecoupling test"
+)
+
 class _NoProcessGroups:
     tp = None
     expt_tp = None
@@ -38,18 +50,19 @@ def _step_sum_loss(model, input_tensor):
 
 
 def _record_md_split_output(param, grad, **md_kwargs):
+    split_qkv = md_kwargs.pop("split_qkv", True)
     optimizer = MDDecoupling(
         params=[param],
         lr=0.01,
-        split_qkv=True,
+        split_qkv=split_qkv,
         pg_collection=None,
         tp_mode="duplicated",
         **md_kwargs,
     )
     calls = []
 
-    def record_split(split_grad, tp_group, partition_dim, flat_mode=False):
-        del tp_group, partition_dim, flat_mode
+    def record_split(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
+        del tp_group, partition_dim, flat_mode, is_router
         calls.append(split_grad.detach().clone())
         return torch.full_like(split_grad, float(len(calls)))
 
@@ -92,6 +105,138 @@ def _assert_qkv_split_tangent(optimizer, param, grad):
     torch.testing.assert_close(residuals, torch.zeros_like(residuals), rtol=1e-5, atol=1e-6)
 
 
+def _mla_kv_up_proj_optimizer(param, **kwargs):
+    return MDDecoupling(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(1, 1),
+        split_mla_per_head=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+        **kwargs,
+    )
+
+
+def _assert_split_flat_norms(optimizer, param, tensor, expected_norm, is_qkv=False):
+    parts, _ = optimizer._split_param_tensor(param, tensor, is_qkv=is_qkv)
+    expected = torch.full((len(parts),), expected_norm, dtype=tensor.dtype, device=tensor.device)
+    actual = torch.stack([torch.linalg.vector_norm(part) for part in parts])
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def _assert_split_tangent(optimizer, param, grad, is_qkv):
+    p_parts, _ = optimizer._split_param_tensor(param, param, is_qkv=is_qkv)
+    g_parts, _ = optimizer._split_param_tensor(param, grad, is_qkv=is_qkv)
+    residuals = torch.stack(
+        [
+            (p_part * g_part).sum().abs()
+            / (torch.linalg.vector_norm(p_part) * torch.linalg.vector_norm(g_part)).clamp_min(1e-12)
+            for p_part, g_part in zip(p_parts, g_parts)
+        ]
+    )
+    torch.testing.assert_close(residuals, torch.zeros_like(residuals), rtol=1e-5, atol=1e-6)
+
+
+def _bare_param_from_gains(optimizer, param):
+    state = optimizer.state[param]
+    bare_param = param.detach().clone()
+    if "flat_gain" in state:
+        bare_param.div_(optimizer._phi(state["flat_gain"]))
+    if "row_gain" in state:
+        bare_param.div_(optimizer._phi(state["row_gain"])[:, None])
+    if "col_gain" in state:
+        bare_param.div_(optimizer._phi(state["col_gain"])[None, :])
+    return bare_param
+
+
+class _TinyMDDecouplingModel(torch.nn.Module):
+    def __init__(self, shared_output=False, offloading_expert=False, device="cpu"):
+        super().__init__()
+        self.config = SimpleNamespace(
+            context_parallel_size=1,
+            hidden_size=8,
+            kv_channels=4,
+            moe_use_inplace_fp8_param=offloading_expert,
+            moe_use_offloading_experts=offloading_expert,
+            num_attention_heads=2,
+            num_layers=1,
+            num_query_groups=1,
+        )
+        self.ddp_config = SimpleNamespace(
+            num_distributed_optimizer_instances=1,
+            use_distributed_optimizer=False,
+            use_megatron_fsdp=False,
+        )
+        self.embedding = torch.nn.Module()
+        self.embedding.word_embeddings = torch.nn.Embedding(8, 8, device=device)
+        self.output_layer = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.router = torch.nn.Linear(8, 4, bias=False, device=device)
+        self.attn = torch.nn.Module()
+        self.attn.linear_qkv = torch.nn.Linear(8, 24, bias=False, device=device)
+        self.mlp = torch.nn.Module()
+        self.mlp.linear_fc2 = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.norm = torch.nn.LayerNorm(8, device=device)
+        if offloading_expert:
+            self.experts = torch.nn.Module()
+            self.experts.weight2 = torch.nn.Parameter(torch.ones(2, 8, 8, device=device))
+
+        self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
+        self.output_layer.weight.is_embedding_or_output_parameter = True
+        if shared_output:
+            self.output_layer.weight.shared_embedding = True
+
+
+def test_md_decoupling_recipe_defaults():
+    config = OptimizerConfig()
+
+    assert config.hypersphere_mode == "flat"
+    assert config.hypersphere_embedding_mode == "row"
+    assert config.hypersphere_router_mode == "row"
+    assert config.hypersphere_radius_from_init is False
+    assert config.hypersphere_gains_mode == "rowcol"
+    assert config.hypersphere_gains_mode_output == "inherit"
+    assert config.hypersphere_gains_mode_embedding == "none"
+    assert config.hypersphere_gains_mode_router == "rowcol"
+    assert config.use_orthogonal_updates is True
+    assert config.gain_parametrization == "softplus"
+    assert config.muon_router_scale_mode == "none"
+
+
+def test_md_decoupling_router_scale_mode_resolution():
+    # Default: routers get "none" (constant 1.0) while matrices follow scale_mode. A router of
+    # shape (num_experts, hidden) is non-square, so shape_up would give >1; "none" pins it to 1.
+    optimizer = MDDecoupling(
+        params=[torch.nn.Parameter(torch.ones(2, 2))],
+        lr=0.01,
+        scale_mode="shape_up",
+        pg_collection=None,
+    )
+    assert optimizer.router_scale_mode == "none"
+    assert optimizer._resolve_scale_mode(is_router=True) == "none"
+    assert optimizer._resolve_scale_mode(is_router=False) == "shape_up"
+    # The resolved router mode yields a constant 1.0 regardless of the router's aspect ratio,
+    # so the update is width-invariant (num_experts=128 fixed while hidden scales).
+    for hidden in (128, 768, 1536):
+        assert _get_muon_scale_factor(
+            128, hidden, mode=optimizer._resolve_scale_mode(is_router=True)
+        ) == 1.0
+    # shape_up on a router WOULD track width — this is the behavior being excluded.
+    assert _get_muon_scale_factor(128, 768, mode="shape_up") > 1.0
+
+    # Override: routers can be made to follow a mode explicitly.
+    overridden = MDDecoupling(
+        params=[torch.nn.Parameter(torch.ones(2, 2))],
+        lr=0.01,
+        scale_mode="shape_up",
+        router_scale_mode="spectral",
+        pg_collection=None,
+    )
+    assert overridden._resolve_scale_mode(is_router=True) == "spectral"
+    assert overridden._resolve_scale_mode(is_router=False) == "shape_up"
+
+
 def test_md_decoupling_router_gains_mode_override():
     param = torch.nn.Parameter(torch.ones(2, 2))
     param.is_router = True
@@ -104,6 +249,152 @@ def test_md_decoupling_router_gains_mode_override():
     )
 
     assert optimizer._resolve_gains_mode(param) == "none"
+
+
+def test_md_decoupling_default_gains_mode_resolution():
+    normal = torch.nn.Parameter(torch.ones(2, 2))
+    embedding = torch.nn.Parameter(torch.ones(2, 2))
+    output = torch.nn.Parameter(torch.ones(2, 2))
+    router = torch.nn.Parameter(torch.ones(2, 2))
+    embedding.is_md_embedding_parameter = True
+    output.is_md_output_parameter = True
+    router.is_router = True
+    optimizer = MDDecoupling(
+        params=[normal, embedding, output, router],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        hypersphere_gains_mode_output="inherit",
+        hypersphere_gains_mode_embedding="none",
+        hypersphere_gains_mode_router="rowcol",
+        pg_collection=None,
+    )
+
+    assert optimizer._resolve_gains_mode(normal) == "rowcol"
+    assert optimizer._resolve_gains_mode(embedding) == "none"
+    assert optimizer._resolve_gains_mode(output) == "rowcol"
+    assert optimizer._resolve_gains_mode(router) == "rowcol"
+
+
+def test_md_decoupling_gains_mode_none_disables_gain_state():
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.is_router = True
+    param.grad = torch.ones_like(param)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="none",
+        hypersphere_gains_mode_router="rowcol",
+        use_orthogonal_updates=False,
+        pg_collection=None,
+    )
+
+    optimizer.step()
+
+    gain_state_keys = {
+        "flat_gain",
+        "flat_gain_m",
+        "flat_gain_v",
+        "row_gain",
+        "row_gain_m",
+        "row_gain_v",
+        "col_gain",
+        "col_gain_m",
+        "col_gain_v",
+    }
+    assert optimizer.hypersphere_gains_mode is None
+    assert optimizer._resolve_gains_mode(param) is None
+    assert gain_state_keys.isdisjoint(optimizer.state[param])
+
+
+def test_md_decoupling_embedding_gain_override_wins_for_tied_output():
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.is_md_embedding_parameter = True
+    param.is_md_output_parameter = True
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        hypersphere_gains_mode_embedding="none",
+        hypersphere_gains_mode_output="flat",
+        pg_collection=None,
+    )
+
+    assert optimizer._resolve_gains_mode(param) == "none"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="optimizer wrapper creates CUDA scale")
+def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
+    Utils.initialize_model_parallel()
+    try:
+        untied_model = _TinyMDDecouplingModel(shared_output=False, device="cuda")
+        shared_model = _TinyMDDecouplingModel(shared_output=True, device="cuda")
+        offload_model = _TinyMDDecouplingModel(
+            offloading_expert=True, device="cuda"
+        ).bfloat16()
+        config = OptimizerConfig(
+            optimizer="md_decoupling",
+            lr=0.01,
+            min_lr=0.0,
+            use_orthogonal_updates=False,
+        )
+        offload_config = OptimizerConfig(
+            optimizer="md_decoupling",
+            lr=0.01,
+            min_lr=0.0,
+            bf16=True,
+            use_orthogonal_updates=False,
+        )
+
+        optimizer = get_megatron_mddecoupling_optimizer(
+            config,
+            [untied_model],
+            use_gloo_process_groups=False,
+        )
+        shared_optimizer = get_megatron_mddecoupling_optimizer(
+            config,
+            [shared_model],
+            use_gloo_process_groups=False,
+        )
+        offload_optimizer = get_megatron_mddecoupling_optimizer(
+            offload_config,
+            [offload_model],
+            use_gloo_process_groups=False,
+        )
+        md_optimizer = optimizer.chained_optimizers[0].optimizer
+        shared_md_optimizer = shared_optimizer.chained_optimizers[0].optimizer
+        offload_md_optimizer = offload_optimizer.chained_optimizers[0].optimizer
+
+        assert untied_model.embedding.word_embeddings.weight.is_md_embedding_parameter is True
+        assert not hasattr(untied_model.embedding.word_embeddings.weight, "is_md_output_parameter")
+        assert untied_model.output_layer.weight.is_md_output_parameter is True
+        assert not hasattr(untied_model.output_layer.weight, "is_md_embedding_parameter")
+        assert untied_model.router.weight.is_router is True
+        assert untied_model.attn.linear_qkv.weight.is_qkv is True
+        assert untied_model.mlp.linear_fc2.weight.is_out_proj is True
+        assert (
+            md_optimizer._resolve_gains_mode(untied_model.embedding.word_embeddings.weight)
+            == "none"
+        )
+        assert md_optimizer._resolve_gains_mode(untied_model.output_layer.weight) == "rowcol"
+        assert md_optimizer._resolve_gains_mode(untied_model.router.weight) == "rowcol"
+
+        assert shared_model.output_layer.weight.is_md_embedding_parameter is True
+        assert not hasattr(shared_model.output_layer.weight, "is_md_output_parameter")
+        assert shared_md_optimizer._resolve_gains_mode(shared_model.output_layer.weight) == "none"
+
+        assert offload_model.experts.weight2.expert_tp is True
+        assert offload_model.experts.weight2.merged_offload_expert is True
+        assert offload_model.experts.weight2.is_out_proj is True
+        offload_main_param = offload_model.experts.weight2.main_param
+        assert offload_main_param.merged_offload_expert is True
+        assert offload_main_param.is_out_proj is True
+        assert any(
+            p is offload_main_param
+            for group in offload_md_optimizer.param_groups
+            for p in group["params"]
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_md_decoupling_direct_gains_no_clamp_min_round_trip():
@@ -492,3 +783,532 @@ def test_md_decoupling_nesterov(use_nesterov):
 
     assert not torch.equal(model.weight.data, original_weight)
     assert optimizer.use_nesterov is use_nesterov
+
+
+def test_md_decoupling_mla_split_flat_normalization_is_block_local():
+    param = torch.nn.Parameter(torch.arange(1, 33, dtype=torch.float32).view(4, 8))
+    param.is_kv_up_proj = True
+    optimizer = _mla_kv_up_proj_optimizer(
+        param,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+    )
+
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_qkv=False)
+
+    _assert_split_flat_norms(optimizer, param, param, expected_norm=8**0.5)
+    torch.testing.assert_close(torch.linalg.vector_norm(param), torch.tensor(32**0.5))
+
+@requires_cuda
+def test_md_decoupling_mla_split_gains_step_preserves_bare_split_norms():
+    param = torch.nn.Parameter(
+        torch.arange(1, 33, dtype=torch.float32, device="cuda").view(4, 8)
+    )
+    param.is_kv_up_proj = True
+    optimizer = _mla_kv_up_proj_optimizer(
+        param,
+        hypersphere_mode="flat",
+        hypersphere_gains_mode="row",
+        gains_lr=0.05,
+        use_orthogonal_updates=False,
+    )
+
+    grad_scale = torch.linspace(0.1, 3.2, param.numel(), device=param.device).view_as(param)
+    loss = (param * grad_scale).sum()
+    loss.backward()
+    optimizer.step()
+
+    state = optimizer.state[param]
+    row_gain = state["row_gain"]
+    assert row_gain.shape == (param.size(0),)
+    assert torch.isfinite(param).all()
+    assert torch.isfinite(row_gain).all()
+    assert not torch.allclose(row_gain, torch.ones_like(row_gain))
+
+    bare_param = param.detach() / optimizer._phi(row_gain)[:, None]
+    _assert_split_flat_norms(optimizer, param, bare_param, expected_norm=8**0.5)
+
+def test_md_decoupling_mla_split_tangential_grad_is_block_local():
+    param = torch.nn.Parameter(torch.arange(1, 33, dtype=torch.float32).view(4, 8))
+    param.is_kv_up_proj = True
+    grad = torch.linspace(-1.5, 2.5, param.numel()).view_as(param)
+    optimizer = _mla_kv_up_proj_optimizer(
+        param,
+        hypersphere_mode="flat",
+        hypersphere_tangential_grad=True,
+        hypersphere_preserve_init=True,
+    )
+
+    with torch.no_grad():
+        optimizer._project_tangent_inplace(param, grad, is_qkv=False)
+
+    _assert_split_tangent(optimizer, param, grad, is_qkv=False)
+
+def test_md_decoupling_mla_split_row_normalization():
+    param = torch.nn.Parameter(torch.arange(1, 33, dtype=torch.float32).view(4, 8))
+    param.is_kv_up_proj = True
+    optimizer = _mla_kv_up_proj_optimizer(
+        param,
+        hypersphere_mode="row",
+        hypersphere_preserve_init=True,
+    )
+
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_qkv=False)
+
+    parts, _ = optimizer._split_param_tensor(param, param, is_qkv=False)
+    for part in parts:
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(part, dim=1),
+            torch.ones(part.size(0), dtype=part.dtype),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("gain_mode", "expected_state_keys"),
+    [
+        ("flat", ("flat_gain",)),
+        ("rowcol", ("row_gain", "col_gain")),
+    ],
+)
+def test_md_decoupling_mla_split_gain_modes_preserve_bare_split_norms(
+    gain_mode, expected_state_keys
+):
+    param = torch.nn.Parameter(
+        torch.arange(1, 33, dtype=torch.float32, device="cuda").view(4, 8)
+    )
+    param.is_kv_up_proj = True
+    optimizer = _mla_kv_up_proj_optimizer(
+        param,
+        hypersphere_mode="flat",
+        hypersphere_gains_mode=gain_mode,
+        gains_lr=0.05,
+        gain_parametrization="softplus",
+        use_orthogonal_updates=False,
+    )
+
+    grad_scale = torch.linspace(0.1, 3.2, param.numel(), device=param.device).view_as(param)
+    loss = (param * grad_scale).sum()
+    loss.backward()
+    optimizer.step()
+
+    state = optimizer.state[param]
+    for key in expected_state_keys:
+        assert key in state
+        assert torch.isfinite(state[key]).all()
+        assert not torch.allclose(optimizer._phi(state[key]), torch.ones_like(state[key]))
+    _assert_split_flat_norms(
+        optimizer,
+        param,
+        _bare_param_from_gains(optimizer, param),
+        expected_norm=8**0.5,
+    )
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("gain_mode", "expected_state_keys"),
+    [
+        ("flat", ("flat_gain",)),
+        ("rowcol", ("row_gain", "col_gain")),
+    ],
+)
+def test_md_decoupling_gqa_split_gain_modes_preserve_bare_split_norms(
+    gain_mode, expected_state_keys
+):
+    param = torch.nn.Parameter(
+        torch.arange(1, 129, dtype=torch.float32, device="cuda").view(16, 8)
+    )
+    param.is_qkv = True
+    optimizer = _gqa_qkv_optimizer(
+        param,
+        hypersphere_mode="flat",
+        hypersphere_gains_mode=gain_mode,
+        gains_lr=0.05,
+        gain_parametrization="softplus",
+        use_orthogonal_updates=False,
+    )
+
+    grad_scale = torch.linspace(0.1, 12.8, param.numel(), device=param.device).view_as(param)
+    loss = (param * grad_scale).sum()
+    loss.backward()
+    optimizer.step()
+
+    state = optimizer.state[param]
+    for key in expected_state_keys:
+        assert key in state
+        assert torch.isfinite(state[key]).all()
+        assert not torch.allclose(optimizer._phi(state[key]), torch.ones_like(state[key]))
+    _assert_split_flat_norms(
+        optimizer,
+        param,
+        _bare_param_from_gains(optimizer, param),
+        expected_norm=8**0.5,
+        is_qkv=True,
+    )
+
+def test_md_decoupling_mla_kv_up_proj_split():
+    param = torch.nn.Parameter(torch.empty(10, 4))
+    param.is_kv_up_proj = True
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(3, 2),
+    )
+
+    assert [call.shape for call in calls] == [torch.Size([6, 4]), torch.Size([4, 4])]
+    expected = torch.tensor([1, 1, 1, 2, 2, 1, 1, 1, 2, 2]).view(10, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+def test_md_decoupling_mla_kv_up_proj_split_uses_local_dim0_tp_shapes():
+    param = torch.nn.Parameter(torch.empty(10, 4))
+    param.is_kv_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(12, 8),
+    )
+
+    assert [call.shape for call in calls] == [torch.Size([6, 4]), torch.Size([4, 4])]
+    assert torch.equal(output[:6], torch.ones_like(output[:6]))
+    assert torch.equal(output[6:], torch.full_like(output[6:], 2.0))
+
+@pytest.mark.parametrize("split_qkv", [False, True])
+def test_md_decoupling_mla_kv_up_proj_split_per_head(split_qkv):
+    param = torch.nn.Parameter(torch.empty(10, 4))
+    param.is_kv_up_proj = True
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(3, 2),
+        split_mla_per_head=True,
+        split_qkv=split_qkv,
+    )
+
+    assert [call.shape for call in calls] == [
+        torch.Size([3, 4]),
+        torch.Size([2, 4]),
+        torch.Size([3, 4]),
+        torch.Size([2, 4]),
+    ]
+    expected = torch.tensor([1] * 3 + [2] * 2 + [3] * 3 + [4] * 2).view(10, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+def test_md_decoupling_mla_kv_up_proj_per_head_ignores_head_partition_dim(monkeypatch):
+    param = torch.nn.Parameter(torch.arange(1, 41, dtype=torch.float32).view(10, 4))
+    param.is_kv_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(40, dtype=torch.float32).view(10, 4)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
+        kv_up_proj_split_shapes=(3, 2),
+        split_mla_per_head=True,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="distributed",
+    )
+    partition_dims = []
+
+    def record_partition_dim(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
+        del tp_group, flat_mode, is_router
+        partition_dims.append(partition_dim)
+        return torch.full_like(split_grad, float(len(partition_dims)))
+
+    optimizer._orthogonalize_tensor = record_partition_dim
+    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, flat_mode=True)
+
+    assert partition_dims == [None, None, None, None]
+    expected = torch.tensor([1] * 3 + [2] * 2 + [3] * 3 + [4] * 2).view(10, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+    def fail_all_reduce(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("KV-up per-head splits should not all-reduce across TP ranks")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fail_all_reduce)
+
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_qkv=False)
+
+    _assert_split_flat_norms(optimizer, param, param, expected_norm=2.0)
+
+def test_md_decoupling_mla_q_up_proj_split_per_head():
+    param = torch.nn.Parameter(torch.empty(12, 4))
+    param.is_q_up_proj = True
+    grad = torch.arange(48, dtype=torch.float32).view(12, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_q_up_proj_fn=lambda p: getattr(p, "is_q_up_proj", False),
+        q_up_proj_head_dim=4,
+        split_mla_per_head=True,
+    )
+
+    assert [call.shape for call in calls] == [
+        torch.Size([4, 4]),
+        torch.Size([4, 4]),
+        torch.Size([4, 4]),
+    ]
+    expected = torch.tensor([1] * 4 + [2] * 4 + [3] * 4).view(12, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+def test_md_decoupling_mla_q_up_proj_per_head_ignores_head_partition_dim(monkeypatch):
+    param = torch.nn.Parameter(torch.arange(1, 49, dtype=torch.float32).view(12, 4))
+    param.is_q_up_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(48, dtype=torch.float32).view(12, 4)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        is_q_up_proj_fn=lambda p: getattr(p, "is_q_up_proj", False),
+        q_up_proj_head_dim=4,
+        split_mla_per_head=True,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="distributed",
+    )
+    partition_dims = []
+
+    def record_partition_dim(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
+        del tp_group, flat_mode, is_router
+        partition_dims.append(partition_dim)
+        return torch.full_like(split_grad, float(len(partition_dims)))
+
+    optimizer._orthogonalize_tensor = record_partition_dim
+    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, flat_mode=True)
+
+    assert partition_dims == [None, None, None]
+    expected = torch.tensor([1] * 4 + [2] * 4 + [3] * 4).view(12, 1)
+    assert torch.equal(output, expected.expand_as(output))
+
+    def fail_all_reduce(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("q-up per-head splits should not all-reduce across TP ranks")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fail_all_reduce)
+
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_qkv=False)
+
+    _assert_split_flat_norms(optimizer, param, param, expected_norm=2.0)
+
+def test_md_decoupling_mla_qkv_down_proj_split_mechanics():
+    param = torch.nn.Parameter(torch.empty(5, 4))
+    param.is_qkv_down_proj = True
+    grad = torch.arange(20, dtype=torch.float32).view(5, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
+        qkv_down_proj_split_shapes=(2, 3),
+    )
+
+    assert [call.shape for call in calls] == [torch.Size([2, 4]), torch.Size([3, 4])]
+    assert torch.equal(output[:2], torch.ones_like(output[:2]))
+    assert torch.equal(output[2:], torch.full_like(output[2:], 2.0))
+
+def test_md_decoupling_mla_qkv_down_proj_split_uses_local_dim0_tp_shapes():
+    param = torch.nn.Parameter(torch.empty(6, 4))
+    param.is_qkv_down_proj = True
+    param.partition_dim = 0
+    grad = torch.arange(24, dtype=torch.float32).view(6, 4)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
+        qkv_down_proj_split_shapes=(4, 8),
+    )
+
+    assert [call.shape for call in calls] == [torch.Size([2, 4]), torch.Size([4, 4])]
+    assert torch.equal(output[:2], torch.ones_like(output[:2]))
+    assert torch.equal(output[2:], torch.full_like(output[2:], 2.0))
+
+def test_md_decoupling_mla_param_tags_copy_to_main_param():
+    param = torch.empty(2, 2)
+    tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+    param.is_kv_up_proj = True
+    param.is_q_up_proj = True
+    param.is_qkv_down_proj = True
+    main_param = torch.empty_like(param)
+
+    tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+
+    assert main_param.is_kv_up_proj
+    assert main_param.is_q_up_proj
+    assert main_param.is_qkv_down_proj
+
+@pytest.mark.parametrize(
+    ("split_mla_per_head", "expected_q_up_proj_head_dim"),
+    [(False, None), (True, 8)],
+)
+def test_md_decoupling_builder_tags_mla_and_gqa_parameters(
+    monkeypatch, split_mla_per_head, expected_q_up_proj_head_dim
+):
+    class _FakeModelChunk:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                num_attention_heads=8,
+                num_query_groups=2,
+                kv_channels=4,
+                multi_latent_attention=True,
+                qk_head_dim=6,
+                v_head_dim=5,
+                qk_pos_emb_head_dim=2,
+                q_lora_rank=3,
+                kv_lora_rank=7,
+                num_layers=4,
+                hidden_size=5,
+            )
+            self.qkv = torch.nn.Parameter(torch.ones(48, 5))
+            self.kv_up = torch.nn.Parameter(torch.ones(88, 5))
+            self.q_up = torch.nn.Parameter(torch.ones(64, 5))
+            self.qkv_down = torch.nn.Parameter(torch.ones(12, 5))
+            self.named = [
+                ("decoder.layers.0.self_attention.linear_qkv.weight", self.qkv),
+                ("decoder.layers.0.self_attention.linear_kv_up_proj.weight", self.kv_up),
+                ("decoder.layers.0.self_attention.linear_q_up_proj.weight", self.q_up),
+                (
+                    "decoder.layers.0.self_attention.linear_qkv_down_proj.weight",
+                    self.qkv_down,
+                ),
+            ]
+
+        def named_parameters(self):
+            return iter(self.named)
+
+    class _FakeOptimizerWrapper:
+        def __init__(self, optimizer, config, init_state_fn=None):
+            del init_state_fn
+            self.optimizer = optimizer
+            self.config = config
+            self.param_groups = optimizer.param_groups
+            self.state = optimizer.state
+            self.is_stub_optimizer = False
+
+        def get_parameters(self):
+            return [p for group in self.param_groups for p in group["params"]]
+
+    def fake_get_param_groups(model_chunks, config, config_overrides):
+        del config, config_overrides
+        params = [
+            p
+            for model_chunk in model_chunks
+            for _, p in model_chunk.named_parameters()
+            if p.requires_grad
+        ]
+        return [{"params": params, "is_expert_parallel": False}]
+
+    def fake_get_megatron_optimizer(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(chained_optimizers=[])
+
+    monkeypatch.setattr(md_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(md_module, "FP32Optimizer", _FakeOptimizerWrapper)
+    monkeypatch.setattr(md_module, "get_megatron_optimizer", fake_get_megatron_optimizer)
+
+    model_chunk = _FakeModelChunk()
+    config = OptimizerConfig(optimizer="md_decoupling", lr=0.01, min_lr=0.0)
+    config.use_orthogonal_updates = False
+    config.hypersphere_mode = "flat"
+    config.hypersphere_embedding_mode = None
+    config.hypersphere_router_mode = None
+    config.hypersphere_gains_mode = None
+    config.muon_split_qkv = True
+    config.muon_split_mla_per_head = split_mla_per_head
+    config.use_distributed_optimizer = False
+    config.fp16 = False
+    config.bf16 = False
+
+    chained = md_module.get_megatron_mddecoupling_optimizer(
+        config,
+        [model_chunk],
+        config_overrides={},
+        pg_collection=_NoProcessGroups(),
+    )
+
+    optimizer = chained.chained_optimizers[0].optimizer
+    assert optimizer.qkv_split_shapes == [16, 4, 4]
+    assert optimizer.q_up_proj_head_dim == expected_q_up_proj_head_dim
+    assert optimizer.qkv_down_proj_split_shapes == (3, 9)
+    assert model_chunk.qkv.is_qkv
+    assert model_chunk.kv_up.is_kv_up_proj
+    assert model_chunk.q_up.is_q_up_proj
+    assert model_chunk.qkv_down.is_qkv_down_proj
+
+    kv_grad = torch.arange(88 * 5, dtype=torch.float32).view(88, 5)
+    kv_parts, merge_kv_parts = optimizer._split_param_tensor(model_chunk.kv_up, kv_grad)
+    # MultiLatentAttention.forward views linear_kv_up_proj output as
+    # [tokens, num_heads, qk_head_dim + v_head_dim] before splitting K and V.
+    kv_per_head = kv_grad.view(8, 11, 5)
+    if split_mla_per_head:
+        expected_parts = [
+            part
+            for head in kv_per_head.unbind(0)
+            for part in torch.split(head, (6, 5), dim=0)
+        ]
+    else:
+        expected_parts = [
+            kv_per_head[:, :6].reshape(48, 5),
+            kv_per_head[:, 6:].reshape(40, 5),
+        ]
+    assert len(kv_parts) == len(expected_parts)
+    for actual, expected in zip(kv_parts, expected_parts):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(merge_kv_parts(kv_parts), kv_grad)
+    assert optimizer.kv_up_proj_split_shapes == (6, 5)
+
+def test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags(monkeypatch):
+    class _FakeOptimizer:
+        def __init__(self, params):
+            self.config = SimpleNamespace()
+            self.param_groups = [{"params": params, "is_expert_parallel": False}]
+            self.state = {}
+            self.is_stub_optimizer = False
+
+        def get_parameters(self):
+            return [p for group in self.param_groups for p in group["params"]]
+
+    monkeypatch.setattr(layer_wise_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(layer_wise_module, "get_pg_rank", lambda group: 0)
+
+    qkv = torch.nn.Parameter(torch.ones(16, 4))
+    qkv.is_qkv = True
+    kv_up = torch.nn.Parameter(torch.ones(8, 4))
+    kv_up.is_kv_up_proj = True
+    q_up = torch.nn.Parameter(torch.ones(12, 4))
+    q_up.is_q_up_proj = True
+    qkv_down = torch.nn.Parameter(torch.ones(5, 4))
+    qkv_down.is_qkv_down_proj = True
+
+    optimizer = _FakeOptimizer([qkv, kv_up, q_up, qkv_down])
+    config = SimpleNamespace(bf16=False)
+    pg_collection = SimpleNamespace(dp_cp=object(), expt_dp=object())
+
+    layerwise = LayerWiseDistributedOptimizer([optimizer], config, pg_collection)
+
+    sharded_params = [p for shard in layerwise.dp_cp_params_list for p in shard]
+    assert any(p is qkv for p in sharded_params) and qkv.is_qkv
+    assert any(p is kv_up for p in sharded_params) and kv_up.is_kv_up_proj
+    assert any(p is q_up for p in sharded_params) and q_up.is_q_up_proj
+    assert any(p is qkv_down for p in sharded_params) and qkv_down.is_qkv_down_proj

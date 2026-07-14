@@ -31,6 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
+from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -507,6 +508,20 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
+    def _wrap_activation_reload(self, output: torch.Tensor):
+        """Wire ``MoEActReloadTrigger`` on the combine output so the offloaded expert input
+        activation is reloaded during the combine-backward window.
+
+        Reads the handle set by ``OffloadingExpertsMLP.forward``. Safe against VPP
+        interleaving here because experts and combine run synchronously within this forward, so the
+        module slot cannot be overwritten by another microbatch in between. No-op unless an active
+        handle was produced this forward.
+        """
+        handle = getattr(self.experts, "_act_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEActReloadTrigger.apply(output, handle)
+        return output
+
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed."""
@@ -586,6 +601,9 @@ class MoELayer(BaseMoELayer):
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+                # Reload the offloaded expert activations during the combine-backward
+                # window. No-op unless moe_offload_activations produced an active handle.
+                output = self._wrap_activation_reload(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

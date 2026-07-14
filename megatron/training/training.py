@@ -459,9 +459,13 @@ def num_floating_point_operations(args, batch_size):
         fma_expansion_factor = 2
         # - 3x (gated linear unit): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
         # - 2x (non-gated): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
-        # pnglu (PolyNorm GLU) is also a GLU (fc1 is h->2*ffn_h), so it counts as gated even
-        # though it does not set args.swiglu.
-        ffn_expansion_factor = 3 if (args.swiglu or args.pnglu) else 2
+        # sssglu/reglu/pnglu/pn3glu/gxpr/gxpry/gxprv2/gxr2/xr2glu/xsssglu (ReLU-, softsign-gated,
+        # PolyNorm-family and XPR-family GLU gates) are also GLUs (fc1 is h->2*ffn_h), so they
+        # count as gated even though they do not set args.swiglu.
+        ffn_expansion_factor = 3 if (
+            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.pn3glu
+            or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
+        ) else 2
 
         if args.multi_latent_attention:
             assert not args.group_query_attention
@@ -704,7 +708,12 @@ def num_floating_point_operations(args, batch_size):
             gqa_groups=args.num_query_groups,
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
-            swiglu=args.swiglu or args.pnglu,  # pnglu is a GLU (gated) but does not set args.swiglu
+            # sssglu/reglu/pnglu/pn3glu/gxpr/gxpry/gxprv2/gxr2/xr2glu/xsssglu are GLUs (gated) but
+            # do not set args.swiglu
+            swiglu=(
+                args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.pn3glu
+                or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
+            ),
             moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
                                  else args.ffn_hidden_size),
@@ -2195,6 +2204,18 @@ def training_log(
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
+        if args.moe_router_ep_violation_metrics:
+            track_names.append("ep_expert_max_violation")
+            track_names.append("ep_expert_min_violation")
+            track_names.append("ep_expert_median_violation")
+        if args.moe_router_bias_metrics:
+            uses_quantile_balancing = "quantile_balancing" in args.moe_router_load_balancing_type
+            if args.moe_router_enable_expert_bias and not uses_quantile_balancing:
+                track_names.extend(
+                    ['expert_bias_mean', 'expert_bias_std', 'expert_bias_min', 'expert_bias_max']
+                )
+            if uses_quantile_balancing:
+                track_names.extend(['qb_beta_mean', 'qb_beta_std', 'qb_beta_min', 'qb_beta_max'])
 
         if is_hybrid_model(args):
             from operator import itemgetter

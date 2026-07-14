@@ -277,6 +277,13 @@ class OptimizerConfig:
     muon_scale_mode: str = "spectral"
     """The mode to use for the scale factor. Defaults to "spectral"."""
 
+    muon_router_scale_mode: str = "none"
+    """Muon scale-factor mode for MoE router weights under md_decoupling, overriding
+    ``muon_scale_mode`` for routers only. Defaults to "none" (constant 1.0): the router maps
+    hidden -> num_experts, so its aspect ratio — and hence the shape-derived scale factor
+    (e.g. shape_up) — tracks hidden even when the matrix LR is held fixed, which breaks LR
+    transfer across width. Set to a mode name to make routers follow that scale instead."""
+
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 
@@ -308,7 +315,7 @@ class OptimizerConfig:
     ###################################################################################
     # MDDecoupling (magnitude-direction decoupling: hypersphere normalization + learnable
     # per-axis gains + optional Muon orthogonalized updates). Reuses the muon_* / adam_* /
-    # weight_decay fields above for shared knobs. All defaults are off; existing runs unaffected.
+    # weight_decay fields above for shared knobs.
     ###################################################################################
     matrix_lr: Optional[float] = None
     """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling or
@@ -334,13 +341,13 @@ class OptimizerConfig:
 
     hypersphere_mode: Optional[str] = 'flat'
     """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
-    'row'/'col'/'flat'/'embed'. Applied post-step to project the weight onto the L2 sphere.
+    'row'/'col'/'flat'/'embed'/'none'. Applied post-step to project the weight onto the L2 sphere.
     None = off."""
 
     hypersphere_embedding_mode: Optional[str] = 'row'
-    """Hypersphere mode override for embedding + LM head. When set, those params stay in
-    MDDecoupling (Adam branch) and get post-step normalization. When None, they route to the
-    chained external Adam with no hypersphere. One of 'row'/'col'/'flat'/'embed'/'none'."""
+    """Hypersphere mode override for embedding + LM head. One of
+    'row'/'col'/'flat'/'embed'/'none'/'external'. 'external' routes those params to the chained
+    optimizer; 'none' keeps them in MDDecoupling without post-step normalization."""
 
     hypersphere_router_mode: Optional[str] = 'row'
     """Hypersphere mode override for MoE router weights. One of 'row'/'col'/'flat'/'embed'/'none'.
@@ -372,19 +379,22 @@ class OptimizerConfig:
     LM head ALWAYS use the Adam branch regardless of this flag."""
 
     hypersphere_gains_mode: Optional[str] = 'rowcol'
-    """Learnable per-axis gains for matrix params. One of 'row'/'col'/'rowcol'/'flat'/'embed'."""
+    """Learnable per-axis gains for matrix params. One of
+    'row'/'col'/'rowcol'/'flat'/'embed'/'none'."""
 
-    hypersphere_gains_mode_output: Optional[str] = None
-    """Gains mode override for the LM head. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
+    hypersphere_gains_mode_output: Optional[str] = 'inherit'
+    """Gains mode override for the LM head. One of
+    'row'/'col'/'rowcol'/'flat'/'inherit'/'none'. 'inherit' uses the base gains mode."""
 
-    hypersphere_gains_mode_embedding: Optional[str] = None
-    """Gains mode override for the embedding. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
+    hypersphere_gains_mode_embedding: Optional[str] = 'none'
+    """Gains mode override for the embedding. One of
+    'row'/'col'/'rowcol'/'flat'/'inherit'/'none'. None or 'inherit' uses the base gains mode."""
 
-    hypersphere_gains_mode_router: Optional[str] = 'none'
-    """Gains mode override for MoE router weights. One of 'row'/'col'/'rowcol'/'flat'/'none'.
-    Defaults to 'none': per-expert row gains re-introduce the per-expert magnitude that the router
-    hypersphere normalization removes, which unbalances expert selection. Only takes effect when
-    --hypersphere-gains-mode is set (routers otherwise have no gains at all)."""
+    hypersphere_gains_mode_router: Optional[str] = 'rowcol'
+    """Gains mode override for MoE router weights. One of
+    'row'/'col'/'rowcol'/'flat'/'inherit'/'none'. None or 'inherit' uses the base gains mode.
+    Defaults to 'rowcol'. Only takes effect when --hypersphere-gains-mode is set (routers otherwise
+    have no gains at all)."""
 
     gains_lr: Optional[float] = None
     """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks

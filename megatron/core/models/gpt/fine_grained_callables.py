@@ -24,6 +24,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
+from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
 
 
 def weak_method(method):
@@ -566,6 +567,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             dispatched_tokens, dispatched_tokens_sf, dispatched_probs
         )
 
+        # Stash the activation-offload handle (moe_offload_activations) on the per-microbatch
+        # layer_state so the combine node -- which may be interleaved with another microbatch's
+        # moe node under EP overlap -- reloads the correct instance's fp8_x in backward. Reading
+        # the module slot directly here (still inside this node, synchronous) avoids that race.
+        node.layer_state.act_offload_handle = getattr(
+            layer.mlp.experts, "_act_offload_handle", None
+        )
+
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
         # `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep:
@@ -589,8 +598,13 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # with another microbatch's computation and expose the communication.
         """
         output = layer.mlp.combine(output)
+        # Reload the offloaded expert input activation (fp8_x) during this combine's backward
+        # all-to-all window. No-op unless moe_offload_activations produced an active handle.
+        handle = getattr(node.layer_state, "act_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEActReloadTrigger.apply(output, handle)
         return output
-        
+
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.postprocess(output, shared_expert_output)

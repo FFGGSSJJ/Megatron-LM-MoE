@@ -6,19 +6,29 @@ Utilities for MoE experts offloading with FP8 support, including:
 """
 from __future__ import annotations
 
+import collections
 import itertools
 from dataclasses import dataclass
 
 import torch
 
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    TransformerConfig,
+    MOE_OFFLOAD_INPUT,
+    MOE_OFFLOAD_FC1_OUTPUT,
+)
 
 try:
     import grouped_gemm
 except ImportError:
     grouped_gemm = None
 
-from megatron.core.transformer.moe.experts_offloading_util import StreamManager
+from megatron.core.transformer.moe.moe_offload import (
+    ActivationOffloadHandle,
+    MoEActivationOffloadManager,
+    PinnedActBufferPool,
+    StreamManager,
+)
 from megatron.core.transformer.moe.experts_util import (
     ExpertsWgradScheduler,
     get_dummy_wgrad,
@@ -40,10 +50,20 @@ from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
     swiglu_backward,
 )
+from megatron.core.transformer.moe.sssglu_jit import (
+    sssglu_forward,
+    sssglu_backward,
+)
+from megatron.core.transformer.moe.rlglu_jit import (
+    rlglu_forward,
+    rlglu_backward,
+)
 from megatron.core.fusions.fused_polynorm_glu import (
     fused_polynorm_glu_forward,
     fused_polynorm_glu_backward,
 )
+from megatron.core.fusions.fused_bias_sssglu import ssslu
+from megatron.core.activations import rlglu_act
 
 @dataclass(frozen=True)
 class OffloadingFP8Config:
@@ -62,6 +82,12 @@ class OffloadingFP8Config:
     moe_ffn_hidden_size: int
     gated_linear_unit: bool
     gated_polynorm_linear_unit: bool
+    # SSSGLU: GLU with the SiLU gate replaced by scaled softsign (activation_func == ssslu);
+    # routed through its own Triton kernels in sssglu_jit.py (sibling of swiglu_jit.py).
+    gated_sssglu_linear_unit: bool = False
+    # RLGLU: GLU with gate relu(a)-0.5*ln(1+|a|) (activation_func == rlglu_act); routed through
+    # its own Triton kernels in rlglu_jit.py (sibling of sssglu_jit.py).
+    gated_rlglu_linear_unit: bool = False
     polynorm_eps: float = 1e-6
     fc1_out_size: int = 0
 
@@ -71,6 +97,8 @@ class OffloadingFP8Config:
     moe_offloading_num_stages: int = 1
     moe_offloading_experts_debug_mode: bool = False
     moe_use_extra_fp8_param_storage: bool = False
+    moe_offload_input: bool = False
+    moe_offload_fc1_output: bool = False
 
     # recomputation
     recompute_granularity: str = "selective"
@@ -102,12 +130,20 @@ class OffloadingFP8Config:
             moe_ffn_hidden_size=config.moe_ffn_hidden_size,
             gated_linear_unit=config.gated_linear_unit,
             gated_polynorm_linear_unit=config.pnglu,
+            gated_sssglu_linear_unit=(config.activation_func == ssslu),
+            gated_rlglu_linear_unit=(config.activation_func == rlglu_act),
             polynorm_eps=getattr(config, "polynorm_eps", 1e-6),
             moe_offloading_chunk_size=config.moe_offloading_chunk_size,
             moe_offloading_num_chunks=config.moe_offloading_num_chunks,
             moe_offloading_num_stages=config.moe_offloading_num_stages,
             moe_offloading_experts_debug_mode=config.moe_offloading_experts_debug_mode,
             moe_use_extra_fp8_param_storage=config.moe_use_extra_fp8_param_storage,
+            moe_offload_input=(
+                MOE_OFFLOAD_INPUT in (config.moe_offload_activations or [])
+            ),
+            moe_offload_fc1_output=(
+                MOE_OFFLOAD_FC1_OUTPUT in (config.moe_offload_activations or [])
+            ),
             recompute_granularity=config.recompute_granularity,
             recompute_modules=config.recompute_modules,
             delay_wgrad_compute=config.delay_wgrad_compute,
@@ -625,11 +661,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 config.polynorm_eps,
                 permuted_probs.unsqueeze(-1),
             )
+        elif config.gated_sssglu_linear_unit:
+            s = sssglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
+        elif config.gated_rlglu_linear_unit:
+            s = rlglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
         else:
-            s = swiglu_forward(
-                fc1_output,
-                permuted_probs.unsqueeze(-1)
-            )
+            s = swiglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
 
         # quantize the swiglu output to FP8
         # fp8_s = per_token_cast_to_fp8(s, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
@@ -748,6 +785,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
             return grad_a, grad_probs, grad_a1, grad_a2
+        elif config.gated_sssglu_linear_unit:
+            grad_a, grad_probs = sssglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+            return grad_a, grad_probs, None, None
+        elif config.gated_rlglu_linear_unit:
+            grad_a, grad_probs = rlglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+            return grad_a, grad_probs, None, None
         else:
             grad_a, grad_probs = swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
             return grad_a, grad_probs, None, None
@@ -854,6 +897,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             s, _ = fused_polynorm_glu_forward(
                 a, a1, a2, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
+        elif config.gated_sssglu_linear_unit:
+            s = sssglu_forward(a, permuted_probs.unsqueeze(-1))
+        elif config.gated_rlglu_linear_unit:
+            s = rlglu_forward(a, permuted_probs.unsqueeze(-1))
         else:
             s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
         fp8_s = guarded_per_channel_cast_to_fp8_pack_kmajor(
@@ -1103,23 +1150,39 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # only stores tensors. The full sf can be reconstructed by concatenation
         # if needed, but the chunks are already in the layout we want.
         ctx.fp8_permuted_local_hidden_states_sf_chunks = fp8_x_sf_chunks
+
+        # activation offload: park fp8_x on pinned host during the combine phase and free its GPU
+        # storage. It is reloaded by MoEActReloadTrigger.backward before this Function's backward.
+        act_offload_handle = None
+        if config.moe_offload_input and fp8_x_full.numel() > 0:
+            act_offload_handle = MoEActivationOffloadManager.offload(fp8_x_full, stream_manager)
+            ctx.fp8_hidden_state_per_chunk = None
+        ctx.act_offload_handle = act_offload_handle
+        # When offloading, do not keep the (now-freed) GPU tensor in save_for_backward; the input is
+        # reconstructed from the handle in backward.
+        saved_fp8_x = None if act_offload_handle is not None else fp8_permuted_local_hidden_states[0]
+
         if activation_recompute:
             release(fc1_output)
             ctx.save_for_backward(
-                fp8_permuted_local_hidden_states[0],
+                saved_fp8_x,
                 None, None,
                 permuted_probs
             )
         else:
             fp8_fc1_output = per_token_cast_to_fp8(fc1_output, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+            saved_fp8_fc1 = fp8_fc1_output[0]
+            if config.moe_offload_fc1_output and act_offload_handle is not None:
+                MoEActivationOffloadManager.offload_fc1(act_offload_handle, saved_fp8_fc1)
+                saved_fp8_fc1 = None
             ctx.save_for_backward(
-                fp8_permuted_local_hidden_states[0],
-                fp8_fc1_output[0],
+                saved_fp8_x,
+                saved_fp8_fc1,
                 fp8_fc1_output[1],
                 permuted_probs
             )
 
-        return y, None
+        return y, act_offload_handle
 
 
 
@@ -1151,6 +1214,29 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             permuted_probs
         ) = ctx.saved_tensors
 
+        # Reconstruct fp8_x from the host-offloaded copy. MoEActReloadTrigger.backward has already
+        # launched the H2D (overlapping the combine-backward all-to-all); wait for it before use and
+        # rebuild the per-chunk views that were dropped in forward.
+        act_offload_handle: ActivationOffloadHandle = getattr(ctx, "act_offload_handle", None)
+        if act_offload_handle is not None and act_offload_handle.active:
+            assert act_offload_handle.gpu_slot is not None, (
+                "Activation reload did not run before expert backward -- MoEActReloadTrigger must be "
+                "wired on the combine output when moe_offload_activations is enabled."
+            )
+            stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done)
+            fp8_permuted_local_hidden_states = act_offload_handle.gpu_slot
+            fp8_x_chunks = list(
+                torch.split(fp8_permuted_local_hidden_states, total_token_num_per_chunk, dim=0)
+            )
+            fp8_hidden_state_per_chunk = (fp8_x_chunks, fp8_permuted_local_hidden_states_sf_chunks)
+            # Recycle the pinned host buffer, guarded by the reload event so a future D2H write does
+            # not overwrite it until this reload's H2D read has completed.
+            PinnedActBufferPool.get_instance().free(
+                act_offload_handle.cpu_base, act_offload_handle.h2d_done
+            )
+            act_offload_handle.cpu_base = None
+            act_offload_handle.cpu_flat = None
+
         if ctx.activation_recompute:
             # recompute the activation for backward
             fc1_output = OffloadingExpertsFP8GroupedSwiMLP.call_forward_a(
@@ -1166,6 +1252,23 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 config,
             )
         else:
+            # if fc1 was offloaded, its reload H2D has been flowing on act_h2d_stream since the
+            # reload trigger (serial after fp8_x's). wait its OWN event here
+            if (
+                act_offload_handle is not None
+                and getattr(act_offload_handle, "fc1_active", False)
+            ):
+                assert act_offload_handle.gpu_slot_fc1 is not None, (
+                    "fc1 activation reload did not run before expert backward -- "
+                    "MoEActivationOffloadManager.reload must handle the fc1 slot when fc1_active is set."
+                )
+                stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done_fc1)
+                fp8_fc1_output = act_offload_handle.gpu_slot_fc1
+                PinnedActBufferPool.get_instance().free(
+                    act_offload_handle.cpu_base_fc1, act_offload_handle.h2d_done_fc1
+                )
+                act_offload_handle.cpu_base_fc1 = None
+                act_offload_handle.cpu_flat_fc1 = None
             fc1_output = per_token_dequant_from_fp8(fp8_fc1_output, fp8_fc1_output_scales)
 
         grad_y = grad_outputs[0].contiguous()
@@ -1308,7 +1411,7 @@ def offloading_fp8_grouped_swiglu_mlp(
     wgrad_accumulation_and_reduce_hooks: list,
     a1: torch.Tensor = None,
     a2: torch.Tensor = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, ActivationOffloadHandle | None]:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
     Args:
@@ -1325,9 +1428,11 @@ def offloading_fp8_grouped_swiglu_mlp(
         config (OffloadingFP8Config): offloading FP8 configuration
 
     Returns:
-        torch.Tensor: output of the MLP
+        tuple[torch.Tensor, ActivationOffloadHandle | None]: the MLP output and the activation
+        offload handle (None unless ``moe_offload_activations`` produced one). The caller must wire
+        the handle into ``MoEActReloadTrigger`` on the combine output so it is reloaded in backward.
     """
-    output, _ = OffloadingExpertsFP8GroupedSwiMLP.apply(
+    output, act_offload_handle = OffloadingExpertsFP8GroupedSwiMLP.apply(
         a1,
         a2,
         cpu_w1,
@@ -1348,4 +1453,4 @@ def offloading_fp8_grouped_swiglu_mlp(
         wgrad_accumulation_and_reduce_hooks
     )
 
-    return output
+    return output, act_offload_handle

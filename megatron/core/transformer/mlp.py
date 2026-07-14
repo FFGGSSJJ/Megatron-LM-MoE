@@ -23,8 +23,29 @@ from megatron.core.fusions.fused_bias_geglu import (
     quick_gelu,
     weighted_bias_quick_geglu_impl,
 )
-from megatron.core.activations import PolyNorm
+from megatron.core.activations import (
+    GXPR,
+    GXPRY,
+    GXPRV2,
+    GXR2,
+    PolyNorm,
+    PolyNormAct,
+    XPR,
+    XR2,
+    XR2GLU,
+    XSSSGLU,
+    rlglu_act,
+)
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+from megatron.core.fusions.fused_bias_rlglu import (
+    bias_rlglu_impl,
+    weighted_bias_rlglu_impl,
+)
+from megatron.core.fusions.fused_bias_sssglu import (
+    bias_sssglu_impl,
+    ssslu,
+    weighted_bias_sssglu_impl,
+)
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -237,6 +258,34 @@ class MLP(MegatronModule):
             self.polynorm_glu = PolyNorm(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
             )
+        if self.config.pn3glu:
+            self.polynorm_glu = PolyNorm(
+                num_local_experts=1, config=self.config, tp_group=self.tp_group, num_terms=3
+            )
+
+        # XPR/GXPR/XR2/GXR2/PolyNormAct: like PolyNorm, a dense MLP (and each SequentialMLP /
+        # shared expert, which are themselves MLPs) owns a single coefficient set, so
+        # num_local_experts=1 here.
+        if self.config.xpr:
+            self.xpr_act = XPR(num_local_experts=1, config=self.config)
+        if self.config.gxpr:
+            self.gxpr_glu = GXPR(num_local_experts=1, config=self.config)
+        if self.config.gxpry:
+            self.gxpry_glu = GXPRY(num_local_experts=1, config=self.config)
+        if self.config.gxprv2:
+            self.gxprv2_glu = GXPRV2(num_local_experts=1, config=self.config)
+        if self.config.xr2:
+            self.xr2_act = XR2(num_local_experts=1, config=self.config)
+        if self.config.gxr2:
+            self.gxr2_glu = GXR2(num_local_experts=1, config=self.config)
+        if self.config.xr2glu:
+            self.xr2glu = XR2GLU(num_local_experts=1, config=self.config)
+        if self.config.xsssglu:
+            self.xsssglu_glu = XSSSGLU(num_local_experts=1, config=self.config)
+        if self.config.polynorm:
+            self.polynorm_act = PolyNormAct(
+                num_local_experts=1, config=self.config, tp_group=self.tp_group
+            )
 
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
@@ -281,6 +330,22 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
+                elif self.activation_func == ssslu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_sssglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
+                elif self.activation_func == rlglu_act and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_rlglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
                         intermediate_parallel,
@@ -292,7 +357,8 @@ class MLP(MegatronModule):
                     )
                 else:
                     raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
+                        "Only support fusion of swiglu, sssglu, rlglu and quick_gelu with "
+                        "per_token_scale in MLP."
                     )
             else:
                 if self.activation_func == F.gelu:
@@ -312,15 +378,33 @@ class MLP(MegatronModule):
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
                     )
+                elif self.activation_func == ssslu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_sssglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
+                elif self.activation_func == rlglu_act and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_rlglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
                 else:
-                    raise ValueError("Only support fusion of gelu and swiglu")
+                    raise ValueError("Only support fusion of gelu, swiglu, sssglu and rlglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             # When PolyNorm fuses the per_token_scale multiply into its kernel we skip the
             # eager post-multiply below (the fc2-bias scaling further down still uses per_token_scale).
             scale_fused = False
-            if self.config.gated_linear_unit and self.config.pnglu:
+            if self.config.gated_linear_unit and (self.config.pnglu or self.config.pn3glu):
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)
@@ -329,6 +413,66 @@ class MLP(MegatronModule):
                     x_linear = x_linear + self.config.glu_linear_offset
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.polynorm_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.gxpr:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.gxpr_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.gxpry:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.gxpry_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.gxprv2:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.gxprv2_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.gxr2:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.gxr2_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.xr2glu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.xr2glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.xsssglu:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.xsssglu_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit:
 
@@ -341,6 +485,12 @@ class MLP(MegatronModule):
                     return gate * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
+            elif self.config.xpr:
+                intermediate_parallel = self.xpr_act(intermediate_parallel)
+            elif self.config.xr2:
+                intermediate_parallel = self.xr2_act(intermediate_parallel)
+            elif self.config.polynorm:
+                intermediate_parallel = self.polynorm_act(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
