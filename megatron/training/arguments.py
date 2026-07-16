@@ -1458,7 +1458,14 @@ def validate_args(args, defaults={}):
 
     if args.inference_dynamic_batching:
         assert args.inference_dynamic_batching_buffer_size_gb is not None
-        assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
+        if args.multi_latent_attention and args.cache_mla_latents:
+            assert args.inference_dynamic_batching_block_size == 64, (
+                "Flash MLA requires a block size of 64"
+            )
+        else:
+            assert args.inference_dynamic_batching_block_size % 256 == 0, (
+                "block size should be a multiple of 256"
+            )
 
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \
@@ -2004,7 +2011,7 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
-                       'It should be a multiple of 256')
+                       'It should be a multiple of 256, or 64 when caching MLA latents')
     group.add_argument('--inference-dynamic-batching-max-requests',
                        type=int, default=None,
                        help='Override the inference context\'s `max_requests`. '

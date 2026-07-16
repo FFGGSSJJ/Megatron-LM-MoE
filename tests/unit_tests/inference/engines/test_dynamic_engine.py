@@ -52,7 +52,7 @@ from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -283,6 +283,7 @@ class TestDynamicInferenceEngine:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+            expert_model_parallel_size=test_config.expert_model_parallel_size,
         )
 
         set_rounder(4)
@@ -300,13 +301,15 @@ class TestDynamicInferenceEngine:
         # Requests.
         requests = cls._build_requests(test_config)
 
-        if test_config.model_provider == "gpt":
+        if test_config.model_provider in ("gpt", "mla"):
+            is_mla = test_config.model_provider == "mla"
             # Transformer config.
-            transformer_config = TransformerConfig(
+            transformer_config_cls = MLATransformerConfig if is_mla else TransformerConfig
+            transformer_config_kwargs = dict(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=128 if test_config.fp8 else 32,
+                hidden_size=128 if test_config.fp8 or is_mla else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=(
@@ -324,6 +327,7 @@ class TestDynamicInferenceEngine:
                     if test_config.expert_model_parallel_size == 1
                     else test_config.expert_model_parallel_size
                 ),
+                moe_token_dispatcher_type="alltoall",
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
@@ -340,10 +344,33 @@ class TestDynamicInferenceEngine:
                 ),
                 # inference optimized currently only supports RMS Norm
             )
-            if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+            if is_mla:
+                transformer_config_kwargs.update(
+                    q_lora_rank=32,
+                    kv_lora_rank=32,
+                    qk_head_dim=128,
+                    v_head_dim=128,
+                    qk_pos_emb_head_dim=64,
+                    qk_layernorm=True,
+                    cache_mla_latents=True,
+                    bf16=True,
+                )
+            transformer_config = transformer_config_cls(**transformer_config_kwargs)
+
+            if is_mla:
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=transformer_config.num_moe_experts,
+                    multi_latent_attention=True,
+                    qk_layernorm=True,
+                )
+            elif test_config.fp8 or test_config.transformer_impl == "transformer_engine":
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec()
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec()
 
@@ -805,6 +832,74 @@ class TestDynamicInferenceEngine:
             # Verify each request has generated tokens
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
+
+    def test_generate_runs_dummy_forward_until_ep_peers_finish(self) -> None:
+        """Synchronous generation must keep joining EP steps after local completion."""
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter([0])
+        engine.add_request = mock.Mock()
+        engine.has_unfinished_requests = mock.Mock(side_effect=[True, False, False])
+        engine._any_synchronous_ep_rank_has_work = mock.Mock(
+            side_effect=[True, True, False]
+        )
+        finished_record = types.SimpleNamespace(request_id=0)
+        engine.step_modern = mock.Mock(
+            return_value={"finished_request_records": [finished_record]}
+        )
+        engine._run_ep_dummy_step = mock.Mock()
+
+        result = DynamicInferenceEngine.generate(engine, ["prompt"], SamplingParams())
+
+        assert result == [finished_record]
+        engine.step_modern.assert_called_once_with()
+        engine._run_ep_dummy_step.assert_called_once_with()
+        assert [
+            call.args[0]
+            for call in engine._any_synchronous_ep_rank_has_work.call_args_list
+        ] == [True, False, False]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_generate_with_uneven_ep_work_runs_real_dummy_forward(self) -> None:
+        """An idle EP rank must run the real model dummy path until its peer finishes."""
+        if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+            pytest.skip("Test requires exactly two distributed ranks")
+
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=2,
+                max_sequence_length=8,
+                num_gap_steps=0,
+                expert_model_parallel_size=2,
+                context_buffer_size_gb=0.01,
+                context_block_size_tokens=64,
+                model_provider="mla",
+            )
+        )
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        prompts = ["active prompt"] if ep_rank == 0 else []
+        env.engine.controller.tokenize_prompt = lambda *args, **kwargs: [1, 2, 3, 4]
+        real_dummy_forward = env.engine.controller.dummy_forward
+        env.engine.controller.dummy_forward = mock.Mock(wraps=real_dummy_forward)
+
+        results = env.engine.generate(
+            prompts,
+            SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+        )
+
+        if ep_rank == 0:
+            assert len(results) == 1
+            assert len(results[0].merge().generated_tokens) == 2
+            assert env.engine.controller.dummy_forward.call_count == 0
+        else:
+            assert results == []
+            assert env.engine.controller.dummy_forward.call_count > 0
 
     @pytest.mark.internal
     @pytest.mark.asyncio

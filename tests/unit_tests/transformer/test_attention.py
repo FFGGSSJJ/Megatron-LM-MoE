@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import types
 from unittest import mock
 
 import pytest
@@ -19,8 +20,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.attention import HAVE_FA3, Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args
@@ -41,6 +42,182 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+def test_materialize_paged_kv_cache_in_varlen_order():
+    kv_cache = torch.arange(8).reshape(4, 2, 1)
+    block_table = torch.tensor([[2, 0, -1], [3, 1, -1]])
+    sequence_lengths = torch.tensor([3, 4])
+
+    materialized = Attention._materialize_paged_kv_cache(
+        kv_cache, block_table, sequence_lengths
+    )
+
+    assert torch.equal(
+        materialized.squeeze(-1), torch.tensor([4, 5, 0, 6, 7, 2, 3])
+    )
+
+
+def test_dynamic_flash_attention_2_prefill_forwards_window_size():
+    attention = mock.Mock()
+    attention.training = False
+    attention.batch_invariant_mode = False
+    attention.softmax_scale = None
+    attention._get_flash_attention_window_size.return_value = (1024, 0)
+    q = torch.zeros(2, 1, 1, 4)
+    k = v = torch.zeros(2, 1, 4)
+
+    with mock.patch("megatron.core.transformer.attention.HAVE_FA3", False), mock.patch(
+        "megatron.core.transformer.attention.flash_attn_varlen_func",
+        return_value=torch.zeros(2, 1, 4),
+    ) as flash_attention:
+        Attention.flash_decode_and_prefill(
+            attention,
+            q,
+            k,
+            v,
+            2,
+            2,
+            torch.tensor([0, 2]),
+            torch.tensor([0, 2]),
+            torch.tensor([2]),
+            torch.tensor([[0]]),
+            False,
+        )
+
+    assert flash_attention.call_args.kwargs["window_size"] == (1024, 0)
+
+
+@pytest.mark.parametrize(
+    ("have_fa3", "kernel_name"),
+    (
+        (False, "flash_attn_with_kvcache"),
+        (True, "flash_attn3_with_kvcache"),
+    ),
+    ids=("fa2", "fa3"),
+)
+def test_dynamic_flash_attention_decode_forwards_window_size(have_fa3, kernel_name):
+    attention = mock.Mock()
+    attention.training = False
+    attention.batch_invariant_mode = False
+    attention._get_flash_attention_window_size.return_value = (1024, 0)
+    q = torch.zeros(1, 1, 1, 4)
+    k = v = torch.zeros(1, 64, 1, 4)
+
+    with mock.patch(
+        "megatron.core.transformer.attention.HAVE_FA3", have_fa3
+    ), mock.patch(
+        f"megatron.core.transformer.attention.{kernel_name}",
+        return_value=torch.zeros_like(q),
+    ) as flash_attention:
+        Attention.flash_decode_and_prefill(
+            attention,
+            q,
+            k,
+            v,
+            1,
+            2,
+            torch.tensor([0, 1]),
+            torch.tensor([0, 2]),
+            torch.tensor([2]),
+            torch.tensor([[0]]),
+            True,
+        )
+
+    assert flash_attention.call_args.kwargs["window_size"] == (1024, 0)
+
+
+@pytest.mark.skipif(not HAVE_FA3, reason="FlashAttention-3 is required")
+@torch.inference_mode()
+def test_mla_flash_attention_2_padding_matches_flash_attention_3():
+    """FA2's padded MLA values must match FA3's native unequal-head-dim result."""
+    pytest.importorskip("flash_attn")
+
+    torch.manual_seed(1234)
+    length = 257
+    page_size = 64
+    num_pages = (length + page_size - 1) // page_size
+    num_heads = 4
+    qk_dim = 192
+    value_dim = 128
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+
+    attention = mock.Mock()
+    attention.training = False
+    attention.batch_invariant_mode = False
+    attention.softmax_scale = qk_dim**-0.5
+    attention.config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=num_heads,
+        q_lora_rank=32,
+        kv_lora_rank=32,
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=64,
+        v_head_dim=value_dim,
+    )
+    attention._get_flash_attention_window_size.return_value = (-1, -1)
+    attention._flash_attention_3_forward_wrapper = types.MethodType(
+        Attention._flash_attention_3_forward_wrapper, attention
+    )
+
+    query = torch.randn(length, 1, num_heads, qk_dim, device=device, dtype=dtype) * 0.1
+    paged_key = (
+        torch.randn(
+            num_pages, page_size, num_heads, qk_dim, device=device, dtype=dtype
+        )
+        * 0.1
+    )
+    paged_value = (
+        torch.randn(
+            num_pages, page_size, num_heads, value_dim, device=device, dtype=dtype
+        )
+        * 0.1
+    )
+    contiguous_key = paged_key.flatten(0, 1)[:length]
+    contiguous_value = paged_value.flatten(0, 1)[:length]
+    cu_seqlens = torch.tensor([0, length], dtype=torch.int32, device=device)
+    sequence_lengths = torch.tensor([length], dtype=torch.int32, device=device)
+    block_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+
+    with mock.patch("megatron.core.transformer.attention.HAVE_FA3", False):
+        fa2_output = Attention.flash_decode_and_prefill(
+            attention,
+            query,
+            contiguous_key,
+            contiguous_value,
+            length,
+            length,
+            cu_seqlens,
+            cu_seqlens,
+            sequence_lengths,
+            None,
+            False,
+        )
+
+    with mock.patch("megatron.core.transformer.attention.HAVE_FA3", True):
+        fa3_output = Attention.flash_decode_and_prefill(
+            attention,
+            query,
+            paged_key,
+            paged_value,
+            length,
+            length,
+            cu_seqlens,
+            cu_seqlens,
+            sequence_lengths,
+            block_table,
+            False,
+        )
+
+    assert fa2_output.shape == fa3_output.shape == (length, 1, num_heads, value_dim)
+    torch.testing.assert_close(
+        fa2_output.float(),
+        fa3_output.float(),
+        atol=2e-3,
+        rtol=2e-2,
+    )
 
 
 @pytest.mark.parametrize("output_gate", [False, True])
