@@ -143,6 +143,18 @@ class KimiDeltaAttention(GatedDeltaNet):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
+        # Keep the fused projection for the forward GEMM, but expose its logical
+        # global matrices so Muon/MuonMD can derive the TP-local row ranges and
+        # orthogonalize them independently.
+        self.in_proj.weight.is_kda_in_proj = True
+        self.in_proj.weight.kda_split_shapes = (
+            self.qk_dim,          # Q
+            self.qk_dim,          # K
+            self.v_dim,           # V
+            self.v_dim,           # output gate
+            self.num_value_heads, # beta
+            self.alpha_dim,       # alpha
+        )
 
         # A_log + dt_bias are now per-channel: shape [num_v_heads, key_head_dim].
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
@@ -156,6 +168,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
         setattr(self.dt_bias, "partition_dim", 0)
+        self.dt_bias.is_kda_decay_parameter = True
         self.A_log = nn.Parameter(
             torch.empty(
                 self.num_v_heads_local_tp,
@@ -166,6 +179,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         setattr(self.A_log, "tensor_model_parallel", True)
         setattr(self.A_log, "partition_dim", 0)
+        self.A_log.is_kda_decay_parameter = True
 
         # Bind the FLA op.
         self.gated_delta_rule = chunk_kda
