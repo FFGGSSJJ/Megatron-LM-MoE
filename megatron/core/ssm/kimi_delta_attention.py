@@ -137,7 +137,11 @@ class KimiDeltaAttention(GatedDeltaNet):
         if not HAVE_KDA:
             raise ImportError(
                 "FLA's chunk_kda op is required for Kimi Delta Attention. "
-                "Install flash-linear-attention >= 0.4.0."
+                "Install flash-linear-attention >= 0.4.2."
+            )
+        if not config.linear_attention_use_output_gate:
+            raise ValueError(
+                "Kimi Delta Attention requires linear_attention_use_output_gate=True."
             )
 
         # pp_layer_offset/cp_comm_type are unused (see GatedDeltaNet.__init__ docstring);
