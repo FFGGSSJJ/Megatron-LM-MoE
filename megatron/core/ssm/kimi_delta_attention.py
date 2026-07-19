@@ -15,11 +15,14 @@
 # into Megatron would mean rewriting it anyway, so we wrap the FLA `chunk_kda`
 # kernel directly here, mirroring the structure of `gated_delta_net.py`.
 #
-# This keeps the kernel (and its FlashKDA/CUTLASS path inside FLA 0.5.0)
+# This keeps the kernel (including the optional FlashKDA path in FLA 0.5.0+)
 # exactly as released by Moonshot, while letting the rest of the layer reuse
 # Megatron's distributed conventions.
 
+import inspect
 import logging
+import math
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -29,8 +32,12 @@ from torch import Tensor
 
 from megatron.core.jit import jit_fuser
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import (
+    gather_from_tensor_model_parallel_region,
+    get_cuda_rng_tracker,
+)
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
@@ -45,12 +52,39 @@ except ImportError:
     chunk_kda = None
     HAVE_KDA = False
 
+try:
+    from fla.modules import FusedRMSNormGated
+
+    HAVE_FUSED_RMSNORM_GATED = True
+except ImportError:
+    FusedRMSNormGated = None
+    HAVE_FUSED_RMSNORM_GATED = False
+
+
+def _chunk_kda_supports(option: str) -> bool:
+    """Return whether the installed FLA explicitly exposes an optional KDA feature."""
+    if not HAVE_KDA:
+        return False
+    try:
+        return option in inspect.signature(chunk_kda).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
+    "use_beta_sigmoid_in_kernel"
+)
+_KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL = _chunk_kda_supports("allow_neg_eigval")
+
 logger = logging.getLogger(__name__)
 
 
-# Reuse GatedDeltaNetSubmodules for structural parity. KDA has the same
-# in/out projections; the differences live inside the layer.
-KimiDeltaAttentionSubmodules = GatedDeltaNetSubmodules
+@dataclass
+class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
+    """KDA projections in addition to the shared GDN input/output modules."""
+
+    decay_out_proj: Union[ModuleSpec, type] = IdentityOp
+    gate_out_proj: Union[ModuleSpec, type] = IdentityOp
 
 
 class KimiDeltaAttention(GatedDeltaNet):
@@ -58,29 +92,32 @@ class KimiDeltaAttention(GatedDeltaNet):
 
     Diff vs GatedDeltaNet:
       - decay g is a vector in R^{key_head_dim} per head (vs scalar per head),
-        so the alpha slot in the input projection is num_value_heads*key_head_dim
-        instead of num_value_heads.
-      - the chunkwise op is `chunk_kda` (FLA 0.5.0+).
-      - gates: KDA keeps GDN's output gate; the in-kernel `use_gate_in_kernel`
-        path is left off here so the gate stays in the explicit
-        `_apply_gated_norm` branch (matches the rest of the codebase).
+        produced by the reference low-rank projection hidden -> value_head_dim ->
+        num_value_heads*key_head_dim.
+      - the output gate uses the matching low-rank projection and sigmoid gated
+        RMSNorm from the reference KDA architecture.
+      - the chunkwise op is `chunk_kda` (FLA 0.4.0+).
+      - A_log is one fp32 scalar per value head, while dt_bias is fp32 and
+        channel-wise within each value head.
 
     Reference: Kimi Team, "Kimi Linear: An Expressive, Efficient Attention
     Architecture", arXiv:2510.26692; FLA op `fla.ops.kda.chunk_kda`.
 
-    The class subclasses `GatedDeltaNet` and replaces three things:
-      1. `__init__` resizes `self.in_proj`, `self.A_log`, `self.dt_bias` to the
-         vector-alpha layout, then rebuilds the fla op binding.
-      2. `_compute_g_and_beta` returns a vector g of shape [b, s, h, d_k].
+    The class subclasses `GatedDeltaNet` and replaces four things:
+      1. `__init__` builds the reference factorized decay/output-gate projections
+         and resizes `self.A_log` / `self.dt_bias`.
+      2. `forward` delegates the vector decay activation to FLA's fused KDA gate
+         and uses the fused beta sigmoid when the installed kernel exposes it.
       3. `forward` overrides only the splitting + reshape of `qkvzba` (alpha
          is wider) and the FLA-op call (chunk_kda instead of
          chunk_gated_delta_rule). All other plumbing (conv1d, CP/TP all-to-all,
          output projection, gated norm) is inherited unchanged.
+      4. The normal per-channel output-gate path uses FLA's fused sigmoid-gated
+         RMSNorm; the optional scalar/disabled gate modes retain an unfused path.
 
-    Currently TP=1 / CP=1 only — sharded_state_dict from the parent class
-    will report wrong shapes for the alpha slot under TP>1. Distributed
-    checkpointing for KDA is a TODO; for the 1-node ablation runs in this
-    repo it is unused.
+    TP/CP forward execution is supported. KDA distributed-checkpoint splitting
+    remains a separate TODO because the inherited GDN checkpoint factory assumes
+    the GDN projection layout.
     """
 
     def __init__(
@@ -100,7 +137,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         if not HAVE_KDA:
             raise ImportError(
                 "FLA's chunk_kda op is required for Kimi Delta Attention. "
-                "Install flash-linear-attention >= 0.5.0."
+                "Install flash-linear-attention >= 0.4.0."
             )
 
         # pp_layer_offset/cp_comm_type are unused (see GatedDeltaNet.__init__ docstring);
@@ -120,12 +157,22 @@ class KimiDeltaAttention(GatedDeltaNet):
             pg_collection=pg_collection,
         )
 
-        # KDA in_proj layout: qkv (qk*2 + v), gate (v), beta (num_v_heads),
-        # alpha (num_v_heads * key_head_dim). Differs from GDN's alpha slot
-        # of num_value_heads.
+        # The reference KDA uses low-rank projections for both the decay input
+        # and output gate:
+        #   f_b(f_a(x)): hidden -> value_head_dim -> num_v_heads * key_head_dim
+        #   g_b(g_a(x)): hidden -> value_head_dim -> value_dim
+        # Fuse all projections that consume hidden_states directly into one
+        # column-parallel GEMM. The second-stage projections remain separate.
+        self.gate_low_rank_dim = self.value_head_dim
+        assert self.gate_low_rank_dim % self.tp_size == 0, (
+            "KDA gate low-rank dimension must be divisible by tensor parallel size"
+        )
         self.alpha_dim = self.num_value_heads * self.key_head_dim
         self.in_proj_dim = (
-            self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads + self.alpha_dim
+            self.qk_dim * 2
+            + self.v_dim
+            + 2 * self.gate_low_rank_dim
+            + self.num_value_heads
         )
 
         # Rebuild in_proj with the new output dim. Uses the same submodule spec
@@ -143,26 +190,53 @@ class KimiDeltaAttention(GatedDeltaNet):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
-        # Keep the fused projection for the forward GEMM, but expose its logical
-        # global matrices so Muon/MuonMD can derive the TP-local row ranges and
-        # orthogonalize them independently.
+        # Keep the first-stage projection fused for the forward GEMM, but expose
+        # the six reference matrices so Muon/MuonMD orthogonalize them separately.
         self.in_proj.weight.is_kda_in_proj = True
         self.in_proj.weight.kda_split_shapes = (
-            self.qk_dim,          # Q
-            self.qk_dim,          # K
-            self.v_dim,           # V
-            self.v_dim,           # output gate
-            self.num_value_heads, # beta
-            self.alpha_dim,       # alpha
+            self.qk_dim,               # Q
+            self.qk_dim,               # K
+            self.v_dim,                # V
+            self.gate_low_rank_dim,     # f_a (decay bottleneck)
+            self.gate_low_rank_dim,     # g_a (output-gate bottleneck)
+            self.num_value_heads,       # beta
         )
 
-        # A_log + dt_bias are now per-channel: shape [num_v_heads, key_head_dim].
+        self.decay_out_proj = build_module(
+            submodules.decay_out_proj,
+            self.gate_low_rank_dim,
+            self.alpha_dim,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name="kda_decay_out",
+            tp_group=self.pg_collection.tp,
+        )
+        self.gate_out_proj = build_module(
+            submodules.gate_out_proj,
+            self.gate_low_rank_dim,
+            self.v_dim,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name="kda_gate_out",
+            tp_group=self.pg_collection.tp,
+        )
+
+        # Reference shapes: A_log is scalar per value head; dt_bias is
+        # channel-wise. Store dt_bias flattened, as FLA does, so both parameters
+        # are one-dimensional fp32 Adam parameters without weight decay.
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.num_v_heads_local_tp,
-                self.key_head_dim,
-                dtype=config.params_dtype,
+                self.num_v_heads_local_tp * self.key_head_dim,
+                dtype=torch.float32,
                 device=torch.cuda.current_device(),
             )
         )
@@ -172,8 +246,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         self.A_log = nn.Parameter(
             torch.empty(
                 self.num_v_heads_local_tp,
-                self.key_head_dim,
-                dtype=config.params_dtype,
+                dtype=torch.float32,
                 device=torch.cuda.current_device(),
             )
         )
@@ -183,42 +256,67 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Bind the FLA op.
         self.gated_delta_rule = chunk_kda
+        self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
+            not self.config.linear_attention_allow_neg_eigval
+            or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
+        )
 
-        # Re-init A_log + dt_bias for the new shape.
+        # Re-init A_log + dt_bias using the reference KDA time-scale distribution.
         self._reset_kda_decay_params(A_init_range)
+
+        # Match the reference FLA KDA output path. The norm is per value head,
+        # hence its feature dimension is value_head_dim rather than the full
+        # (TP-global) v_dim. FLA's fused kernel also applies sigmoid(gate).
+        self._use_fused_output_norm_gate = (
+            HAVE_FUSED_RMSNORM_GATED
+            and self.config.normalization == "RMSNorm"
+            and not self.config.layernorm_zero_centered_gamma
+            and self.config.linear_attention_use_output_gate
+            and self.config.linear_attention_output_gate_form == "per_channel"
+        )
+        if self._use_fused_output_norm_gate:
+            self.out_norm = FusedRMSNormGated(
+                self.value_head_dim,
+                activation="sigmoid",
+                eps=self.config.layernorm_epsilon,
+                device=torch.cuda.current_device(),
+                dtype=self.config.params_dtype,
+            )
+            # This scale is replicated across TP ranks, just like Megatron's
+            # regular output RMSNorm scale. Preserve its sequence-parallel
+            # gradient-reduction marker after replacing the backend norm.
+            setattr(
+                self.out_norm.weight,
+                "sequence_parallel",
+                self.config.sequence_parallel,
+            )
 
     def _reset_kda_decay_params(self, A_init_range: Tuple[float, float]) -> None:
         if not self.config.perform_initialization:
             return
         with get_cuda_rng_tracker().fork():
-            torch.ones(
-                self.num_v_heads_local_tp,
-                self.key_head_dim,
-                out=self.dt_bias.data,
-                dtype=self.config.params_dtype,
-                device=torch.cuda.current_device(),
-            )
+            # use log-uniform distribution for dt_bias to start with a healthy retention span, as in the reference Kimi-Linear code.
+            dt = torch.exp(
+                torch.rand_like(self.dt_bias.data)
+                * (math.log(0.1) - math.log(0.001))
+                + math.log(0.001)
+            ).clamp(min=1e-4)
+            inv_dt = dt + torch.log(-torch.expm1(-dt))
+            self.dt_bias.data.copy_(inv_dt)
             A = torch.empty(
                 self.num_v_heads_local_tp,
-                self.key_head_dim,
-                dtype=self.config.params_dtype,
+                dtype=torch.float32,
                 device=torch.cuda.current_device(),
             ).uniform_(*A_init_range)
             self.A_log.data.copy_(torch.log(A))
 
     @jit_fuser
-    def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
-        """Vector decay variant: g has shape [b, s, h, d_k] instead of [b, s, h].
-
-        alpha here is the post-projection tensor reshaped to [b, s, h, d_k].
-        A_log/dt_bias have shape [h, d_k] (broadcast over batch and seq).
-        """
-        # alpha: fp32 to match the precision used by FLA decay path.
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)
-        beta = beta.sigmoid()
+    def _activate_beta(self, beta):
+        """Fallback beta activation for FLA versions without fused sigmoid support."""
+        beta = beta.float().sigmoid()
         if self.config.linear_attention_allow_neg_eigval:
             beta = beta * 2.0
-        return g, beta
+        return beta
 
     def forward(
         self,
@@ -241,7 +339,6 @@ class KimiDeltaAttention(GatedDeltaNet):
             nvtx_range_push, nvtx_range_pop, causal_conv1d,
         )
         from megatron.core.utils import deprecate_inference_params
-        from fla.modules.l2norm import l2norm
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -256,52 +353,79 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
+        projected, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
         num_v_heads_tp = self.num_value_heads // self.tp_size
+        low_rank_local_tp = self.gate_low_rank_dim // self.tp_size
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
 
-        # CP All to All: CP to HP. Alpha slot is wider than GDN's:
-        # alpha_dim = num_value_heads * key_head_dim (vs num_value_heads for GDN).
-        qkvzba = tensor_a2a_cp2hp(
-            qkvzba,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            split_sections=[
-                self.qk_dim_local_tp,           # Q
-                self.qk_dim_local_tp,           # K
-                self.v_dim_local_tp,            # V
-                self.v_dim_local_tp,            # gate
-                num_v_heads_tp,                 # beta (per-head scalar, sigmoid'd)
-                self.alpha_dim // self.tp_size, # alpha (per-channel: num_v_heads*key_head_dim)
-            ],
-        )
-
-        # Transpose: s b x --> b s x
-        qkvzba = qkvzba.transpose(0, 1)
-
-        # Split into qkv (Q+K+V), gate, beta, alpha. The alpha slot is wider here.
-        alpha_local = self.alpha_dim // self.tp_size // self.cp_size
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
+        # Q/K/V occupy one contiguous prefix and stay grouped for convolution.
+        # Only split out the tensors that follow different computation paths.
+        qkv, decay_low_rank, gate_low_rank, beta = torch.split(
+            projected,
             [
-                (2 * self.qk_dim_local_tp + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                num_v_heads_tp // self.cp_size,
-                alpha_local,
+                self.conv_dim_local_tp,
+                low_rank_local_tp,
+                low_rank_local_tp,
+                num_v_heads_tp,
             ],
             dim=-1,
         )
+        # Gather the low-rank activations from TP shards before applying the second-stage projections (it needs the complete input, not only 1/TP part of it).
+        decay_low_rank = gather_from_tensor_model_parallel_region(
+            decay_low_rank, group=self.pg_collection.tp
+        )
+        gate_low_rank = gather_from_tensor_model_parallel_region(
+            gate_low_rank, group=self.pg_collection.tp
+        )
+        alpha, _ = self.decay_out_proj(decay_low_rank)
+        gate, _ = self.gate_out_proj(gate_low_rank)
+
+        # Keep the logical outputs separate through CP. The CP helper already
+        # communicates split sections independently, so packing qkv/gate/beta/
+        # alpha into a temporary qkvzba tensor only adds a full-size copy.
+        qkv = tensor_a2a_cp2hp(
+            qkv,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+            split_sections=qkv_channels_split_sections,
+        )
+        gate = tensor_a2a_cp2hp(
+            gate,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+        )
+        beta = tensor_a2a_cp2hp(
+            beta,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+        )
+        alpha = tensor_a2a_cp2hp(
+            alpha,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+        )
+
+        # Transpose separately: s b x --> b s x.
+        qkv = qkv.transpose(0, 1)
+        gate = gate.transpose(0, 1)
+        beta = beta.transpose(0, 1)
+        alpha = alpha.transpose(0, 1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
 
         # Convolution on qkv (Q, K, V all per-token for KDA — no DeltaProduct).
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp,
-        ]
         conv1d_weight = get_parameter_local_cp(
             self.conv1d.weight, dim=0, cp_group=self.pg_collection.cp,
             split_sections=qkv_channels_split_sections,
@@ -337,11 +461,20 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         nvtx_range_pop(suffix="prepare_qkv_for_kda")
 
-        # Compute vector g and sigmoid'd beta (overridden helper).
+        # FLA computes the vector decay from raw alpha, A_log, and dt_bias inside
+        # chunk_kda. Newer FLA versions can also fuse beta.float().sigmoid().
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp)
-        g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
+        A_log_local_cp = get_parameter_local_cp(
+            self.A_log, dim=0, cp_group=self.pg_collection.cp
+        )
+        dt_bias_local_tp = self.dt_bias.view(
+            self.num_v_heads_local_tp, self.key_head_dim
+        )
+        dt_bias_local_cp = get_parameter_local_cp(
+            dt_bias_local_tp, dim=0, cp_group=self.pg_collection.cp
+        )
+        if not self._use_fused_beta_sigmoid:
+            beta = self._activate_beta(beta)
         nvtx_range_pop(suffix="g_and_beta")
 
         # Initial state: learnable param > carried full-batch state > None.
@@ -370,15 +503,28 @@ class KimiDeltaAttention(GatedDeltaNet):
         initial_state_f32 = initial_state.float() if initial_state is not None else None
 
         nvtx_range_push(suffix="chunk_kda")
+        kda_kwargs = {
+            "g": alpha,
+            "beta": beta,
+            "A_log": A_log_local_cp,
+            "dt_bias": dt_bias_local_cp.reshape(-1),
+            "initial_state": initial_state_f32,
+            "output_final_state": need_final_state,
+            "use_qk_l2norm_in_kernel": False,
+            "use_gate_in_kernel": True,
+
+        }
+        if self._use_fused_beta_sigmoid:
+            kda_kwargs["use_beta_sigmoid_in_kernel"] = True
+            if _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
+                kda_kwargs["allow_neg_eigval"] = (
+                    self.config.linear_attention_allow_neg_eigval
+                )
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query, key, value,
-            g=g, beta=beta,
-            initial_state=initial_state_f32,
-            output_final_state=need_final_state,
-            use_qk_l2norm_in_kernel=False,
-            use_gate_in_kernel=False,
+            query, key, value, **kda_kwargs
         )
         nvtx_range_pop(suffix="chunk_kda")
+
 
         # Carry-over (matches GDN; only active if linear_attention_carry_state=True).
         if self._carry_enabled and last_recurrent_state is not None:
@@ -425,6 +571,31 @@ class KimiDeltaAttention(GatedDeltaNet):
         nvtx_range_pop(suffix="out_proj")
         return out, out_bias
 
+    def backward_dw(self):
+        """Execute deferred weight-gradient computation for all KDA linear projections."""
+        self.in_proj.backward_dw()
+        self.decay_out_proj.backward_dw()
+        self.gate_out_proj.backward_dw()
+        self.out_proj.backward_dw()
+
+    def _apply_gated_norm(self, x, gate):
+        """Apply per-head RMSNorm and the reference KDA sigmoid output gate."""
+        if self._use_fused_output_norm_gate:
+            return self.out_norm(x, gate)
+        return self._apply_gated_norm_unfused(x, gate)
+
+    @jit_fuser
+    def _apply_gated_norm_unfused(self, x, gate):
+        """Fallback for the optional scalar or disabled output-gate modes."""
+        x_dtype = x.dtype
+        y = self.out_norm(x.reshape(-1, x.shape[-1]))
+        if self.config.linear_attention_use_output_gate:
+            if self.config.linear_attention_output_gate_form == "scalar":
+                gate = gate.mean(dim=-1, keepdim=True)
+            gate = gate.reshape(-1, gate.shape[-1])
+            y = y * torch.sigmoid(gate.float())
+        return y.to(x_dtype)
+
     def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
         """Reshape alpha from a flat [b, s, h*d_k] slice to [b, s, h, d_k].
 
@@ -439,13 +610,14 @@ class KimiDeltaAttention(GatedDeltaNet):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Q,K normalization (l2norm by default; rmsnorm if configured)
+        # Normalize fused Q+K before splitting
         if self.use_qk_l2norm:
             query_key = query_key.contiguous()
             if self.qk_rmsnorm is not None:
                 query_key = self.qk_rmsnorm(query_key)
             else:
                 from fla.modules.l2norm import l2norm
+
                 query_key = l2norm(query_key)
 
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
@@ -474,14 +646,22 @@ class KimiDeltaAttention(GatedDeltaNet):
 def get_kimi_delta_attention_module_spec(
     config: TransformerConfig, backend=None,
 ) -> ModuleSpec:
-    """Module spec for KDA. Mirrors the GDN spec but instantiates KimiDeltaAttention.
-
-    Reuses the projections + output norm structure of GDN since the KDA
-    layer's external interface is identical to GDN's.
-    """
+    """Build the KDA spec with separate second-stage gate projections."""
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-        get_gated_delta_net_module_spec,
+        _get_backend_spec_provider,
     )
-    spec = get_gated_delta_net_module_spec(config=config, backend=backend)
-    spec.module = KimiDeltaAttention
-    return spec
+
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+    rms_norm = config.normalization == "RMSNorm"
+    return ModuleSpec(
+        module=KimiDeltaAttention,
+        submodules=KimiDeltaAttentionSubmodules(
+            in_proj=backend.column_parallel_layer_norm_linear(),
+            decay_out_proj=backend.column_parallel_linear(),
+            gate_out_proj=backend.column_parallel_linear(),
+            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+            out_proj=backend.row_parallel_linear(),
+        ),
+        metainfo={"fuse_input_layernorm": True},
+    )

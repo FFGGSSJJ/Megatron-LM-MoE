@@ -692,8 +692,8 @@ def test_muon_builder_routes_kda_decay_parameters_to_scalar_optimizer(monkeypatc
                 multi_latent_attention=False,
             )
             self.in_proj = torch.nn.Parameter(torch.ones(8, 4))
-            self.A_log = torch.nn.Parameter(torch.ones(2, 4))
-            self.dt_bias = torch.nn.Parameter(torch.ones(2, 4))
+            self.A_log = torch.nn.Parameter(torch.ones(2))
+            self.dt_bias = torch.nn.Parameter(torch.ones(8))
             self.A_log.is_kda_decay_parameter = True
             self.dt_bias.is_kda_decay_parameter = True
 
