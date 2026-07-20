@@ -1,13 +1,12 @@
-"""Triton kernels for SSSGLU activation with optional per-row probability scaling.
+"""Triton kernels for SSGLU activation with optional per-row probability scaling.
 
-SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign:
-    gate(a)  = softsign(a - 1) + 0.5 = (a - 1) / (1 + |a - 1|) + 0.5   (== sssglu_act in activations.py)
-    SSSGLU   = gate(a) * b
-Structured exactly like ``rlglu_jit.py`` / ``ssglu_jit.py`` / ``swiglu_jit.py`` (its GLU siblings)
--- the only difference is the gate; all gate math runs in fp32. Like RLGLU (and unlike SwiGLU/SSGLU,
-``a * squash(a) * b``) the forward has no extra factor of ``a`` -- the gate is applied directly. Its
-derivative is ``gate'(a) = 1 / (1 + |a - 1|)**2``. See also the (torch) fusion in
-``megatron.core.fusions.fused_bias_sssglu``.
+SSGLU is SwiGLU with the sigmoid inside SiLU replaced by softsign rescaled to (0, 1):
+    gate(a)   = 0.5 + 0.5 * a / (1 + |a|)
+    sslu(a)  = a * gate(a)
+    SSGLU    = sslu(a) * b
+Structured exactly like ``swiglu_jit.py`` (its SwiGLU sibling) — the only difference is the
+gate; all gate math runs in fp32. See also the (torch) fusion in
+``megatron.core.fusions.fused_bias_ssglu``.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _sssglu_fwd_kernel(
+def _ssglu_fwd_kernel(
     x_ptr, p_ptr, y_ptr,
     M, D,
     stride_xm, stride_xn,
@@ -40,10 +39,10 @@ def _sssglu_fwd_kernel(
     a = tl.load(x_ptr + a_off, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(x_ptr + b_off, mask=mask, other=0.0).to(tl.float32)
 
-    # gate(a) = softsign(a - 1) + 0.5 = 0.5 + (a - 1) / (1 + |a - 1|); y = gate(a) * b
-    u = a - 1.0
-    gate_a = 0.5 + u / (1.0 + tl.abs(u))
-    y = gate_a * b
+    # sslu(a) = a * (0.5 + 0.5 * a / (1 + |a|))
+    gate_a = 0.5 + 0.5 * a / (1.0 + tl.abs(a))
+    sslu_a = gate_a * a
+    y = sslu_a * b
 
     if HAS_PROBS:
         p = tl.load(p_ptr + rm, mask=rm < M, other=0.0).to(tl.float32)
@@ -54,7 +53,7 @@ def _sssglu_fwd_kernel(
 
 
 @triton.jit
-def _sssglu_bwd_kernel(
+def _ssglu_bwd_kernel(
     x_ptr, p_ptr, gy_ptr, gx_ptr, gp_ptr,
     M, D,
     stride_xm, stride_xn,
@@ -80,24 +79,24 @@ def _sssglu_bwd_kernel(
     b = tl.load(x_ptr + b_off, mask=mask, other=0.0).to(tl.float32)
     gy = tl.load(gy_ptr + gy_off, mask=mask, other=0.0).to(tl.float32)
 
-    # gate(a)  = 0.5 + (a - 1) / (1 + |a - 1|)
-    # gate'(a) = 1 / (1 + |a - 1|)**2
-    u = a - 1.0
-    denom = 1.0 + tl.abs(u)
-    gate_a = 0.5 + u / denom
-    d_gate = 1.0 / (denom * denom)
+    # gate(a) = 0.5 + 0.5 * a / (1 + |a|); gate'(a) = 0.5 / (1 + |a|)**2
+    # d/da sslu(a) = gate(a) + a * gate'(a)
+    denom = 1.0 + tl.abs(a)
+    gate_a = 0.5 + 0.5 * a / denom
+    sslu_a = gate_a * a
+    d_sslu = gate_a + 0.5 * a / (denom * denom)
 
     if HAS_PROBS:
         p = tl.load(p_ptr + rm, mask=rm < M, other=0.0).to(tl.float32)
         gy_scaled = gy * p[:, None]
-        # partial grad_probs over this D-block: sum_d (gate(a) * b * gy)
-        partial = tl.sum(tl.where(mask, gate_a * b * gy, 0.0), axis=1)
+        # partial grad_probs over this D-block: sum_d (sslu(a) * b * gy)
+        partial = tl.sum(tl.where(mask, sslu_a * b * gy, 0.0), axis=1)
         tl.atomic_add(gp_ptr + rm, partial, mask=rm < M)
     else:
         gy_scaled = gy
 
-    grad_a = gy_scaled * d_gate * b
-    grad_b = gy_scaled * gate_a
+    grad_a = gy_scaled * d_sslu * b
+    grad_b = gy_scaled * sslu_a
 
     ga_off = rm[:, None] * stride_gxm + rd[None, :] * stride_gxn
     gb_off = ga_off + D * stride_gxn
@@ -111,13 +110,13 @@ def _block_d(D: int) -> int:
     return triton.next_power_of_2(max(D, 16))
 
 
-def sssglu_forward(
+def ssglu_forward(
     input_tensor: torch.Tensor,
     probs: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton SSSGLU forward.
+    """Triton SSGLU forward.
 
-    y = gate(a) * b, gate(a) = softsign(a-1) + 0.5, optionally scaled by per-row `probs`.
+    y = sslu(a) * b, optionally scaled by per-row `probs`.
     """
     assert input_tensor.shape[-1] % 2 == 0, "last dim must be 2*D"
     orig_shape = input_tensor.shape
@@ -136,7 +135,7 @@ def sssglu_forward(
 
     BLOCK_M, BLOCK_D = 16, _block_d(D)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_D))
-    _sssglu_fwd_kernel[grid](
+    _ssglu_fwd_kernel[grid](
         x,
         p_flat if p_flat is not None else x,  # placeholder ptr when unused
         y,
@@ -150,12 +149,12 @@ def sssglu_forward(
     return y.view(orig_shape[:-1] + (D,))
 
 
-def sssglu_backward(
+def ssglu_backward(
     grad_output: torch.Tensor,
     input_tensor: torch.Tensor,
     probs: torch.Tensor | None = None,
 ):
-    """Triton SSSGLU backward.
+    """Triton SSGLU backward.
 
     Returns grad_input matching input_tensor.shape. If probs is given, also
     returns grad_probs with shape probs.shape[:-1] (last dim already reduced).
@@ -176,7 +175,7 @@ def sssglu_backward(
 
     BLOCK_M, BLOCK_D = 16, _block_d(D)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_D))
-    _sssglu_bwd_kernel[grid](
+    _ssglu_bwd_kernel[grid](
         x,
         p_flat if p_flat is not None else x,
         gy,

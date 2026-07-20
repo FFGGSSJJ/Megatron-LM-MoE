@@ -1,4 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -827,8 +829,8 @@ class XR2GLU(XR2):
 
 
 @jit_fuser
-def compiled_xsssglu(x, y, alpha):
-    """XSSSGLU gate: ``(|alpha| * softsign(x) + 0.5) * x * y``.
+def compiled_xssglu(x, y, alpha):
+    """XSSGLU gate: ``(|alpha| * softsign(x) + 0.5) * x * y``.
 
     Softsign already smoothly interpolates between the negative- and positive-``x`` regimes
     (unlike the rest of the XPR/XR2 family, which needs an explicit ``torch.where`` piecewise
@@ -837,12 +839,12 @@ def compiled_xsssglu(x, y, alpha):
     return (alpha * F.softsign(x) + 0.5) * x * y
 
 
-class XSSSGLU(MegatronModule):
+class XSSGLU(MegatronModule):
     """Learnable GLU gate built from a softsign-scaled linear term -- no polynomial term and no
     piecewise positive/negative branching (softsign already handles both signs smoothly)::
 
         gate(x) = |alpha| * softsign(x) + 0.5
-        XSSSGLU(x, y) = gate(x) * x * y
+        XSSGLU(x, y) = gate(x) * x * y
 
     At ``alpha == 0`` this degenerates to a fixed ``0.5 * x * y`` (a plain linear GLU with a
     constant 0.5 gate); growing ``|alpha|`` pushes ``gate(x)`` toward a soft step between
@@ -887,7 +889,7 @@ class XSSSGLU(MegatronModule):
             scores: optional per-token multiplier ``(..., 1)`` (MoE router probs / per-token scale).
         """
         alpha = self._coeffs(x_glu, tokens_per_expert)
-        out = compiled_xsssglu(x_glu, x_linear, alpha)
+        out = compiled_xssglu(x_glu, x_linear, alpha)
         if scores is not None:
             original_dtype = out.dtype
             out = (out * scores).to(original_dtype)
@@ -914,6 +916,58 @@ def rlglu_act(x: torch.Tensor) -> torch.Tensor:
     reduction; see fused_bias_rlglu.py.
     """
     return torch.relu(x) - 0.5 * torch.log(1 + x.abs())
+
+
+def lglu_act(x: torch.Tensor) -> torch.Tensor:
+    """LGLU gate: ``f(x) = sign(x - 1) * ln(|x - 1| + 1) + ln 2``.
+
+    Used as the gate of a gated linear unit (``lglu_act(x_glu) * x_linear``) via the generic
+    (non-fused) GLU path -- dispatched by ``activation_func == lglu_act`` with
+    ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. No fused kernel (the user
+    only requested kernel fusion for SSSGLU), so it always runs eager.
+
+    A symmetric-log ("signed logarithm") gate centered at ``x = 1``: it grows like
+    ``+/- ln|x - 1|`` in the tails (a gentle, unbounded response of either sign) and the additive
+    ``ln 2`` fixes ``f(1) = ln 2`` so the gate is never exactly zero at its center. Its derivative
+    is ``1 / (1 + |x - 1|)`` (a smooth bump peaking at ``x = 1``), so ``sign(x - 1)`` never causes a
+    kink in the value -- ``sign(u) * ln(|u| + 1) -> 0`` as ``u -> 0`` from both sides.
+    """
+    u = x - 1
+    return torch.sign(u) * torch.log(1 + u.abs()) + math.log(2.0)
+
+
+def situ_act(x: torch.Tensor) -> torch.Tensor:
+    """SiTU gate: ``f(x) = sigmoid(x) * tanh(x)``.
+
+    Used as the gate of a gated linear unit (``situ_act(x_glu) * x_linear``) via the generic
+    (non-fused) GLU path -- dispatched by ``activation_func == situ_act`` with
+    ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. No fused kernel (the user
+    only requested kernel fusion for SSSGLU), so it always runs eager.
+
+    A "sigmoid-times-tanh" gate: ``-> 1`` as ``x -> +inf``, ``-> 0`` as ``x -> -inf`` (the sigmoid
+    and tanh factors both vanish/saturate together), and ``f(0) = 0``. Unlike a plain sigmoid gate
+    it dips slightly negative for ``x < 0`` (tanh is negative there while sigmoid stays positive),
+    giving a small non-monotone trough near the origin.
+    """
+    return torch.sigmoid(x) * torch.tanh(x)
+
+
+def sssglu_act(x: torch.Tensor) -> torch.Tensor:
+    """SSSGLU gate: ``f(x) = softsign(x - 1) + 0.5 = (x - 1) / (1 + |x - 1|) + 0.5``.
+
+    Used as the gate of a gated linear unit (``sssglu_act(x_glu) * x_linear``). Unlike SwiGLU/SSGLU
+    (whose gate is of the form ``x * squash(x)``) this is the gate applied directly, so it is
+    structurally an RLGLU-style pure gate. It IS fused: dispatched by ``activation_func ==
+    sssglu_act`` with ``gated_linear_unit=True``, it routes to the fused kernels in
+    ``megatron.core.fusions.fused_bias_sssglu`` (torch/``@jit_fuser``) and
+    ``megatron.core.transformer.moe.sssglu_jit`` (Triton, fp8/offloading paths); the generic GLU
+    path uses this function directly as the eager fallback.
+
+    A shifted, scaled softsign: a smooth (0, 1)-valued step centered at ``x = 1`` with
+    ``f(1) = 0.5``, ``f -> 1`` as ``x -> +inf`` and ``f -> 0`` as ``x -> -inf``. Its derivative is
+    ``1 / (1 + |x - 1|)**2``. The fused kernels inline this math (kept in sync with this function).
+    """
+    return F.softsign(x - 1) + 0.5
 
 
 @jit_fuser

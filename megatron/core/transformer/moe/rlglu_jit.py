@@ -3,10 +3,10 @@
 RLGLU is a gated linear unit whose gate is the "relu minus log" function:
     gate(a)  = relu(a) - 0.5 * ln(1 + |a|)                       (== rlglu_act in activations.py)
     RLGLU    = gate(a) * b
-Structured exactly like ``sssglu_jit.py`` / ``swiglu_jit.py`` (its GLU siblings) -- the only
+Structured exactly like ``ssglu_jit.py`` / ``swiglu_jit.py`` (its GLU siblings) -- the only
 difference is the gate; all gate math runs in fp32. The defining property that makes the backward
-cheap: ``gate'(a) = 0.5 + 0.5 * a / (1 + |a|)`` is exactly the SSSGLU gate (softsign rescaled to
-(0, 1)), so the backward reuses that expression. Unlike SwiGLU/SSSGLU (``a * squash(a) * b``) the
+cheap: ``gate'(a) = 0.5 + 0.5 * a / (1 + |a|)`` is exactly the SSGLU gate (softsign rescaled to
+(0, 1)), so the backward reuses that expression. Unlike SwiGLU/SSGLU (``a * squash(a) * b``) the
 forward has no extra factor of ``a`` -- the gate is applied directly. See also the (torch) fusion
 in ``megatron.core.fusions.fused_bias_rlglu``.
 """
@@ -81,7 +81,7 @@ def _rlglu_bwd_kernel(
     gy = tl.load(gy_ptr + gy_off, mask=mask, other=0.0).to(tl.float32)
 
     # gate(a)  = relu(a) - 0.5 * ln(1 + |a|)
-    # gate'(a) = 0.5 + 0.5 * a / (1 + |a|)   (the SSSGLU gate; softsign rescaled to (0, 1))
+    # gate'(a) = 0.5 + 0.5 * a / (1 + |a|)   (the SSGLU gate; softsign rescaled to (0, 1))
     denom = 1.0 + tl.abs(a)
     gate_a = tl.maximum(a, 0.0) - 0.5 * tl.log(denom)
     d_gate = 0.5 + 0.5 * a / denom
