@@ -54,6 +54,7 @@ from ..models.common.embeddings.yarn_rotary_pos_embedding import (
 )
 from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
+from .utils import is_layer_window_attention
 
 try:
     from einops import rearrange
@@ -617,11 +618,25 @@ class Attention(MegatronModule, ABC):
             )
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
-            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+            use_uncompressed_mla = getattr(self.config, "cache_mla_latents", None) and (
+                max_seqlen_q > 1 or not HAVE_FMLA
+            )
+            if use_uncompressed_mla:
+                # Use unabsorbed MLA attention for prefill/mixed mode, and as a
+                # correctness fallback for decode when FlashMLA is unavailable.
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )
+                if not HAVE_FA3 or max_seqlen_q == 1:
+                    # FlashAttention-2's paged prefill requires blocks divisible by 256,
+                    # while FlashMLA decode requires 64-token latent blocks. Materialize
+                    # only the active latent tokens for FA2 prefill and retain the paged
+                    # latent cache for decode.
+                    _, sequence_lengths, _ = inference_context.cu_kv_lengths()
+                    kv_cache = self._materialize_paged_kv_cache(
+                        kv_cache, block_table, sequence_lengths
+                    )
+                    block_table = None
                 # Uncompress the KV cache for prefill/mixed mode
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
@@ -705,6 +720,7 @@ class Attention(MegatronModule, ABC):
         seqlens_k,
         block_table,
         softmax_scale,
+        window_size,
     ):
         """
         Wrapper for calling the FA3 _flash_attn_forward function.
@@ -739,9 +755,9 @@ class Attention(MegatronModule, ABC):
             "causal": True,
             "attention_chunk": 0,
             "softcap": 0.0,
-            "window_size": (-1, -1),
-            "window_size_left": -1,
-            "window_size_right": -1,
+            "window_size": window_size,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
             "rotary_interleaved": True,
             "scheduler_metadata": None,
             "num_splits": 0 if not self.batch_invariant_mode else 1,
@@ -761,6 +777,17 @@ class Attention(MegatronModule, ABC):
         output_total, *unused = _flash_attn_forward(**final_kwargs)
 
         return output_total
+
+    def _get_flash_attention_window_size(self) -> tuple[int, int]:
+        """Return this layer's FlashAttention window, or unlimited attention."""
+        if is_layer_window_attention(
+            self.config.window_size,
+            self.config.window_attn_skip_freq,
+            self.layer_number,
+        ):
+            assert self.config.window_size is not None
+            return self.config.window_size
+        return (-1, -1)
 
     def flash_decode_and_prefill(
         self,
@@ -793,16 +820,21 @@ class Attention(MegatronModule, ABC):
         """
 
         assert not self.training
-        assert block_table is not None
+        window_size = self._get_flash_attention_window_size()
 
-        # Flash attn kernel.
-        if max_seqlen_q > 1:
+        # Flash attn kernel. Without FlashMLA, MLA decode uses the same uncompressed
+        # varlen fallback as prefill.
+        use_varlen_attention = max_seqlen_q > 1 or (
+            isinstance(self.config, MLATransformerConfig) and not HAVE_FMLA
+        )
+        if use_varlen_attention:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA3:
+            if HAVE_FA3 and block_table is not None:
+                assert block_table is not None
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 output_total = self._flash_attention_3_forward_wrapper(
@@ -815,11 +847,16 @@ class Attention(MegatronModule, ABC):
                     seqlens_k,
                     block_table,
                     softmax_scale,
+                    window_size,
                 )
             else:
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
+                value_head_dim = v.size(-1)
+                if isinstance(self.config, MLATransformerConfig) and value_head_dim != q.size(-1):
+                    assert value_head_dim < q.size(-1)
+                    v = torch.nn.functional.pad(v, (0, q.size(-1) - value_head_dim))
                 output_total = flash_attn_varlen_func(
                     q,
                     k,
@@ -830,12 +867,16 @@ class Attention(MegatronModule, ABC):
                     max_seqlen_k,
                     softmax_scale=softmax_scale,
                     causal=True,
+                    window_size=window_size,
                     block_table=block_table,
                 )
+                output_total = output_total[..., :value_head_dim]
             output_total = output_total.unsqueeze(1)
         else:  # decode only
+            assert block_table is not None
             # If using MLA we use the FlashMLA kernel
             if isinstance(self.config, MLATransformerConfig):
+                assert HAVE_FMLA
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
@@ -869,6 +910,7 @@ class Attention(MegatronModule, ABC):
                     "v_cache": v,
                     "cache_seqlens": seqlens_k,
                     "causal": True,
+                    "window_size": window_size,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
                     "num_splits": 0 if not self.batch_invariant_mode else 1,
                 }
@@ -880,6 +922,26 @@ class Attention(MegatronModule, ABC):
                     ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
+
+    @staticmethod
+    def _materialize_paged_kv_cache(
+        kv_cache: Tensor, block_table: Tensor, sequence_lengths: Tensor
+    ) -> Tensor:
+        """Gather active paged-cache tokens into varlen sequence order."""
+        block_size = kv_cache.size(1)
+        sequences = []
+        for request_blocks, sequence_length in zip(block_table, sequence_lengths):
+            sequence_length = int(sequence_length.item())
+            if sequence_length == 0:
+                continue
+            block_count = (sequence_length + block_size - 1) // block_size
+            block_ids = request_blocks[:block_count].to(dtype=torch.long)
+            sequence = kv_cache.index_select(0, block_ids).flatten(0, 1)
+            sequences.append(sequence[:sequence_length])
+
+        if not sequences:
+            return kv_cache.new_empty((0, *kv_cache.shape[2:]))
+        return torch.cat(sequences, dim=0)
 
     def forward(
         self,

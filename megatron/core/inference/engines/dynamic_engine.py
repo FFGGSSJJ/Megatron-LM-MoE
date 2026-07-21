@@ -1965,6 +1965,33 @@ class DynamicInferenceEngine(AbstractEngine):
     # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
     step = step_legacy
 
+    def _any_synchronous_ep_rank_has_work(self, local_work: bool) -> bool:
+        """Return whether any EP rank has unfinished synchronous generation work."""
+        ep_group = self.pg_collection.ep
+        if get_pg_size(ep_group) == 1:
+            return local_work
+
+        global_work = torch.tensor(
+            local_work,
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
+        torch.distributed.all_reduce(
+            global_work,
+            op=torch.distributed.ReduceOp.MAX,
+            group=ep_group,
+        )
+        return bool(global_work.item())
+
+    def _run_ep_dummy_step(self) -> None:
+        """Participate in an EP inference step without advancing local requests."""
+        self.step_start_event.record()
+        self.controller.dummy_forward()
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        self.context.step_count += 1
+        self.context.prefix_cache_lru_clock += 1
+
     def generate(
         self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
     ) -> List[DynamicInferenceRequest]:
@@ -1975,9 +2002,18 @@ class DynamicInferenceEngine(AbstractEngine):
             _ = self.add_request(request_id, prompt, sampling_params)
 
         finished_request_records_list = []
-        while self.has_unfinished_requests():
-            result = self.step_modern()
-            finished_request_records_list.extend(result["finished_request_records"])
+        while True:
+            local_work = self.has_unfinished_requests()
+            if not self._any_synchronous_ep_rank_has_work(local_work):
+                break
+
+            if local_work:
+                result = self.step_modern()
+                finished_request_records_list.extend(result["finished_request_records"])
+            else:
+                # Other EP ranks still have real work and will enter MoE
+                # collectives. Participate without advancing local requests.
+                self._run_ep_dummy_step()
 
         # Ensure requests are returned in the same order they were passed in.
         finished_request_records_list.sort(key=lambda r: r.request_id)
@@ -2288,12 +2324,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self._run_ep_dummy_step()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

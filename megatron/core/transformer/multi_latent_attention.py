@@ -34,7 +34,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import HAVE_FMLA, Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -331,9 +331,11 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
+                    inference_context.is_decode_only(),
                 )
-                # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
+                # FlashMLA decode returns an absorbed latent output. The varlen fallback
+                # returns ordinary per-head values and needs the standard rearrangement.
+                if not inference_context.is_decode_only() or not HAVE_FMLA:
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
@@ -341,7 +343,12 @@ class MultiLatentAttention(Attention):
                 )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if (
+            self.cache_mla_latents
+            and inference_context is not None
+            and inference_context.is_decode_only()
+            and HAVE_FMLA
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -711,6 +718,7 @@ class MLASelfAttention(MultiLatentAttention):
                 self.config.cache_mla_latents
                 and inference_context
                 and inference_context.is_decode_only()
+                and HAVE_FMLA
             )
             # Compute query components. Multiply by up k if absorbing
             q_content = (
@@ -749,7 +757,10 @@ class MLASelfAttention(MultiLatentAttention):
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(kv_compressed)
+            linear_kv_up_proj = getattr(self, "linear_kv_up_proj", None)
+            if linear_kv_up_proj is None:
+                linear_kv_up_proj = self.linear_kv_up_proj_linear
+            kv, _ = linear_kv_up_proj(kv_compressed)
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
@@ -860,9 +871,9 @@ class MLASelfAttention(MultiLatentAttention):
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
         else:
-            if self.cache_mla_latents:
+            if self.cache_mla_latents and inference_context is not None:
                 assert (
-                    inference_context and not inference_context.is_static_batching()
+                    not inference_context.is_static_batching()
                 ), "Caching MLA latents only works with dynamic backend inference"
                 query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
@@ -895,7 +906,9 @@ class MLASelfAttention(MultiLatentAttention):
 
         # Add head dimension
         k_pos_emb = k_pos_emb.unsqueeze(-2)
-        k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+        k_pos_emb = k_pos_emb.expand(
+            *k_pos_emb.shape[:-2], self.num_attention_heads_per_partition, -1
+        )
 
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
         return key, value
@@ -930,6 +943,13 @@ class MLASelfAttention(MultiLatentAttention):
                     split_te_layernorm_column_parallel_linear(
                         self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
                     )
+                )
+                projection_weight = self.linear_kv_up_proj.weight
+                linear_kv_up_proj_norm = linear_kv_up_proj_norm.to(
+                    device=projection_weight.device, dtype=projection_weight.dtype
+                )
+                linear_kv_up_proj_linear = linear_kv_up_proj_linear.to(
+                    device=projection_weight.device, dtype=projection_weight.dtype
                 )
 
                 # Note: When caching latents we overide the kv_layernorm
