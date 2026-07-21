@@ -560,6 +560,13 @@ def validate_args(args, defaults={}):
         )
         assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
 
+    if args.save_iters:
+        args.save_iters = set(
+            int(x.strip()) for x in args.save_iters.split(",") if x.strip()
+        )
+        assert all(i > 0 for i in args.save_iters), "--save-iters values must be positive"
+        assert args.save is not None, "--save-iters requires --save to be set"
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -1125,11 +1132,13 @@ def validate_args(args, defaults={}):
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
-        assert args.save_interval is not None
-        assert args.save_interval > 0
-        if args.save_retain_interval is not None:
-            assert args.save_retain_interval > 0
-            assert args.save_retain_interval % args.save_interval == 0
+        assert args.save_interval is not None or args.save_iters is not None, \
+            "--save requires either --save-interval or --save-iters"
+        if args.save_interval is not None:
+            assert args.save_interval > 0
+            if args.save_retain_interval is not None:
+                assert args.save_retain_interval > 0
+                assert args.save_retain_interval % args.save_interval == 0
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -3007,6 +3016,11 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--save-iters', type=str, default=None,
+                       help='Comma-separated list of iterations at which to save a '
+                       'checkpoint, in addition to --save-interval. Unlike '
+                       '--save-interval these are explicit iterations (e.g. "1,2,4,8") '
+                       'and training continues afterwards.')
     return parser
 
 

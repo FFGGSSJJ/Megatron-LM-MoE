@@ -1223,7 +1223,11 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
+        already_saved = (
+            (args.save_interval and iteration % args.save_interval == 0)
+            or (args.save_iters and iteration in args.save_iters)
+        )
+        if not args.skip_train and args.save and iteration != 0 and not already_saved:
             save_checkpoint(
                 iteration,
                 model,
@@ -2634,7 +2638,10 @@ def checkpoint_and_decide_exit(
             return True
 
     # Regular save (persistent and non-persistent).
-    if args.save and args.save_interval and iteration % args.save_interval == 0:
+    if args.save and (
+        (args.save_interval and iteration % args.save_interval == 0)
+        or (args.save_iters and iteration in args.save_iters)
+    ):
         save_checkpoint_and_time(
             iteration,
             model,
