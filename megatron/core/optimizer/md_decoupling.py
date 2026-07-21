@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# NOTE: should we remove this copyright notice? as it is from EPFL this implementation and not from NVIDIA (even though we derive things from the Muon implementation from NVIDIA)
 
 """MDDecoupling optimizer (magnitude-direction decoupling).
 
