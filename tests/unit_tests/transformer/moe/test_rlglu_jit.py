@@ -1,7 +1,7 @@
 """Tests for the Triton RLGLU kernels (``megatron/core/transformer/moe/rlglu_jit.py``).
 
 These are the fp32-internal Triton kernels used on the FP8 offloading-experts path (the sibling
-of ``sssglu_jit.py`` / ``swiglu_jit.py``). RLGLU is a GLU whose gate is
+of ``ssglu_jit.py`` / ``swiglu_jit.py``). RLGLU is a GLU whose gate is
 ``gate(a) = relu(a) - 0.5 * ln(1 + |a|)`` and output ``gate(a) * b``. Forward and backward
 (including the per-row ``probs`` scaling and its gradient) are checked against a pure-torch
 autograd reference. CUDA-gated like the other kernel tests; run on the cluster GPU.
@@ -60,9 +60,9 @@ def test_rlglu_jit_matches_autograd_reference(dtype, use_probs, shape):
     assert torch.allclose(grad_x.float(), x_ref.grad, **tols)
 
 
-def test_rlglu_jit_gate_derivative_is_sssglu_gate():
-    """The RLGLU kernel's da-branch derivative equals the SSSGLU gate (b == 1, no probs)."""
-    from megatron.core.transformer.moe.sssglu_jit import sssglu_forward
+def test_rlglu_jit_gate_derivative_is_ssglu_gate():
+    """The RLGLU kernel's da-branch derivative equals the SSGLU gate (b == 1, no probs)."""
+    from megatron.core.transformer.moe.ssglu_jit import ssglu_forward
 
     M, D = 64, 64
     a = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -70,9 +70,9 @@ def test_rlglu_jit_gate_derivative_is_sssglu_gate():
     g = torch.ones(M, D, dtype=torch.float32, device="cuda")
     grad_x = rlglu_backward(g, x)
     grad_a = torch.chunk(grad_x, 2, -1)[0]
-    # SSSGLU gate as ssslu(a)/a, i.e. the (0,1) softsign gate == RLGLU gate'(a).
-    sss_gate = 0.5 + 0.5 * a / (1.0 + a.abs())
-    assert torch.allclose(grad_a, sss_gate, rtol=1e-4, atol=1e-5)
+    # SSGLU gate as sslu(a)/a, i.e. the (0,1) softsign gate == RLGLU gate'(a).
+    ss_gate = 0.5 + 0.5 * a / (1.0 + a.abs())
+    assert torch.allclose(grad_a, ss_gate, rtol=1e-4, atol=1e-5)
 
 
 def test_rlglu_jit_differs_from_swiglu():

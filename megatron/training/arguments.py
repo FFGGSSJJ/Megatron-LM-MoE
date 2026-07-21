@@ -29,9 +29,9 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu, rlglu_act
+from megatron.core.activations import squared_relu, rlglu_act, sssglu_act, lglu_act, situ_act
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.core.fusions.fused_bias_sssglu import ssslu
+from megatron.core.fusions.fused_bias_ssglu import sslu
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1095,8 +1095,8 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.ffn_hidden_size is None:
         if (
-            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.gxpr
-            or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
+            args.swiglu or args.ssglu or args.reglu or args.rlglu or args.pnglu or args.gxpr
+            or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xssglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1773,13 +1773,13 @@ def core_transformer_config_from_args(args, config_class=None):
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
-    elif args.sssglu:
+    elif args.ssglu:
         # SwiGLU with the sigmoid inside SiLU replaced by softsign scaled to (0, 1). Non-learnable
         # and structurally identical to SwiGLU, so it reuses the same fusion switch
-        # (--no-bias-swiglu-fusion) and dispatches on activation_func == ssslu.
+        # (--no-bias-swiglu-fusion) and dispatches on activation_func == sslu.
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
-        kw_args['activation_func'] = ssslu
+        kw_args['activation_func'] = sslu
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     elif args.reglu:
         # ReLU-gated linear unit: relu(x_glu) * x_linear. Non-learnable and has no fused kernel;
@@ -1792,12 +1792,38 @@ def core_transformer_config_from_args(args, config_class=None):
         # RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. Non-learnable and
         # structurally identical to SwiGLU (elementwise gate, no cross-feature reduction), so it
         # reuses the same fusion switch (--no-bias-swiglu-fusion) and dispatches on
-        # activation_func == rlglu_act. Its gate derivative is exactly the SSSGLU gate, which the
+        # activation_func == rlglu_act. Its gate derivative is exactly the SSGLU gate, which the
         # fused backward reuses.
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = rlglu_act
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.sssglu:
+        # SSSGLU: gate f(x)=softsign(x-1)+0.5, output f(x_glu)*x_linear. Non-learnable and
+        # structurally identical to SwiGLU/RLGLU (elementwise gate, no cross-feature reduction), so
+        # it reuses the same fusion switch (--no-bias-swiglu-fusion) and dispatches on
+        # activation_func == sssglu_act. It has dedicated fused kernels (fused_bias_sssglu.py +
+        # sssglu_jit.py).
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = sssglu_act
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.lglu:
+        # LGLU: gate f(x)=sign(x-1)*ln(|x-1|+1)+ln2, output f(x_glu)*x_linear. Non-learnable and
+        # has no fused kernel; runs through the generic (non-fused) GLU path with
+        # activation_func == lglu_act.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = lglu_act
+        kw_args['bias_activation_fusion'] = False
+    elif args.situ:
+        # SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear. Non-learnable and has no
+        # fused kernel; runs through the generic (non-fused) GLU path with
+        # activation_func == situ_act.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = situ_act
+        kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -1822,15 +1848,18 @@ def core_transformer_config_from_args(args, config_class=None):
         'xr2': args.xr2,
         'gxr2': args.gxr2,
         'xr2glu': args.xr2glu,
-        'xsssglu': args.xsssglu,
+        'xssglu': args.xssglu,
         'polynorm': args.polynorm,
     }
     _all_activation_flags = dict(_other_new_activation_flags)
     _all_activation_flags.update({
         'swiglu': args.swiglu,
-        'sssglu': args.sssglu,
+        'ssglu': args.ssglu,
         'reglu': args.reglu,
         'rlglu': args.rlglu,
+        'sssglu': args.sssglu,
+        'lglu': args.lglu,
+        'situ': args.situ,
         'squared_relu': args.squared_relu,
         'quick_geglu': args.quick_geglu,
         'pnglu': args.pnglu,
@@ -1869,7 +1898,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
-    if args.xsssglu:
+    if args.xssglu:
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
@@ -1936,7 +1965,8 @@ def _add_transformer_engine_args(parser):
                        help='Store the fused GLU activation input (the fc1 output) in FP8 '
                        '(e4m3, direct unscaled cast) for the backward pass, halving that '
                        'saved-activation memory. Only supported for SwiGLU (--swiglu), '
-                       'SSSGLU (--sssglu) and RLGLU (--rlglu) via their fused kernels.')
+                       'SSGLU (--ssglu), RLGLU (--rlglu) and SSSGLU (--sssglu) via their fused '
+                       'kernels.')
 
     # FP4 related arguments
     group.add_argument('--te-precision-config-file', default=None,
@@ -2220,7 +2250,7 @@ def _add_network_size_args(parser):
         "xr2",
         "gxr2",
         "xr2glu",
-        "xsssglu",
+        "xssglu",
         "pn3glu",
         "polynorm",
         "sandwich_norm",
@@ -2296,11 +2326,11 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
-    group.add_argument('--sssglu', action='store_true',
-                       help='Use SSSGLU: SwiGLU with the sigmoid inside SiLU replaced by '
-                       'softsign scaled to (0,1): ssslu(x_glu) * x_linear, where '
-                       'ssslu(x) = x * (0.5 + 0.5*softsign(x)). Non-learnable (cf. the '
-                       'learnable --xsssglu) and fused the same way as SwiGLU '
+    group.add_argument('--ssglu', action='store_true',
+                       help='Use SSGLU: SwiGLU with the sigmoid inside SiLU replaced by '
+                       'softsign scaled to (0,1): sslu(x_glu) * x_linear, where '
+                       'sslu(x) = x * (0.5 + 0.5*softsign(x)). Non-learnable (cf. the '
+                       'learnable --xssglu) and fused the same way as SwiGLU '
                        '(honors --no-bias-swiglu-fusion). Implies gated linear units.')
     group.add_argument('--reglu', action='store_true',
                        help='Use ReGLU: ReLU-gated linear unit, relu(x_glu) * x_linear. '
@@ -2309,7 +2339,21 @@ def _add_network_size_args(parser):
     group.add_argument('--rlglu', action='store_true',
                        help='Use RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. '
                        'Non-learnable; implies gated linear units. Fused the same way as SwiGLU '
-                       '(honors --no-bias-swiglu-fusion); its gate derivative is the SSSGLU gate.')
+                       '(honors --no-bias-swiglu-fusion); its gate derivative is the SSGLU gate.')
+    group.add_argument('--sssglu', action='store_true',
+                       help='Use SSSGLU: gate f(x)=softsign(x-1)+0.5, output f(x_glu)*x_linear. '
+                       'Non-learnable; implies gated linear units. Fused the same way as SwiGLU '
+                       '(honors --no-bias-swiglu-fusion) via dedicated kernels (fused_bias_sssglu.py '
+                       '/ sssglu_jit.py). Distinct from --xssglu (learnable) and the former SSSGLU '
+                       '(now --ssglu).')
+    group.add_argument('--lglu', action='store_true',
+                       help='Use LGLU: gate f(x)=sign(x-1)*ln(|x-1|+1)+ln2, output '
+                       'f(x_glu)*x_linear. Non-learnable; implies gated linear units. No fused '
+                       'kernel (runs through the generic GLU path).')
+    group.add_argument('--situ', action='store_true',
+                       help='Use SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear. '
+                       'Non-learnable; implies gated linear units. No fused kernel (runs through '
+                       'the generic GLU path).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '
@@ -2363,8 +2407,8 @@ def _add_network_size_args(parser):
                        '|ap1|*x^2 + |b|*x for x>0, and (|b|+|an|)*x*softsign(x) + |b|*x for '
                        'x<=0. Implies gated linear units. Each MoE expert gets its own '
                        'coefficients.')
-    group.add_argument('--xsssglu', action='store_true',
-                       help='Use XSSSGLU: gate(x_glu) * x_linear, where gate(x) = '
+    group.add_argument('--xssglu', action='store_true',
+                       help='Use XSSGLU: gate(x_glu) * x_linear, where gate(x) = '
                        '|alpha|*softsign(x) + 0.5. No piecewise branch (softsign already '
                        'interpolates smoothly across x=0) and only one learnable coefficient. '
                        'Implies gated linear units. Each MoE expert gets its own coefficient.')
