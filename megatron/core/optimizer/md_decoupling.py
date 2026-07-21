@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# NOTE: should we remove this copyright notice? as it is from EPFL this implementation and not from NVIDIA (even though we derive things from the Muon implementation from NVIDIA)
 
 """MDDecoupling optimizer (magnitude-direction decoupling).
 
@@ -23,6 +24,9 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor_for_axes
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -59,6 +63,19 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+_MD_GAIN_STATE_KINDS = {
+    "row_gain": "row",
+    "row_gain_m": "row",
+    "row_gain_v": "row",
+    "col_gain": "col",
+    "col_gain_m": "col",
+    "col_gain_v": "col",
+    "flat_gain": "flat",
+    "flat_gain_m": "flat",
+    "flat_gain_v": "flat",
+}
+
+
 def _normalize_embedding_mode(mode):
     return None if mode == "external" else mode
 
@@ -74,6 +91,156 @@ def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") 
     if mode == "none":
         return 1.0
     return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
+
+
+def _md_gain_retained_axes(gain_kind: str, model_ndim: int) -> tuple[int, ...]:
+    """Return model-local axes represented by an MD gain tensor."""
+    if model_ndim == 2:
+        return {"row": (0,), "col": (1,), "flat": ()}[gain_kind]
+    if model_ndim == 3:
+        # Merged experts use [local_experts, out, in]. The expert axis is always logical state.
+        return {"row": (0, 1), "col": (0, 2), "flat": (0,)}[gain_kind]
+    raise ValueError(f'MD gain checkpointing expects a 2D or merged 3D weight, got {model_ndim}D')
+
+
+def _projected_metadata_signature(
+    model_shard: ShardedTensor, retained_axes: tuple[int, ...]
+) -> tuple:
+    """Metadata used to verify that factory leaves project to the same gain shard."""
+    prefix = model_shard.prepend_axis_num
+    global_axes = (*range(prefix), *(prefix + axis for axis in retained_axes))
+    return (
+        prefix,
+        tuple(model_shard.global_shape[axis] for axis in global_axes),
+        tuple(model_shard.global_offset[axis] for axis in global_axes),
+        None
+        if model_shard.axis_fragmentations is None
+        else tuple(model_shard.axis_fragmentations[axis] for axis in global_axes),
+    )
+
+
+def _build_md_gain_factory(
+    model_factory: ShardedTensorFactory,
+    gain: torch.Tensor,
+    gain_kind: str,
+    key: str,
+) -> ShardedTensorFactory:
+    """Build a gain-specific factory from a model parameter factory.
+
+    Known model factories either split a 2D weight along dim 0 or expose a merged 3D expert
+    parameter as one transposed 2D shard per expert. Row gains follow the dim-0 split, while
+    column and flat gains are shared by all dim-0 pieces. Merged expert gains retain the expert
+    axis and project each per-expert leaf independently.
+    """
+    model_ndim = model_factory.data.ndim
+    if model_ndim not in (2, 3):
+        raise ValueError(
+            f'Unsupported {model_ndim}D factory-backed parameter for MD gain {key}'
+        )
+
+    @torch.no_grad()
+    def build_fn(runtime_key, data, replica_id, flattened_range):
+        if flattened_range is not None or model_factory.flattened_range is not None:
+            raise ValueError(f'Flattened factory-backed MD gains are not supported for {key}')
+
+        template_state = model_factory.build_fn(
+            runtime_key,
+            model_factory.data,
+            replica_id,
+            model_factory.flattened_range,
+        ) # original model factory build_fn to get the template state for the gain
+        template_shards = list(nested_values(template_state))
+        if not template_shards or not all(
+            isinstance(shard, ShardedTensor) for shard in template_shards
+        ):
+            raise TypeError(f'Model factory for {key} did not produce ShardedTensor leaves')
+
+        if model_ndim == 3:
+            # Fused expert factories store one transposed [in, out] tensor per expert.
+            if len(template_shards) != data.size(0):
+                raise ValueError(
+                    f'Expected one factory shard per local expert for {key}: '
+                    f'{len(template_shards)} != {data.size(0)}'
+                )
+            expected_leaf_shape = tuple(reversed(model_factory.data.shape[1:]))
+            if any(template.local_shape != expected_leaf_shape for template in template_shards):
+                raise ValueError(
+                    f'Expected transposed per-expert factory shards shaped '
+                    f'{expected_leaf_shape} for {key}'
+                )
+            retained_leaf_axes = {"row": (1,), "col": (0,), "flat": ()}[gain_kind]
+            return [
+                make_sharded_optimizer_tensor_for_axes(
+                    template,
+                    data[expert_idx],
+                    template.key,
+                    retained_leaf_axes,
+                    allow_shape_mismatch=(
+                        template.allow_shape_mismatch and gain_kind == "row"
+                    ),
+                )
+                for expert_idx, template in enumerate(template_shards)
+            ]
+
+        if not all(shard.data.ndim == 2 for shard in template_shards):
+            raise ValueError(f'Expected 2D leaves from model factory for {key}')
+
+         # Row gains: one projected shard for each dim-0 W/V leaf. Example: weight [8, 4] (w: [4, 4], v: [4, 4]) then row gain [8] splits into [4] and [4].
+        if gain_kind == "row":
+            gain_shards = []
+            row_offset = 0
+            for template in template_shards:
+                row_count = template.local_shape[0]
+                gain_shards.append(
+                    make_sharded_optimizer_tensor_for_axes(
+                        template,
+                        data.narrow(0, row_offset, row_count),
+                        template.key,
+                        (0,),
+                        allow_shape_mismatch=template.allow_shape_mismatch,
+                    )
+                )
+                row_offset += row_count
+            if row_offset != data.size(0):
+                raise ValueError(
+                    f'Factory row shards for {key} only cover {row_offset} values, '
+                    f'expected {data.size(0)}'
+                )
+            return gain_shards
+
+        # Column and flat gains: one shard shared (the same gain is used by both W and V leaves) by all W/V leaves.
+        retained_axes = (1,) if gain_kind == "col" else ()
+        expected_signature = _projected_metadata_signature(template_shards[0], retained_axes)
+        if any(
+            _projected_metadata_signature(template, retained_axes) != expected_signature
+            for template in template_shards[1:]
+        ):
+            raise ValueError(
+                f'Model factory leaves do not share one {gain_kind} gain layout for {key}'
+            )
+        return [
+            make_sharded_optimizer_tensor_for_axes(
+                template_shards[0], data, runtime_key, retained_axes
+            )
+        ]
+
+    @torch.no_grad()
+    def merge_fn(loaded_shards):
+        if model_ndim == 3:
+            return torch.stack(loaded_shards, dim=0)
+        if gain_kind == "row":
+            return torch.cat(loaded_shards, dim=0)
+        if len(loaded_shards) != 1:
+            raise ValueError(f'Expected one loaded {gain_kind} gain shard for {key}')
+        return loaded_shards[0]
+
+    return ShardedTensorFactory(
+        key,
+        gain,
+        build_fn,
+        merge_fn,
+        model_factory.replica_id,
+    )
 
 
 class _MDDecouplingBase(torch.optim.Optimizer):
@@ -646,7 +813,8 @@ class MDDecoupling(_MDDecouplingBase):
     Gain optimizer state (1st/2nd moments) is tracked manually as plain tensors in
     `self.state[p]`. This avoids registering gain `nn.Parameter`s in an inner `AdamW` that lives
     outside `self.param_groups` — torch.optim's state_dict id-mapping doesn't survive that. Gain
-    tensors have a different shape than `p`, so use `--ckpt-format torch`.
+    tensors have a different shape than `p`; torch_dist projects the model parameter's sharding
+    metadata onto the row, column, flat, and expert axes represented by each gain.
     """
 
     def __init__(
@@ -691,6 +859,33 @@ class MDDecoupling(_MDDecouplingBase):
         # the Float16 wrapper later clones bf16 → fp32 main_params and migrates self.state only
         # for params still in param_groups on this rank. Deferring to step() keeps the keys
         # consistent with the post-wrap main_params.
+
+    def build_sharded_optimizer_state(
+        self,
+        model_param: ShardedTensor | ShardedTensorFactory,
+        optim_param: torch.Tensor,
+        state_key: str,
+        prefix: str,
+    ) -> ShardedTensor | ShardedTensorFactory | None:
+        """Build reshardable torch_dist metadata for MD gain optimizer state."""
+        gain_kind = _MD_GAIN_STATE_KINDS.get(state_key)
+        if gain_kind is None:
+            return None
+
+        key = f'{prefix}.{model_param.key}'
+        if isinstance(model_param, ShardedTensorFactory):
+            return _build_md_gain_factory(model_param, optim_param, gain_kind, key)
+
+        if model_param.data is None:
+            raise ValueError(f'Model shard {model_param.key} has no local data for MD gain projection')
+        retained_axes = _md_gain_retained_axes(gain_kind, model_param.data.ndim)
+        return make_sharded_optimizer_tensor_for_axes(
+            model_param,
+            optim_param,
+            key,
+            retained_axes,
+            allow_shape_mismatch=(model_param.allow_shape_mismatch and gain_kind == "row"),
+        )
 
     def _phi(self, g: torch.Tensor) -> torch.Tensor:
         """Forward map from raw gain g to effective multiplier phi(g)."""
@@ -1237,10 +1432,11 @@ def _mddecoupling_config_overrides(
 
 
 def _md_init_state_fn(opt, config=None):
-    """Initialize MDDecoupling state for torch_dist checkpoint compatibility (gain state is still
-    created lazily at first step; recommend --ckpt-format torch when gains are enabled)."""
+    """Initialize MDDecoupling state for torch_dist checkpoint compatibility."""
     for group in opt.param_groups:
         for p in group['params']:
+            if hasattr(opt, "_maybe_init_gain_state"):
+                opt._maybe_init_gain_state(p)
             if "exp_avg" not in opt.state[p]:
                 opt.state[p]["exp_avg"] = torch.zeros_like(p.data)
                 if not group.get("use_orthogonal_updates", False) and group.get("beta2", 0) != 0:

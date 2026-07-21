@@ -1541,11 +1541,18 @@ def validate_args(args, defaults={}):
             assert not args.overlap_param_gather, (
                 "md_decoupling without --use-layer-wise-distributed-optimizer does not support "
                 "--overlap-param-gather; enable the layer-wise optimizer.")
-        gains_enabled = args.hypersphere_gains_mode is not None
-        if gains_enabled:
-            assert args.ckpt_format == "torch", (
-                "md_decoupling with learnable gains requires --ckpt-format torch (gain state "
-                "tensors differ in shape from their parameter, which torch_dist cannot round-trip).")
+        gains_overrides = [
+            name
+            for name in (
+                "hypersphere_gains_mode_output",
+                "hypersphere_gains_mode_embedding",
+                "hypersphere_gains_mode_router",
+            )
+            if getattr(args, name, None) not in (None, "none")
+        ]
+        assert args.hypersphere_gains_mode is not None or not gains_overrides, (
+            "md_decoupling gains overrides require --hypersphere-gains-mode to be used; got "
+            f"{', '.join(gains_overrides)}.")
         if args.gains_no_clamp_min and args.gain_parametrization == "softplus":
             warn_rank_0(
                 "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "

@@ -6,17 +6,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing import load
+from megatron.core.dist_checkpointing import save
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory, apply_factories
 import megatron.core.optimizer.layer_wise_optimizer as layer_wise_module
 import megatron.core.optimizer.md_decoupling as md_module
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.md_decoupling import MDDecoupling
 from megatron.core.optimizer.md_decoupling import _get_muon_scale_factor
+from megatron.core.optimizer.md_decoupling import _md_init_state_fn
 from megatron.core.optimizer.md_decoupling import _split_qkv
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.optimizer import FP32Optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+from megatron.core.transformer.moe.fp8_utils import make_fused_experts_sharded_factory
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -412,6 +423,559 @@ def test_md_decoupling_direct_gains_no_clamp_min_round_trip():
     optimizer._apply_gains(param)
 
     torch.testing.assert_close(param, original)
+
+
+def test_md_decoupling_sharded_state_dict_includes_projected_gain_tensors():
+    param = torch.nn.Parameter(torch.ones(3, 4))
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        pg_collection=None,
+    )
+    megatron_optimizer = FP32Optimizer(
+        optimizer,
+        OptimizerConfig(optimizer='md_decoupling'),
+        _md_init_state_fn,
+    )
+    model_sharded_state_dict = {
+        'linear.weight': ShardedTensor.from_rank_offsets('linear.weight', param)
+    }
+
+    state_dict = megatron_optimizer.sharded_state_dict(
+        model_sharded_state_dict,
+        is_loading=True,
+    )
+    param_state = state_dict['state'][0]
+
+    assert isinstance(param_state['exp_avg'], ShardedTensor)
+    assert isinstance(param_state['row_gain'], ShardedTensor)
+    assert isinstance(param_state['row_gain_m'], ShardedTensor)
+    assert isinstance(param_state['row_gain_v'], ShardedTensor)
+    assert isinstance(param_state['col_gain'], ShardedTensor)
+    assert isinstance(param_state['col_gain_m'], ShardedTensor)
+    assert isinstance(param_state['col_gain_v'], ShardedTensor)
+
+    assert param_state['row_gain'].global_shape == (3,)
+    assert param_state['col_gain'].global_shape == (4,)
+
+
+@pytest.mark.parametrize(
+    ('partition_dim', 'gain_kind', 'expected_global_shape', 'expected_fragmentations'),
+    (
+        (0, 'row', (6,), (2,)),
+        (0, 'col', (4,), (1,)),
+        (0, 'flat', (), ()),
+        (1, 'row', (3,), (1,)),
+        (1, 'col', (8,), (2,)),
+        (1, 'flat', (), ()),
+    ),
+)
+def test_md_gain_projection_turns_dropped_tp_axis_into_replica(
+    partition_dim, gain_kind, expected_global_shape, expected_fragmentations
+):
+    local_shape = (3, 4)
+    gain_shape = {'row': (3,), 'col': (4,), 'flat': ()}[gain_kind]
+
+    for tp_rank in (0, 1):
+        param = torch.nn.Parameter(torch.ones(local_shape))
+        model_shard = ShardedTensor.from_rank_offsets(
+            'linear.weight',
+            param,
+            (partition_dim, tp_rank, 2),
+            replica_id=(0, 0, 0),
+            allow_shape_mismatch=True,
+        )
+        optimizer = MDDecoupling(
+            params=[param],
+            lr=0.01,
+            hypersphere_gains_mode='rowcol',
+            pg_collection=None,
+        )
+        gain_shard = optimizer.build_sharded_optimizer_state(
+            model_shard,
+            torch.ones(gain_shape),
+            f'{gain_kind}_gain',
+            f'optimizer.state.{gain_kind}_gain',
+        )
+
+        assert isinstance(gain_shard, ShardedTensor)
+        assert gain_shard.global_shape == expected_global_shape
+        assert gain_shard.axis_fragmentations == expected_fragmentations
+        assert gain_shard.allow_shape_mismatch is (gain_kind == 'row')
+
+        gain_axis = {'row': 0, 'col': 1, 'flat': None}[gain_kind]
+        if gain_axis == partition_dim:
+            assert gain_shard.global_offset == (tp_rank * local_shape[gain_axis],)
+            assert gain_shard.replica_id == (0, 0, 0)
+        else:
+            assert gain_shard.global_offset == (0,) * len(expected_global_shape)
+            assert gain_shard.replica_id == (0, tp_rank, 0)
+
+
+def test_md_gain_projection_preserves_layer_and_expert_axes():
+    param = torch.nn.Parameter(torch.ones(2, 3, 4))
+    model_shard = ShardedTensor.from_rank_offsets(
+        'experts.weight',
+        param,
+        (0, 5, 8),  # layer
+        (1, 1, 2),  # expert ownership
+        replica_id=(0, 0, 0),
+        prepend_axis_num=1,
+    )
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode='rowcol',
+        pg_collection=None,
+    )
+
+    expected = {
+        'row': ((8, 4, 3), (5, 2, 0), (8, 2, 1), (2, 3)),
+        'col': ((8, 4, 4), (5, 2, 0), (8, 2, 1), (2, 4)),
+        'flat': ((8, 4), (5, 2), (8, 2), (2,)),
+    }
+    for gain_kind, (global_shape, global_offset, fragmentations, local_shape) in expected.items():
+        gain_shard = optimizer.build_sharded_optimizer_state(
+            model_shard,
+            torch.ones(local_shape),
+            f'{gain_kind}_gain',
+            f'optimizer.state.{gain_kind}_gain',
+        )
+        assert isinstance(gain_shard, ShardedTensor)
+        assert gain_shard.prepend_axis_num == 1
+        assert gain_shard.global_shape == global_shape
+        assert gain_shard.global_offset == global_offset
+        assert gain_shard.axis_fragmentations == fragmentations
+        assert gain_shard.replica_id == (0, 0, 0)
+
+
+def test_md_gain_projection_supports_dim0_split_factories():
+    param = torch.nn.Parameter(torch.ones(8, 4))
+    model_shard = ShardedTensor.from_rank_offsets(
+        'linear.weight',
+        param,
+        (0, 1, 2),
+        replica_id=(0, 0, 0),
+    )
+    model_factory = apply_swiglu_sharded_factory(model_shard, ())
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode='rowcol',
+        pg_collection=None,
+    )
+
+    row_gain = torch.arange(8, dtype=torch.float32)
+    row_factory = optimizer.build_sharded_optimizer_state(
+        model_factory,
+        row_gain,
+        'row_gain',
+        'optimizer.state.row_gain',
+    )
+    assert isinstance(row_factory, ShardedTensorFactory)
+    row_state = {'row_gain': row_factory}
+    apply_factories(row_state)
+    row_shards = list(nested_values(row_state))
+    assert [shard.local_shape for shard in row_shards] == [(4,), (4,)]
+    assert [shard.global_offset for shard in row_shards] == [(4,), (12,)]
+    assert all(shard.global_shape == (16,) for shard in row_shards)
+    torch.testing.assert_close(row_factory.merge_fn([shard.data for shard in row_shards]), row_gain)
+
+    col_gain = torch.arange(4, dtype=torch.float32)
+    col_factory = optimizer.build_sharded_optimizer_state(
+        model_factory,
+        col_gain,
+        'col_gain',
+        'optimizer.state.col_gain',
+    )
+    assert isinstance(col_factory, ShardedTensorFactory)
+    col_state = {'col_gain': col_factory}
+    apply_factories(col_state)
+    col_shards = list(nested_values(col_state))
+    assert len(col_shards) == 1
+    assert col_shards[0].global_shape == (4,)
+    assert col_shards[0].global_offset == (0,)
+    assert col_shards[0].replica_id == (0, 1, 0)
+    torch.testing.assert_close(col_factory.merge_fn([col_shards[0].data]), col_gain)
+
+
+def test_md_projected_row_gain_reshards(tmp_path_dist_ckpt):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        def make_row_shard(rank, fragments, local_rows, values):
+            param = torch.nn.Parameter(torch.ones(local_rows, 3))
+            model_shard = ShardedTensor.from_rank_offsets(
+                'linear.weight',
+                param,
+                (0, rank, fragments),
+                replica_id=(0, 0, 0),
+            )
+            optimizer = MDDecoupling(
+                params=[param],
+                lr=0.01,
+                hypersphere_gains_mode='row',
+                pg_collection=None,
+            )
+            return optimizer.build_sharded_optimizer_state(
+                model_shard,
+                values,
+                'row_gain',
+                'optimizer.state.row_gain',
+            )
+
+        source_shards = [
+            make_row_shard(0, 2, 4, torch.arange(0, 4, dtype=torch.float32)),
+            make_row_shard(1, 2, 4, torch.arange(4, 8, dtype=torch.float32)),
+        ]
+        destination_shards = [
+            make_row_shard(rank, 4, 2, torch.empty(2)) for rank in range(4)
+        ]
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'md_projected_gain_reshard', sync=True) as ckpt_dir:
+            save({'row_gain': source_shards}, ckpt_dir)
+            loaded = load({'row_gain': destination_shards}, ckpt_dir)
+
+        torch.testing.assert_close(
+            torch.cat(loaded['row_gain']),
+            torch.arange(8, dtype=torch.float32),
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_cuda
+@pytest.mark.skipif(Utils.world_size < 4, reason="TP resharding test requires four ranks")
+@pytest.mark.parametrize(
+    ('source_tp', 'destination_tp'), ((1, 4), (2, 4), (4, 2), (4, 1))
+)
+def test_md_projected_gains_reshard_across_tp(
+    tmp_path_dist_ckpt, source_tp, destination_tp
+):
+    global_rows = 8
+    columns = 3
+
+    def make_gain_state(tp_size, source_values):
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        local_rows = global_rows // tp_size
+        row_start = tp_rank * local_rows
+        param = torch.nn.Parameter(torch.ones(local_rows, columns, device='cuda'))
+        model_shard = ShardedTensor.from_rank_offsets(
+            'linear.weight',
+            param,
+            (0, tp_rank, tp_size),
+            replica_id=(0, 0, dp_rank),
+        )
+        optimizer = MDDecoupling(
+            params=[param],
+            lr=0.01,
+            hypersphere_gains_mode='rowcol',
+            pg_collection=None,
+        )
+        gains = {
+            'row_gain': torch.arange(
+                row_start, row_start + local_rows, dtype=torch.float32, device='cuda'
+            ),
+            'col_gain': torch.arange(columns, dtype=torch.float32, device='cuda') + 100,
+            'flat_gain': torch.tensor(200.0, device='cuda'),
+        }
+        if not source_values:
+            gains = {name: torch.full_like(value, -1) for name, value in gains.items()}
+        return {
+            name: optimizer.build_sharded_optimizer_state(
+                model_shard,
+                value,
+                name,
+                f'optimizer.state.{name}',
+            )
+            for name, value in gains.items()
+        }
+
+    Utils.initialize_model_parallel(source_tp, 1)
+    try:
+        with TempNamedDir(
+            tmp_path_dist_ckpt / f'md_gain_tp_{source_tp}_to_{destination_tp}', sync=True
+        ) as ckpt_dir:
+            save(make_gain_state(source_tp, source_values=True), ckpt_dir)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(destination_tp, 1)
+            loaded = load(make_gain_state(destination_tp, source_values=False), ckpt_dir)
+
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            local_rows = global_rows // destination_tp
+            row_start = tp_rank * local_rows
+            torch.testing.assert_close(
+                loaded['row_gain'],
+                torch.arange(
+                    row_start,
+                    row_start + local_rows,
+                    dtype=torch.float32,
+                    device='cuda',
+                ),
+            )
+            torch.testing.assert_close(
+                loaded['col_gain'],
+                torch.arange(columns, dtype=torch.float32, device='cuda') + 100,
+            )
+            torch.testing.assert_close(loaded['flat_gain'], torch.tensor(200.0, device='cuda'))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_cuda
+@pytest.mark.skipif(Utils.world_size < 4, reason="TP resharding test requires four ranks")
+def test_md_output_row_gain_reshards_across_tp_with_different_padded_vocab_size(
+    tmp_path_dist_ckpt,
+):
+    source_tp, source_padded_vocab = 2, 10
+    destination_tp, destination_padded_vocab = 4, 12
+    columns = 3
+    state_offsets = {'row_gain': 0, 'row_gain_m': 100, 'row_gain_v': 200}
+
+    def make_gain_state(tp_size, padded_vocab_size, source_values):
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        local_rows = padded_vocab_size // tp_size
+        row_start = tp_rank * local_rows
+        param = torch.nn.Parameter(torch.ones(local_rows, columns, device='cuda'))
+        model_shard = ShardedTensor.from_rank_offsets(
+            'output_layer.weight',
+            param,
+            (0, tp_rank, tp_size),
+            replica_id=(0, 0, dp_rank),
+            allow_shape_mismatch=True,
+        )
+        optimizer = MDDecoupling(
+            params=[param],
+            lr=0.01,
+            hypersphere_gains_mode='row',
+            pg_collection=None,
+        )
+        return {
+            state_key: optimizer.build_sharded_optimizer_state(
+                model_shard,
+                torch.arange(
+                    row_start,
+                    row_start + local_rows,
+                    dtype=torch.float32,
+                    device='cuda',
+                )
+                + offset
+                if source_values
+                else torch.full((local_rows,), -1.0, device='cuda'),
+                state_key,
+                f'optimizer.state.{state_key}',
+            )
+            for state_key, offset in state_offsets.items()
+        }
+
+    Utils.initialize_model_parallel(source_tp, 1)
+    try:
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'md_output_gain_padded_vocab_tp_2_to_4', sync=True
+        ) as ckpt_dir:
+            save(make_gain_state(source_tp, source_padded_vocab, source_values=True), ckpt_dir)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(destination_tp, 1)
+            loaded = load(
+                make_gain_state(
+                    destination_tp,
+                    destination_padded_vocab,
+                    source_values=False,
+                ),
+                ckpt_dir,
+            )
+
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            local_rows = destination_padded_vocab // destination_tp
+            row_start = tp_rank * local_rows
+            for state_key, offset in state_offsets.items():
+                expected = torch.cat(
+                    (
+                        torch.arange(
+                            source_padded_vocab,
+                            dtype=torch.float32,
+                            device='cuda',
+                        )
+                        + offset,
+                        torch.zeros(
+                            destination_padded_vocab - source_padded_vocab,
+                            device='cuda',
+                        ),
+                    )
+                )
+                torch.testing.assert_close(
+                    loaded[state_key], expected.narrow(0, row_start, local_rows)
+                )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_cuda
+@pytest.mark.skipif(Utils.world_size < 4, reason="EP resharding test requires four ranks")
+@pytest.mark.parametrize(
+    ('source_ep', 'destination_ep'), ((1, 4), (2, 4), (4, 2), (4, 1))
+)
+def test_md_projected_gains_reshard_across_ep(
+    tmp_path_dist_ckpt, source_ep, destination_ep
+):
+    global_experts = 8
+    rows = 3
+    columns = 4
+
+    def make_gain_state(ep_size, source_values):
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        expert_dp_rank = parallel_state.get_expert_data_parallel_rank()
+        local_experts = global_experts // ep_size
+        expert_start = ep_rank * local_experts
+        param = torch.nn.Parameter(
+            torch.ones(local_experts, rows, columns, device='cuda')
+        )
+
+        model_factory = make_fused_experts_sharded_factory(
+            param,
+            '',
+            'weight',
+            num_local_experts=local_experts,
+            local_expert_indices_offset=expert_start,
+            num_global_experts=global_experts,
+            sharded_offsets=(),
+            replica_id=(0, 0, expert_dp_rank),
+            singleton_local_shards=False,
+        )
+        optimizer = MDDecoupling(
+            params=[param],
+            lr=0.01,
+            hypersphere_gains_mode='rowcol',
+            pg_collection=None,
+        )
+        expert_ids = torch.arange(
+            expert_start,
+            expert_start + local_experts,
+            dtype=torch.float32,
+            device='cuda',
+        )
+        gains = {
+            'row_gain': expert_ids[:, None] * 10 + torch.arange(rows, device='cuda'),
+            'col_gain': expert_ids[:, None] * 10 + torch.arange(columns, device='cuda'),
+            'flat_gain': expert_ids,
+        }
+        if not source_values:
+            gains = {name: torch.full_like(value, -1) for name, value in gains.items()}
+        return {
+            name: optimizer.build_sharded_optimizer_state(
+                model_factory,
+                value,
+                name,
+                f'optimizer.state.{name}',
+            )
+            for name, value in gains.items()
+        }
+
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=source_ep)
+    try:
+        with TempNamedDir(
+            tmp_path_dist_ckpt / f'md_gain_ep_{source_ep}_to_{destination_ep}', sync=True
+        ) as ckpt_dir:
+            save(make_gain_state(source_ep, source_values=True), ckpt_dir)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=destination_ep)
+            loaded = load(make_gain_state(destination_ep, source_values=False), ckpt_dir)
+
+            ep_rank = parallel_state.get_expert_model_parallel_rank()
+            local_experts = global_experts // destination_ep
+            expert_start = ep_rank * local_experts
+            expert_ids = torch.arange(
+                expert_start,
+                expert_start + local_experts,
+                dtype=torch.float32,
+                device='cuda',
+            )
+            torch.testing.assert_close(
+                loaded['row_gain'],
+                expert_ids[:, None] * 10 + torch.arange(rows, device='cuda'),
+            )
+            torch.testing.assert_close(
+                loaded['col_gain'],
+                expert_ids[:, None] * 10 + torch.arange(columns, device='cuda'),
+            )
+            torch.testing.assert_close(loaded['flat_gain'], expert_ids)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _md_sharded_optimizer(param):
+    optimizer = MDDecoupling(
+        params=[
+            {
+                'params': [param],
+                'wd_mult': 1.0,
+                'is_expert_parallel': False,
+                'is_decoupled_lr': False,
+            }
+        ],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        pg_collection=None,
+    )
+    return FP32Optimizer(
+        optimizer,
+        OptimizerConfig(optimizer='md_decoupling'),
+        _md_init_state_fn,
+    )
+
+
+def _linear_weight_sharded_state(param):
+    return {'linear.weight': ShardedTensor.from_rank_offsets('linear.weight', param)}
+
+
+def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        expected_gains = (
+            ('row_gain', 2.0, (3,)),
+            ('row_gain_m', 3.0, (3,)),
+            ('row_gain_v', 4.0, (3,)),
+            ('col_gain', 5.0, (4,)),
+            ('col_gain_m', 6.0, (4,)),
+            ('col_gain_v', 7.0, (4,)),
+        )
+        param = torch.nn.Parameter(torch.ones(3, 4))
+        megatron_optimizer = _md_sharded_optimizer(param)
+        megatron_optimizer.sharded_state_dict(
+            _linear_weight_sharded_state(param),
+            is_loading=True,
+        )
+        optimizer = megatron_optimizer.optimizer
+        for name, value, _ in expected_gains:
+            optimizer.state[param][name].fill_(value)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'md_gain_state_round_trip', sync=True) as ckpt_dir:
+            save(
+                megatron_optimizer.sharded_state_dict(_linear_weight_sharded_state(param)),
+                ckpt_dir,
+            )
+
+            loaded_param = torch.nn.Parameter(torch.ones(3, 4))
+            loaded_megatron_optimizer = _md_sharded_optimizer(loaded_param)
+            loaded_state_dict = load(
+                loaded_megatron_optimizer.sharded_state_dict(
+                    _linear_weight_sharded_state(loaded_param),
+                    is_loading=True,
+                ),
+                ckpt_dir,
+            )
+            loaded_megatron_optimizer.load_state_dict(loaded_state_dict)
+
+        loaded_state = loaded_megatron_optimizer.optimizer.state[loaded_param]
+        for name, value, shape in expected_gains:
+            torch.testing.assert_close(loaded_state[name], torch.full(shape, value))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @requires_cuda_and_emerging

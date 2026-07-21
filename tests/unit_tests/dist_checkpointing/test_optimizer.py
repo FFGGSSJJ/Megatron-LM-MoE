@@ -11,10 +11,16 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import (
+    ShardedTensor,
+    load,
+    load_plain_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
+    make_sharded_optimizer_tensor_for_axes,
     optim_state_to_sharding_state,
 )
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding, extract_sharded_tensors
@@ -236,6 +242,41 @@ class TestOptimizer:
                 for layer_name in model_state_dict
             ]
         )
+
+    def test_optimizer_custom_state_sharding(self):
+        Utils.initialize_model_parallel(1, 1)
+        model = Model()
+        param = model.proj.weight
+        optim_state_dict = {
+            'state': {
+                0: {
+                    'exp_avg': torch.ones_like(param),
+                    'gain': torch.ones(param.size(0)),
+                }
+            },
+            'param_groups': [{'params': [0]}],
+        }
+        param_map = get_param_id_to_sharded_param_map(model.sharded_state_dict(), [param])
+
+        def build_gain_state(model_param, state, state_key, prefix):
+            if state_key != 'gain':
+                return None
+            return make_sharded_optimizer_tensor_for_axes(
+                model_param,
+                state,
+                f'{prefix}.{model_param.key}',
+                (0,),
+            )
+
+        optim_state_to_sharding_state(
+            optim_state_dict,
+            param_map,
+            state_sharding_fn=build_gain_state,
+        )
+
+        assert isinstance(optim_state_dict['state'][0]['exp_avg'], ShardedTensor)
+        assert isinstance(optim_state_dict['state'][0]['gain'], ShardedTensor)
+        assert optim_state_dict['state'][0]['gain'].key == 'optimizer.state.gain.proj.weight'
 
 
 def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
