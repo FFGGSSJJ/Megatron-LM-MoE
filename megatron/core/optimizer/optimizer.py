@@ -884,16 +884,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         step = self._extract_common_per_param_step(state_dict['optimizer'])
 
-        # Convert regular optimizer state
-        # all optimizer parameters passed to optim_state_to_sharding_state are
-        # expected to have the same shape as the model parameters,
-        # so we save the step separately and ignore it here
-        shape_mismatch_keys = getattr(self.optimizer, 'sharded_state_shape_mismatch_keys', ())
+        # Regular optimizer state follows model parameter sharding. Optimizers may provide a
+        # state-specific builder for state with a different logical tensor shape.
+        state_sharding_fn = getattr(self.optimizer, 'build_sharded_optimizer_state', None)
         optim_state_to_sharding_state(
             state_dict['optimizer'],
             id_to_sharded_param_map,
             exclude_keys="step",
-            shape_mismatch_keys=shape_mismatch_keys,
+            state_sharding_fn=state_sharding_fn,
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
@@ -1096,15 +1094,14 @@ class FP32Optimizer(MegatronOptimizer):
         )
         step = self._extract_common_per_param_step(state_dict)
 
-        # all optimizer parameters passed to optim_state_to_sharding_state are
-        # expected to have the same shape as the model parameters,
-        # so we save the step separately and ignore it here
-        shape_mismatch_keys = getattr(self.optimizer, 'sharded_state_shape_mismatch_keys', ())
+        # Regular optimizer state follows model parameter sharding. Optimizers may provide a
+        # state-specific builder for state with a different logical tensor shape.
+        state_sharding_fn = getattr(self.optimizer, 'build_sharded_optimizer_state', None)
         optim_state_to_sharding_state(
             state_dict,
             id_to_sharded_param_map,
             exclude_keys="step",
-            shape_mismatch_keys=shape_mismatch_keys,
+            state_sharding_fn=state_sharding_fn,
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported

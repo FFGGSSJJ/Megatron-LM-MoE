@@ -12,7 +12,6 @@ from torch.optim import Adam
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import (
-    ShardedObject,
     ShardedTensor,
     load,
     load_plain_tensors,
@@ -21,6 +20,7 @@ from megatron.core.dist_checkpointing import (
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
+    make_sharded_optimizer_tensor_for_axes,
     optim_state_to_sharding_state,
 )
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding, extract_sharded_tensors
@@ -243,7 +243,7 @@ class TestOptimizer:
             ]
         )
 
-    def test_optimizer_mismatched_state_uses_sharded_object(self):
+    def test_optimizer_custom_state_sharding(self):
         Utils.initialize_model_parallel(1, 1)
         model = Model()
         param = model.proj.weight
@@ -258,14 +258,24 @@ class TestOptimizer:
         }
         param_map = get_param_id_to_sharded_param_map(model.sharded_state_dict(), [param])
 
+        def build_gain_state(model_param, state, state_key, prefix):
+            if state_key != 'gain':
+                return None
+            return make_sharded_optimizer_tensor_for_axes(
+                model_param,
+                state,
+                f'{prefix}.{model_param.key}',
+                (0,),
+            )
+
         optim_state_to_sharding_state(
             optim_state_dict,
             param_map,
-            shape_mismatch_keys=('gain',),
+            state_sharding_fn=build_gain_state,
         )
 
         assert isinstance(optim_state_dict['state'][0]['exp_avg'], ShardedTensor)
-        assert isinstance(optim_state_dict['state'][0]['gain'], ShardedObject)
+        assert isinstance(optim_state_dict['state'][0]['gain'], ShardedTensor)
         assert optim_state_dict['state'][0]['gain'].key == 'optimizer.state.gain.proj.weight'
 
 

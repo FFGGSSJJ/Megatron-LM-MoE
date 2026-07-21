@@ -33,6 +33,14 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 - **Context Parallelism (CP)**: Long sequence handling ([documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/context_parallel.html))
 - **Expert Parallelism (EP)**: Split experts of an MoE model across multiple GPUs
 
+### Distributed Checkpointing
+
+The `torch_dist` format describes each tensor as a slice of logical global state, allowing a
+checkpoint to load under a different TP, PP, or EP topology. Optimizer state whose shape differs
+from its model parameter must provide its own logical tensor layout. MDDecoupling does this for
+row, column, and flat gains (and their moments) by projecting the model shard onto the axes each
+gain retains; dropped TP-sharded axes become replica coordinates.
+
 
 ## 🔗 Examples & Documentation
 
