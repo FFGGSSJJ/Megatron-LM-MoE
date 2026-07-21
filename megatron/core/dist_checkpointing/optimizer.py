@@ -170,12 +170,15 @@ def make_sharded_optimizer_tensor_for_axes(
     optim_param: torch.Tensor,
     key: str,
     retained_axes: Tuple[int, ...],
+    allow_shape_mismatch: bool = False,
 ) -> ShardedTensor:
     """Project model tensor sharding onto an optimizer tensor with fewer local axes.
 
     All prepended logical axes (for example layer and expert axes) are preserved. ``retained_axes``
     indexes the local model tensor axes represented by ``optim_param``. Fragmented model axes that
     are not retained become replica coordinates instead of tensor-sharding axes.
+    ``allow_shape_mismatch`` should only be enabled when the projected tensor retains the
+    model axis whose global shape may change.
     """
     optim_param = to_local_if_dtensor(optim_param)
     retained_axes = tuple(retained_axes)
@@ -214,6 +217,7 @@ def make_sharded_optimizer_tensor_for_axes(
         ),
         replica_id=_project_replica_id(model_param, retained_axes),
         prepend_axis_num=prepend_axis_num,
+        allow_shape_mismatch=allow_shape_mismatch,
     )
     return sh_ten
 

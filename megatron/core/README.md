@@ -39,7 +39,8 @@ The `torch_dist` format describes each tensor as a slice of logical global state
 checkpoint to load under a different TP, PP, or EP topology. Optimizer state whose shape differs
 from its model parameter must provide its own logical tensor layout. MDDecoupling does this for
 row, column, and flat gains (and their moments) by projecting the model shard onto the axes each
-gain retains; dropped TP-sharded axes become replica coordinates.
+gain retains; dropped TP-sharded axes become replica coordinates. Row gains for vocabulary-shaped
+weights also retain flexible-shape metadata so checkpoints load when TP changes vocabulary padding.
 
 
 ## 🔗 Examples & Documentation

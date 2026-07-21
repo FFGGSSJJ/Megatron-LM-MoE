@@ -484,6 +484,7 @@ def test_md_gain_projection_turns_dropped_tp_axis_into_replica(
             param,
             (partition_dim, tp_rank, 2),
             replica_id=(0, 0, 0),
+            allow_shape_mismatch=True,
         )
         optimizer = MDDecoupling(
             params=[param],
@@ -501,6 +502,7 @@ def test_md_gain_projection_turns_dropped_tp_axis_into_replica(
         assert isinstance(gain_shard, ShardedTensor)
         assert gain_shard.global_shape == expected_global_shape
         assert gain_shard.axis_fragmentations == expected_fragmentations
+        assert gain_shard.allow_shape_mismatch is (gain_kind == 'row')
 
         gain_axis = {'row': 0, 'col': 1, 'flat': None}[gain_kind]
         if gain_axis == partition_dim:
@@ -718,6 +720,96 @@ def test_md_projected_gains_reshard_across_tp(
                 torch.arange(columns, dtype=torch.float32, device='cuda') + 100,
             )
             torch.testing.assert_close(loaded['flat_gain'], torch.tensor(200.0, device='cuda'))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_cuda
+@pytest.mark.skipif(Utils.world_size < 4, reason="TP resharding test requires four ranks")
+def test_md_output_row_gain_reshards_across_tp_with_different_padded_vocab_size(
+    tmp_path_dist_ckpt,
+):
+    source_tp, source_padded_vocab = 2, 10
+    destination_tp, destination_padded_vocab = 4, 12
+    columns = 3
+    state_offsets = {'row_gain': 0, 'row_gain_m': 100, 'row_gain_v': 200}
+
+    def make_gain_state(tp_size, padded_vocab_size, source_values):
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        local_rows = padded_vocab_size // tp_size
+        row_start = tp_rank * local_rows
+        param = torch.nn.Parameter(torch.ones(local_rows, columns, device='cuda'))
+        model_shard = ShardedTensor.from_rank_offsets(
+            'output_layer.weight',
+            param,
+            (0, tp_rank, tp_size),
+            replica_id=(0, 0, dp_rank),
+            allow_shape_mismatch=True,
+        )
+        optimizer = MDDecoupling(
+            params=[param],
+            lr=0.01,
+            hypersphere_gains_mode='row',
+            pg_collection=None,
+        )
+        return {
+            state_key: optimizer.build_sharded_optimizer_state(
+                model_shard,
+                torch.arange(
+                    row_start,
+                    row_start + local_rows,
+                    dtype=torch.float32,
+                    device='cuda',
+                )
+                + offset
+                if source_values
+                else torch.full((local_rows,), -1.0, device='cuda'),
+                state_key,
+                f'optimizer.state.{state_key}',
+            )
+            for state_key, offset in state_offsets.items()
+        }
+
+    Utils.initialize_model_parallel(source_tp, 1)
+    try:
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'md_output_gain_padded_vocab_tp_2_to_4', sync=True
+        ) as ckpt_dir:
+            save(make_gain_state(source_tp, source_padded_vocab, source_values=True), ckpt_dir)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(destination_tp, 1)
+            loaded = load(
+                make_gain_state(
+                    destination_tp,
+                    destination_padded_vocab,
+                    source_values=False,
+                ),
+                ckpt_dir,
+            )
+
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            local_rows = destination_padded_vocab // destination_tp
+            row_start = tp_rank * local_rows
+            for state_key, offset in state_offsets.items():
+                expected = torch.cat(
+                    (
+                        torch.arange(
+                            source_padded_vocab,
+                            dtype=torch.float32,
+                            device='cuda',
+                        )
+                        + offset,
+                        torch.zeros(
+                            destination_padded_vocab - source_padded_vocab,
+                            device='cuda',
+                        ),
+                    )
+                )
+                torch.testing.assert_close(
+                    loaded[state_key], expected.narrow(0, row_start, local_rows)
+                )
     finally:
         Utils.destroy_model_parallel()
 

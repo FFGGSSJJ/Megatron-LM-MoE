@@ -175,6 +175,9 @@ def _build_md_gain_factory(
                     data[expert_idx],
                     template.key,
                     retained_leaf_axes,
+                    allow_shape_mismatch=(
+                        template.allow_shape_mismatch and gain_kind == "row"
+                    ),
                 )
                 for expert_idx, template in enumerate(template_shards)
             ]
@@ -194,6 +197,7 @@ def _build_md_gain_factory(
                         data.narrow(0, row_offset, row_count),
                         template.key,
                         (0,),
+                        allow_shape_mismatch=template.allow_shape_mismatch,
                     )
                 )
                 row_offset += row_count
@@ -880,6 +884,7 @@ class MDDecoupling(_MDDecouplingBase):
             optim_param,
             key,
             retained_axes,
+            allow_shape_mismatch=(model_param.allow_shape_mismatch and gain_kind == "row"),
         )
 
     def _phi(self, g: torch.Tensor) -> torch.Tensor:
