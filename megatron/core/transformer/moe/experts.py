@@ -24,16 +24,18 @@ from megatron.core.activations import (
     XPR,
     XR2,
     XR2GLU,
-    XSSSGLU,
+    XSSGLU,
     squared_relu,
     rlglu_act,
+    sssglu_act,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_rlglu import weighted_bias_rlglu_impl
-from megatron.core.fusions.fused_bias_sssglu import ssslu, weighted_bias_sssglu_impl
+from megatron.core.fusions.fused_bias_ssglu import sslu, weighted_bias_ssglu_impl
+from megatron.core.fusions.fused_bias_sssglu import weighted_bias_sssglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -288,8 +290,8 @@ class TEGroupedMLP(MegatronModule):
             self.gxr2_glu = GXR2(num_local_experts=self.num_local_experts, config=self.config)
         if self.config.xr2glu:
             self.xr2glu = XR2GLU(num_local_experts=self.num_local_experts, config=self.config)
-        if self.config.xsssglu:
-            self.xsssglu_glu = XSSSGLU(
+        if self.config.xssglu:
+            self.xssglu_glu = XSSGLU(
                 num_local_experts=self.num_local_experts, config=self.config
             )
         if self.config.polynorm:
@@ -399,7 +401,7 @@ class TEGroupedMLP(MegatronModule):
         ``tokens_per_expert`` (the per-local-expert token counts of ``intermediate_parallel``)
         is only used when one of the learnable per-expert activations (``config.pnglu``,
         ``config.pn3glu``, ``config.xpr``, ``config.gxpr``, ``config.gxpry``, ``config.gxprv2``,
-        ``config.xr2``, ``config.gxr2``, ``config.xr2glu``, ``config.xsssglu``,
+        ``config.xr2``, ``config.gxr2``, ``config.xr2glu``, ``config.xssglu``,
         ``config.polynorm``) is set, to map
         each expert's coefficients onto its tokens.
         """
@@ -420,9 +422,9 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,
                     self.config.activation_func_fp8_input_store,
                 )
-            elif self.activation_func == ssslu and self.config.gated_linear_unit:
+            elif self.activation_func == sslu and self.config.gated_linear_unit:
                 # dtype is handled inside the fused kernel
-                intermediate_parallel = weighted_bias_sssglu_impl(
+                intermediate_parallel = weighted_bias_ssglu_impl(
                     intermediate_parallel,
                     bias_parallel,
                     permuted_probs,
@@ -431,6 +433,14 @@ class TEGroupedMLP(MegatronModule):
             elif self.activation_func == rlglu_act and self.config.gated_linear_unit:
                 # dtype is handled inside the fused kernel
                 intermediate_parallel = weighted_bias_rlglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                )
+            elif self.activation_func == sssglu_act and self.config.gated_linear_unit:
+                # dtype is handled inside the fused kernel
+                intermediate_parallel = weighted_bias_sssglu_impl(
                     intermediate_parallel,
                     bias_parallel,
                     permuted_probs,
@@ -447,7 +457,8 @@ class TEGroupedMLP(MegatronModule):
                 )
             else:
                 raise ValueError(
-                    "Only support fusion of swiglu, sssglu, rlglu and quick_gelu in TEGroupedMLP."
+                    "Only support fusion of swiglu, ssglu, rlglu, sssglu and quick_gelu in "
+                    "TEGroupedMLP."
                 )
         elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
             assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
@@ -524,14 +535,14 @@ class TEGroupedMLP(MegatronModule):
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
-            elif self.config.gated_linear_unit and self.config.xsssglu:
+            elif self.config.gated_linear_unit and self.config.xssglu:
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)
                     x_linear = x_linear.clamp(min=-val, max=val)
                 if self.config.glu_linear_offset != 0.0:
                     x_linear = x_linear + self.config.glu_linear_offset
-                intermediate_parallel = self.xsssglu_glu(
+                intermediate_parallel = self.xssglu_glu(
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
@@ -602,7 +613,7 @@ class TEGroupedMLP(MegatronModule):
                 or self.config.xr2
                 or self.config.gxr2
                 or self.config.xr2glu
-                or self.config.xsssglu
+                or self.config.xssglu
                 or self.config.polynorm
             ):
                 # These all have the same per-expert-coefficient repeat_interleave gradient
@@ -690,9 +701,9 @@ class TEGroupedMLP(MegatronModule):
             module_sharded_offsets = sharded_offsets
             if name in (
                 'polynorm_glu', 'xpr_act', 'gxpr_glu', 'gxpry_glu', 'gxprv2_glu', 'xr2_act',
-                'gxr2_glu', 'xr2glu', 'xsssglu_glu', 'polynorm_act',
+                'gxr2_glu', 'xr2glu', 'xssglu_glu', 'polynorm_act',
             ) and not singleton_local_shards:
-                # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/XSSSGLU/PolyNormAct coefficients are stored as a single
+                # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/XSSGLU/PolyNormAct coefficients are stored as a single
                 # (num_local_experts,) tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
                 # occupy the [ep_rank * num_local_experts : ...] slice of the global tensor,
                 # mirroring how the expert weights are mapped to global experts. Without this,

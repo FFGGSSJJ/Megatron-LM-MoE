@@ -12,11 +12,11 @@ from megatron.core.utils import nvtx_decorator
 # RLGLU is a gated linear unit whose gate is the "relu minus log" function
 #   gate(x)  = relu(x) - 0.5 * ln(1 + |x|)                       (== rlglu_act in activations.py)
 #   RLGLU(y_1, y_2) = gate(y_1) * y_2
-# Unlike SwiGLU/SSSGLU the gate is NOT of the form ``x * squash(x)`` -- it is the gate itself, so
+# Unlike SwiGLU/SSGLU the gate is NOT of the form ``x * squash(x)`` -- it is the gate itself, so
 # there is no separate SiLU-style helper. The key property that makes the fused backward cheap:
 #   gate'(x) = 0.5 + 0.5 * x / (1 + |x|)   (softsign rescaled to (0, 1))
-# i.e. RLGLU's gate derivative is EXACTLY the SSSGLU gate. So the backward reuses that expression.
-# Built exactly like the SwiGLU/SSSGLU fusions (fused_bias_swiglu.py / fused_bias_sssglu.py):
+# i.e. RLGLU's gate derivative is EXACTLY the SSGLU gate. So the backward reuses that expression.
+# Built exactly like the SwiGLU/SSGLU fusions (fused_bias_swiglu.py / fused_bias_ssglu.py):
 # @jit_fuser forward/backward pairs wrapped in torch.autograd.Function, since the gate has no
 # cross-feature reduction. The gate math is inlined here (rather than importing rlglu_act) to keep
 # the jit_fuser scripting self-contained; it must stay in sync with rlglu_act in activations.py.
@@ -69,7 +69,7 @@ def weighted_rlglu(y, weights):
 def rlglu_back(g, y):
     """Computes the gradient for the RLGLU activation function.
 
-    With gate(x) = relu(x) - 0.5 * ln(1 + |x|), the gate derivative is the SSSGLU gate:
+    With gate(x) = relu(x) - 0.5 * ln(1 + |x|), the gate derivative is the SSGLU gate:
         gate'(x) = 0.5 + 0.5 * x / (1 + |x|)   (softsign rescaled to (0, 1)).
     So d/dy1 [gate(y1) * y2] = gate'(y1) * y2 and d/dy2 [gate(y1) * y2] = gate(y1).
 

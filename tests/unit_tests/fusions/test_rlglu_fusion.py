@@ -1,9 +1,9 @@
 """Tests for the fused RLGLU kernels (``fused_bias_rlglu.py``).
 
 RLGLU is a gated linear unit whose gate is ``f(x) = relu(x) - 0.5 * ln(1 + |x|)``. The fusion is
-built like SwiGLU/SSSGLU (``@jit_fuser`` forward plus hand-derived analytic backward wrapped in
-torch.autograd.Function), so the tests mirror ``test_sssglu_fusion.py``. The defining property
-exploited by the fused backward -- ``f'(x)`` equals the SSSGLU gate ``0.5 * (1 + softsign(x))``
+built like SwiGLU/SSGLU (``@jit_fuser`` forward plus hand-derived analytic backward wrapped in
+torch.autograd.Function), so the tests mirror ``test_ssglu_fusion.py``. The defining property
+exploited by the fused backward -- ``f'(x)`` equals the SSGLU gate ``0.5 * (1 + softsign(x))``
 (softsign rescaled to (0, 1)) -- gets its own explicit check. CUDA-gated like the other fusion
 tests; run on the cluster GPU.
 """
@@ -32,14 +32,14 @@ def _ref(x, bias=None):
     return _gate(y_1) * y_2
 
 
-def test_rlglu_gate_derivative_is_sssglu_gate():
-    """f'(x) == softsign rescaled to (0, 1) == the SSSGLU gate -- the key backward-reuse property."""
+def test_rlglu_gate_derivative_is_ssglu_gate():
+    """f'(x) == softsign rescaled to (0, 1) == the SSGLU gate -- the key backward-reuse property."""
     x = torch.randn(4096, dtype=torch.float64, device="cuda", requires_grad=True)
     _gate(x).sum().backward()
-    sssglu_gate = 0.5 * (1 + F.softsign(x))
-    assert torch.allclose(x.grad, sssglu_gate, rtol=1e-10, atol=1e-10)
+    ssglu_gate = 0.5 * (1 + F.softsign(x))
+    assert torch.allclose(x.grad, ssglu_gate, rtol=1e-10, atol=1e-10)
     # gate derivative is softsign rescaled to (0, 1)
-    assert sssglu_gate.min() > 0 and sssglu_gate.max() < 1
+    assert ssglu_gate.min() > 0 and ssglu_gate.max() < 1
 
 
 def test_rlglu_matches_gate_definition():

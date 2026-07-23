@@ -50,20 +50,24 @@ from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
     swiglu_backward,
 )
-from megatron.core.transformer.moe.sssglu_jit import (
-    sssglu_forward,
-    sssglu_backward,
+from megatron.core.transformer.moe.ssglu_jit import (
+    ssglu_forward,
+    ssglu_backward,
 )
 from megatron.core.transformer.moe.rlglu_jit import (
     rlglu_forward,
     rlglu_backward,
 )
+from megatron.core.transformer.moe.sssglu_jit import (
+    sssglu_forward,
+    sssglu_backward,
+)
 from megatron.core.fusions.fused_polynorm_glu import (
     fused_polynorm_glu_forward,
     fused_polynorm_glu_backward,
 )
-from megatron.core.fusions.fused_bias_sssglu import ssslu
-from megatron.core.activations import rlglu_act
+from megatron.core.fusions.fused_bias_ssglu import sslu
+from megatron.core.activations import rlglu_act, sssglu_act
 
 @dataclass(frozen=True)
 class OffloadingFP8Config:
@@ -82,12 +86,15 @@ class OffloadingFP8Config:
     moe_ffn_hidden_size: int
     gated_linear_unit: bool
     gated_polynorm_linear_unit: bool
-    # SSSGLU: GLU with the SiLU gate replaced by scaled softsign (activation_func == ssslu);
-    # routed through its own Triton kernels in sssglu_jit.py (sibling of swiglu_jit.py).
-    gated_sssglu_linear_unit: bool = False
+    # SSGLU: GLU with the SiLU gate replaced by scaled softsign (activation_func == sslu);
+    # routed through its own Triton kernels in ssglu_jit.py (sibling of swiglu_jit.py).
+    gated_ssglu_linear_unit: bool = False
     # RLGLU: GLU with gate relu(a)-0.5*ln(1+|a|) (activation_func == rlglu_act); routed through
-    # its own Triton kernels in rlglu_jit.py (sibling of sssglu_jit.py).
+    # its own Triton kernels in rlglu_jit.py (sibling of ssglu_jit.py).
     gated_rlglu_linear_unit: bool = False
+    # SSSGLU: GLU with gate softsign(a-1)+0.5 (activation_func == sssglu_act); routed through
+    # its own Triton kernels in sssglu_jit.py (sibling of ssglu_jit.py).
+    gated_sssglu_linear_unit: bool = False
     polynorm_eps: float = 1e-6
     fc1_out_size: int = 0
 
@@ -130,8 +137,9 @@ class OffloadingFP8Config:
             moe_ffn_hidden_size=config.moe_ffn_hidden_size,
             gated_linear_unit=config.gated_linear_unit,
             gated_polynorm_linear_unit=config.pnglu,
-            gated_sssglu_linear_unit=(config.activation_func == ssslu),
+            gated_ssglu_linear_unit=(config.activation_func == sslu),
             gated_rlglu_linear_unit=(config.activation_func == rlglu_act),
+            gated_sssglu_linear_unit=(config.activation_func == sssglu_act),
             polynorm_eps=getattr(config, "polynorm_eps", 1e-6),
             moe_offloading_chunk_size=config.moe_offloading_chunk_size,
             moe_offloading_num_chunks=config.moe_offloading_num_chunks,
@@ -601,6 +609,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w1, gpu_w1_buffers, stream_manager, fp8_parameter_manager, config)
 
         # fc1 chunk-level interleaving computation
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -614,7 +623,6 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fc1_output_chunk = fc1_output_per_chunk[chunk_idx]
 
             # wait for the current chunk of weights to be ready on GPU
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             m_grouped_fp8_gemm_nt_contiguous(
                 tokens_per_expert_chunks_psum[chunk_idx],
@@ -624,11 +632,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 compute_stream=stream_manager.compute_streams[0],
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
 
+        stream_manager.launch_streams_wait_compute_streams()
         return fc1_output
 
     @classmethod
@@ -661,10 +669,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 config.polynorm_eps,
                 permuted_probs.unsqueeze(-1),
             )
-        elif config.gated_sssglu_linear_unit:
-            s = sssglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
+        elif config.gated_ssglu_linear_unit:
+            s = ssglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
         elif config.gated_rlglu_linear_unit:
             s = rlglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
+        elif config.gated_sssglu_linear_unit:
+            s = sssglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
         else:
             s = swiglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
 
@@ -683,6 +693,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fc2_output = torch.empty_like(permuted_local_hidden_states[0], dtype=torch.bfloat16)
         fc2_output_per_chunk = list(torch.split(fc2_output, total_token_num_per_chunk))
 
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -695,7 +706,6 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             s_chunk_scales = fp8_s_per_chunk[1][chunk_idx]
             fc2_output_chunk = fc2_output_per_chunk[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             m_grouped_fp8_gemm_nt_contiguous(
                 tokens_per_expert_chunks_psum[chunk_idx],
@@ -705,11 +715,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 compute_stream=stream_manager.compute_streams[0],
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
-        
+
+        stream_manager.launch_streams_wait_compute_streams()
         return fc2_output, fp8_s, inv if config.gated_polynorm_linear_unit else None
 
 
@@ -749,6 +759,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config, True)
 
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -765,7 +776,6 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_grad_y_chunk = fp8_grad_y_per_chunk[chunk_idx]
             fp8_grad_y_chunk_scales = fp8_grad_y_scales_per_chunk[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             m_grouped_fp8_gemm_nt_contiguous(
                 tokens_per_expert_chunks_psum[chunk_idx],
@@ -775,21 +785,24 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 compute_stream=stream_manager.compute_streams[0],
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
-        
+
+        stream_manager.launch_streams_wait_compute_streams()
         if config.gated_polynorm_linear_unit:
             grad_a, grad_a1, grad_a2, grad_probs = fused_polynorm_glu_backward(
                 grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
             return grad_a, grad_probs, grad_a1, grad_a2
-        elif config.gated_sssglu_linear_unit:
-            grad_a, grad_probs = sssglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+        elif config.gated_ssglu_linear_unit:
+            grad_a, grad_probs = ssglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
             return grad_a, grad_probs, None, None
         elif config.gated_rlglu_linear_unit:
             grad_a, grad_probs = rlglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+            return grad_a, grad_probs, None, None
+        elif config.gated_sssglu_linear_unit:
+            grad_a, grad_probs = sssglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
             return grad_a, grad_probs, None, None
         else:
             grad_a, grad_probs = swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
@@ -823,7 +836,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w1, gpu_w1_buffers, stream_manager, fp8_parameter_manager, config, True)
-        
+
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):            
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -839,7 +853,6 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_grad_a_chunk = fp8_grad_a_per_chunk[chunk_idx]
             fp8_grad_a_chunk_scales = fp8_grad_a_scales_per_chunk[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             m_grouped_fp8_gemm_nt_contiguous(
                 tokens_per_expert_chunks_psum[chunk_idx],
@@ -849,11 +862,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 compute_stream=stream_manager.compute_streams[0],
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
 
+        stream_manager.launch_streams_wait_compute_streams()
         return grad_x
 
     @staticmethod
@@ -897,10 +910,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             s, _ = fused_polynorm_glu_forward(
                 a, a1, a2, config.polynorm_eps, permuted_probs.unsqueeze(-1)
             )
-        elif config.gated_sssglu_linear_unit:
-            s = sssglu_forward(a, permuted_probs.unsqueeze(-1))
+        elif config.gated_ssglu_linear_unit:
+            s = ssglu_forward(a, permuted_probs.unsqueeze(-1))
         elif config.gated_rlglu_linear_unit:
             s = rlglu_forward(a, permuted_probs.unsqueeze(-1))
+        elif config.gated_sssglu_linear_unit:
+            s = sssglu_forward(a, permuted_probs.unsqueeze(-1))
         else:
             s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
         fp8_s = guarded_per_channel_cast_to_fp8_pack_kmajor(

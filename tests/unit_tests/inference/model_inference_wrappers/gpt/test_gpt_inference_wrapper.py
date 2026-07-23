@@ -8,10 +8,13 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -120,3 +123,55 @@ class TestGPTInferenceWrapper:
             logits_seq_len,
             self.vocab_size,
         ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
+
+    @torch.inference_mode()
+    def test_dummy_forward_with_absorbed_mla_without_inference_context(self):
+        """The eager EP dummy path must work after MLA deletes its fused KV up projection."""
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+        vocab_size = 100
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            cache_mla_latents=True,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        model = (
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                    multi_latent_attention=True, qk_layernorm=True
+                ),
+                vocab_size=vocab_size,
+                max_sequence_length=8,
+                parallel_output=True,
+            )
+            .cuda()
+            .bfloat16()
+            .eval()
+        )
+        wrapper = GPTInferenceWrapper(model, StaticInferenceContext(1, 8))
+        attention = model.decoder.layers[0].self_attention
+
+        assert hasattr(attention, "linear_kv_up_proj")
+        first_logits = wrapper.dummy_forward()
+        assert not hasattr(attention, "linear_kv_up_proj")
+        assert hasattr(attention, "linear_kv_up_proj_linear")
+
+        # Exercise the already-absorbed state a second time; this is the state used
+        # by dummy forwards after the first real inference step.
+        second_logits = wrapper.dummy_forward()
+
+        for logits in (first_logits, second_logits):
+            assert logits.shape == (1, 1, vocab_size)
+            assert torch.isfinite(logits).all()

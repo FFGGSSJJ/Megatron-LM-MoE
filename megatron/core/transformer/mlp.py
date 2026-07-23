@@ -33,17 +33,22 @@ from megatron.core.activations import (
     XPR,
     XR2,
     XR2GLU,
-    XSSSGLU,
+    XSSGLU,
     rlglu_act,
+    sssglu_act,
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_rlglu import (
     bias_rlglu_impl,
     weighted_bias_rlglu_impl,
 )
+from megatron.core.fusions.fused_bias_ssglu import (
+    bias_ssglu_impl,
+    sslu,
+    weighted_bias_ssglu_impl,
+)
 from megatron.core.fusions.fused_bias_sssglu import (
     bias_sssglu_impl,
-    ssslu,
     weighted_bias_sssglu_impl,
 )
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
@@ -280,8 +285,8 @@ class MLP(MegatronModule):
             self.gxr2_glu = GXR2(num_local_experts=1, config=self.config)
         if self.config.xr2glu:
             self.xr2glu = XR2GLU(num_local_experts=1, config=self.config)
-        if self.config.xsssglu:
-            self.xsssglu_glu = XSSSGLU(num_local_experts=1, config=self.config)
+        if self.config.xssglu:
+            self.xssglu_glu = XSSGLU(num_local_experts=1, config=self.config)
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
@@ -330,9 +335,9 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
-                elif self.activation_func == ssslu and self.config.gated_linear_unit:
+                elif self.activation_func == sslu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
-                    intermediate_parallel = weighted_bias_sssglu_impl(
+                    intermediate_parallel = weighted_bias_ssglu_impl(
                         intermediate_parallel,
                         bias_parallel,
                         per_token_scale.unsqueeze(-1),
@@ -341,6 +346,14 @@ class MLP(MegatronModule):
                 elif self.activation_func == rlglu_act and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
                     intermediate_parallel = weighted_bias_rlglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
+                elif self.activation_func == sssglu_act and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_sssglu_impl(
                         intermediate_parallel,
                         bias_parallel,
                         per_token_scale.unsqueeze(-1),
@@ -357,7 +370,7 @@ class MLP(MegatronModule):
                     )
                 else:
                     raise ValueError(
-                        "Only support fusion of swiglu, sssglu, rlglu and quick_gelu with "
+                        "Only support fusion of swiglu, ssglu, rlglu, sssglu and quick_gelu with "
                         "per_token_scale in MLP."
                     )
             else:
@@ -378,8 +391,8 @@ class MLP(MegatronModule):
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
                     )
-                elif self.activation_func == ssslu and self.config.gated_linear_unit:
-                    intermediate_parallel = bias_sssglu_impl(
+                elif self.activation_func == sslu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_ssglu_impl(
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
@@ -396,8 +409,17 @@ class MLP(MegatronModule):
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
                     )
+                elif self.activation_func == sssglu_act and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_sssglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
                 else:
-                    raise ValueError("Only support fusion of gelu, swiglu, sssglu and rlglu")
+                    raise ValueError("Only support fusion of gelu, swiglu, ssglu, rlglu and sssglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -464,7 +486,7 @@ class MLP(MegatronModule):
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.xr2glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
-            elif self.config.gated_linear_unit and self.config.xsssglu:
+            elif self.config.gated_linear_unit and self.config.xssglu:
                 x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if (val := self.config.activation_func_clamp_value) is not None:
                     x_glu = x_glu.clamp(min=None, max=val)
@@ -472,7 +494,7 @@ class MLP(MegatronModule):
                 if self.config.glu_linear_offset != 0.0:
                     x_linear = x_linear + self.config.glu_linear_offset
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
-                intermediate_parallel = self.xsssglu_glu(x_glu, x_linear, scores=scores)
+                intermediate_parallel = self.xssglu_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit:
 
