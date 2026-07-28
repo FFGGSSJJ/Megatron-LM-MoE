@@ -373,7 +373,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         bias = dt_bias_local_cp.view(1, 1, *dt_bias_local_cp.shape)
         return -decay_scale * F.softplus(alpha.float() + bias)
 
-    def forward(
+    def _in_proj_to_attn_inputs(
         self,
         hidden_states: torch.Tensor,
         batch: int,
