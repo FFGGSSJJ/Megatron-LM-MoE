@@ -22,7 +22,9 @@
 import inspect
 import logging
 import math
+import os
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
@@ -42,7 +44,15 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
     GatedDeltaNetSubmodules,
+    causal_conv1d,
+    get_parameter_local_cp,
+    nvtx_range_pop,
+    nvtx_range_push,
+    tensor_a2a_cp2hp,
+    tensor_a2a_hp2cp,
 )
+from megatron.core.utils import deprecate_inference_params
+from megatron.core import tensor_parallel
 
 try:
     from fla.ops.kda import chunk_kda
@@ -295,6 +305,13 @@ class KimiDeltaAttention(GatedDeltaNet):
                 self.config.sequence_parallel,
             )
 
+        self.recompute_qkv = (
+            self.config.recompute_granularity == 'selective'
+            and "qkv" in self.config.recompute_modules
+        )
+        self.qkv_checkpoint = None
+
+
     def _reset_kda_decay_params(self, A_init_range: Tuple[float, float]) -> None:
         if not self.config.perform_initialization:
             return
@@ -322,39 +339,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             beta = beta * 2.0
         return beta
 
-    def forward(
+    def _in_proj_to_attn_inputs(
         self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        inference_context=None,
-        packed_seq_params=None,
-        sequence_len_offset=None,
-        *,
-        inference_params=None,
-        **kwargs,
+        hidden_states: torch.Tensor,
+        batch: int,
+        seq_len: int,
     ):
-        """KDA forward. Mirrors GDN.forward, but the alpha slot is wider
-        (num_v_heads * key_head_dim vs num_v_heads). KDA has no DeltaProduct
-        variant, so n_hh is forced to 1 and erase logic is skipped.
-        """
-        import os
-        from megatron.core.ssm.gated_delta_net import (
-            tensor_a2a_cp2hp, tensor_a2a_hp2cp, get_parameter_local_cp,
-            nvtx_range_push, nvtx_range_pop, causal_conv1d,
-        )
-        from megatron.core.utils import deprecate_inference_params
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
-
-        if inference_context is not None:
-            raise NotImplementedError("KDA does not support inference for now.")
-        if packed_seq_params is not None:
-            raise NotImplementedError("KDA does not support packed sequence for now.")
-        assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
-
         # Input projection
         nvtx_range_push(suffix="in_proj")
         projected, _ = self.in_proj(hidden_states)
@@ -464,6 +454,51 @@ class KimiDeltaAttention(GatedDeltaNet):
             qkv, gate, beta, alpha, batch, seq_len
         )
         nvtx_range_pop(suffix="prepare_qkv_for_kda")
+        return query, key, value, gate, beta, alpha
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        *,
+        inference_params=None,
+        **kwargs,
+    ):
+        """KDA forward. Mirrors GDN.forward, but the alpha slot is wider
+        (num_v_heads * key_head_dim vs num_v_heads). KDA has no DeltaProduct
+        variant, so n_hh is forced to 1 and erase logic is skipped.
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        seq_len, batch, _ = hidden_states.shape
+        seq_len = seq_len * self.sp_size * self.cp_size
+
+        if inference_context is not None:
+            raise NotImplementedError("KDA does not support inference for now.")
+        if packed_seq_params is not None:
+            raise NotImplementedError("KDA does not support packed sequence for now.")
+        assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
+
+        # 1. in_proj + conv1d + split
+        # 2. decay_out_proj (low-rank -> vector decay)
+        # 3. gate_out_proj (low-rank -> output gate)
+        if self.recompute_qkv and self.training and torch.is_grad_enabled():
+            self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                fp8=self.config.fp8 or self.config.fp4
+            )
+            # Only tensors may be passed as checkpoint args (they go through
+            # ctx.save_for_backward); bind the shape ints into the callable instead.
+            query, key, value, gate, beta, alpha = self.qkv_checkpoint.checkpoint(
+                partial(self._in_proj_to_attn_inputs, batch=batch, seq_len=seq_len),
+                hidden_states,
+            )
+        else:
+            query, key, value, gate, beta, alpha = \
+                self._in_proj_to_attn_inputs(hidden_states, batch, seq_len)
 
         # FLA computes the vector decay from raw alpha, A_log, and dt_bias inside
         # chunk_kda. Newer FLA versions can also fuse beta.float().sigmoid().
@@ -565,6 +600,13 @@ class KimiDeltaAttention(GatedDeltaNet):
         nvtx_range_push(suffix="gated_norm")
         norm_out = self._apply_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
+
+        # checkpointing for recomputation
+        if self.qkv_checkpoint is not None:
+            self.qkv_checkpoint.discard_output_and_register_recompute(
+                norm_out
+            )
+            self.qkv_checkpoint = None
 
         # Transpose back to sbhd, CP a2a HP→CP, output projection.
         norm_out = norm_out.reshape(batch, seq_len, -1)
