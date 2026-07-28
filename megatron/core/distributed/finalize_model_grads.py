@@ -635,8 +635,11 @@ def finalize_model_grads(
         pos_emb_group = pg_collection.pos_embd
         dp_cp_group = pg_collection.dp_cp
         if uses_histogram_qb:
-            assert hasattr(pg_collection, 'tp_dp_cp')
-            tp_dp_cp_group = pg_collection.tp_dp_cp
+            tp_dp_cp_group = getattr(pg_collection, 'tp_dp_cp', None)
+            if tp_dp_cp_group is None:
+                tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                    with_context_parallel=True
+                )
         else:
             tp_dp_cp_group = None
     else:
