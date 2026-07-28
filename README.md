@@ -45,13 +45,11 @@ The submodule pointer pinned in this repo deliberately lags what's checked out; 
 ## Muon-MD gain logging
 
 For `--optimizer md_decoupling`, pass `--log-muon-md-gains` to write effective gain
-statistics to TensorBoard and Weights & Biases at `--tensorboard-log-interval`. Metrics use
-`muon-md/gains/<family>/<axis>/<stat>`, where the axis is `row`, `col`, or `flat`; the
-statistics are `mean`, `rms`, `min`, and `max`. Families distinguish routers, embeddings,
-outputs, attention inputs/outputs, expert inputs/outputs, dense MLP inputs/outputs, and other
-matrices. Softplus gains are transformed before logging, so the values match the multipliers
-applied to model weights. Global aggregation counts each logical gain element once: TP-sharded
-gain vectors contribute all shards, while replicated TP/DP copies contribute from one owner rank.
+`mean`, `rms`, `min`, and `max` to TensorBoard and Weights & Biases at
+`--tensorboard-log-interval`. Metrics use `muon-md/gains/<family>/<row|col|flat>/<stat>` for
+routers, embeddings, outputs, attention, experts, dense MLPs, and other matrices. Values are
+transformed to the multipliers applied to weights, with TP shards combined and replicated TP/DP
+copies counted once.
 
 ## About
 

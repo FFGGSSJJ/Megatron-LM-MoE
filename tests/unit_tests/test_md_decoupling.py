@@ -80,33 +80,33 @@ def _record_md_split_output(param, grad, **md_kwargs):
 
 def test_md_gain_log_family_classifies_matrix_types():
     cases = [
-        ("decoder.layers.0.mlp.router.weight", {}, "router"),
-        ("embedding.word_embeddings.weight", {}, "embedding"),
-        ("output_layer.weight", {}, "output"),
-        ("decoder.layers.0.self_attention.linear_qkv.weight", {}, "attention-in"),
+        ("decoder.layers.0.mlp.router.weight", "is_router", "router"),
+        ("embedding.word_embeddings.weight", "is_md_embedding_parameter", "embedding"),
+        ("output_layer.weight", "is_md_output_parameter", "output"),
+        ("decoder.layers.0.self_attention.linear_qkv.weight", None, "attention-in"),
         (
             "decoder.layers.0.self_attention.linear_proj.weight",
-            {"is_out_proj": True},
+            "is_out_proj",
             "attention-out",
         ),
-        ("decoder.layers.0.mlp.experts.linear_fc1.weight", {}, "expert-in"),
+        ("decoder.layers.0.mlp.experts.linear_fc1.weight", None, "expert-in"),
         (
             "decoder.layers.0.mlp.experts.linear_fc2.weight",
-            {"is_out_proj": True},
+            "is_out_proj",
             "expert-out",
         ),
-        ("decoder.layers.0.mlp.linear_fc1.weight", {}, "dense-mlp-in"),
+        ("decoder.layers.0.mlp.linear_fc1.weight", None, "dense-mlp-in"),
         (
             "decoder.layers.0.mlp.linear_fc2.weight",
-            {"is_out_proj": True},
+            "is_out_proj",
             "dense-mlp-out",
         ),
-        ("some_unclassified_matrix.weight", {}, "other"),
+        ("some_unclassified_matrix.weight", None, "other"),
     ]
-    for name, attributes, expected in cases:
+    for name, attribute, expected in cases:
         param = torch.nn.Parameter(torch.ones(2, 2))
-        for attribute, value in attributes.items():
-            setattr(param, attribute, value)
+        if attribute:
+            setattr(param, attribute, True)
         assert _gain_log_family(name, param) == expected
 
 
@@ -157,25 +157,25 @@ def test_md_gain_stats_tp_and_dp_ownership(monkeypatch):
         )
     )
 
-    dim0_shard = torch.nn.Parameter(torch.ones(3, 4))
-    dim0_shard.partition_dim = 0
-    assert md_module._include_gain_in_global_stats(optimizer, dim0_shard, "row", False)
-    assert not md_module._include_gain_in_global_stats(optimizer, dim0_shard, "col", False)
-    assert not md_module._include_gain_in_global_stats(optimizer, dim0_shard, "flat", False)
-
-    dim1_shard = torch.nn.Parameter(torch.ones(3, 4))
-    dim1_shard.partition_dim = 1
-    assert not md_module._include_gain_in_global_stats(optimizer, dim1_shard, "row", False)
-    assert md_module._include_gain_in_global_stats(optimizer, dim1_shard, "col", False)
-
-    ranks[dp_group] = 1
-    assert not md_module._include_gain_in_global_stats(optimizer, dim0_shard, "row", False)
-    assert md_module._include_gain_in_global_stats(optimizer, dim0_shard, "row", True)
-
-    expert = torch.nn.Parameter(torch.ones(3, 4))
-    expert.expert_tp = True
-    ranks[expert_dp_group] = 1
-    assert not md_module._include_gain_in_global_stats(optimizer, expert, "flat", False)
+    cases = [
+        (0, "row", 1, 0, False, False, True),
+        (0, "col", 1, 0, False, False, False),
+        (0, "flat", 1, 0, False, False, False),
+        (1, "row", 1, 0, False, False, False),
+        (1, "col", 1, 0, False, False, True),
+        (0, "row", 0, 1, False, False, False),
+        (0, "row", 0, 1, True, False, True),
+        (None, "flat", 0, 1, False, True, False),
+    ]
+    for partition_dim, axis, tp_rank, dp_rank, sharded, expert, expected in cases:
+        ranks[expert_tp_group if expert else tp_group] = tp_rank
+        ranks[expert_dp_group if expert else dp_group] = dp_rank
+        param = torch.nn.Parameter(torch.ones(3, 4))
+        param.partition_dim = partition_dim
+        param.expert_tp = expert
+        assert (
+            md_module._include_gain_in_global_stats(optimizer, param, axis, sharded) is expected
+        )
 
 
 def _gqa_qkv_optimizer(param, **kwargs):

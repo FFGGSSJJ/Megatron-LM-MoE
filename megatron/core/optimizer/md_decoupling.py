@@ -96,26 +96,19 @@ def _normalize_embedding_mode(mode):
 
 def _gain_log_family(name: str, param: torch.Tensor) -> str:
     """Assign a stable, low-cardinality logging family while the parameter name is available."""
-    if getattr(param, "is_router", False) or name.endswith("router.weight"):
+    if getattr(param, "is_router", False):
         return "router"
-    if getattr(param, "is_md_embedding_parameter", False) or name.endswith(
-        "word_embeddings.weight"
-    ):
+    if getattr(param, "is_md_embedding_parameter", False):
         return "embedding"
-    if getattr(param, "is_md_output_parameter", False) or name.endswith("output_layer.weight"):
+    if getattr(param, "is_md_output_parameter", False):
         return "output"
 
     is_out = getattr(param, "is_out_proj", False)
     if "experts" in name:
         return "expert-out" if is_out else "expert-in"
-    if (
-        "self_attention" in name
-        or "cross_attention" in name
-        or ".attention." in name
-        or any(token in name for token in ("linear_qkv", "linear_q_", "linear_kv_"))
-    ):
+    if "attention" in name:
         return "attention-out" if is_out else "attention-in"
-    if ".mlp." in name or "linear_fc" in name:
+    if ".mlp." in name:
         return "dense-mlp-out" if is_out else "dense-mlp-in"
     return "other"
 
@@ -1326,86 +1319,70 @@ class MDDecoupling(_MDDecouplingBase):
 def collect_md_gain_stats(optimizer) -> Dict[str, float]:
     """Collect global effective-gain statistics from wrapped MDDecoupling optimizers."""
 
-    def iter_md_optimizers(wrapped):
-        if isinstance(wrapped, MDDecoupling):
-            yield wrapped
-            return
-        if hasattr(wrapped, "chained_optimizers"):
-            for child in wrapped.chained_optimizers:
-                yield from iter_md_optimizers(child)
-            return
-        inner = getattr(wrapped, "optimizer", None)
-        if inner is not None and inner is not wrapped:
-            yield from iter_md_optimizers(inner)
-
-    md_optimizers = list(iter_md_optimizers(optimizer))
+    wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
+    md_optimizers = [getattr(wrapped, "optimizer", wrapped) for wrapped in wrapped_optimizers]
+    md_optimizers = [wrapped for wrapped in md_optimizers if isinstance(wrapped, MDDecoupling)]
     dp_state_is_sharded = isinstance(optimizer, LayerWiseDistributedOptimizer)
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not md_optimizers and not distributed:
         return {}
 
     bucket_count = len(_GAIN_FAMILIES) * len(_GAIN_AXES)
-    device = None
-    for md_optimizer in md_optimizers:
-        for param, state in md_optimizer.state.items():
-            if any(key in state for key in ("row_gain", "col_gain", "flat_gain")):
-                device = param.device
-                break
-        if device is not None:
-            break
-    if device is None:
+    gain_params = (
+        param
+        for md_optimizer in md_optimizers
+        for param, state in md_optimizer.state.items()
+        if any(f"{axis}_gain" in state for axis in _GAIN_AXES)
+    )
+    gain_param = next(gain_params, None)
+    if gain_param is None:
         device = (
             torch.device("cuda", torch.cuda.current_device())
             if torch.cuda.is_available()
             else torch.device("cpu")
         )
+    else:
+        device = gain_param.device
 
-    sums = torch.zeros(bucket_count, dtype=torch.float64, device=device)
-    sum_squares = torch.zeros_like(sums)
-    counts = torch.zeros_like(sums)
-    minima = torch.full_like(sums, float("inf"))
-    maxima = torch.full_like(sums, float("-inf"))
+    totals = torch.zeros((bucket_count, 3), dtype=torch.float64, device=device)
+    minima = torch.full((bucket_count,), float("inf"), dtype=torch.float64, device=device)
+    maxima = torch.full_like(minima, float("-inf"))
 
     family_indices = {name: index for index, name in enumerate(_GAIN_FAMILIES)}
-    axis_indices = {name: index for index, name in enumerate(_GAIN_AXES)}
     for md_optimizer in md_optimizers:
         for param, state in md_optimizer.state.items():
             family = getattr(param, "md_gain_log_family", "other")
             family_index = family_indices.get(family, family_indices["other"])
-            for axis in _GAIN_AXES:
+            for axis_index, axis in enumerate(_GAIN_AXES):
                 raw_gain = state.get(f"{axis}_gain")
                 if raw_gain is None or not _include_gain_in_global_stats(
                     md_optimizer, param, axis, dp_state_is_sharded
                 ):
                     continue
                 effective_gain = md_optimizer._phi(raw_gain).to(dtype=torch.float64)
-                bucket = family_index * len(_GAIN_AXES) + axis_indices[axis]
-                sums[bucket].add_(effective_gain.sum())
-                sum_squares[bucket].add_(effective_gain.square().sum())
-                counts[bucket].add_(effective_gain.numel())
+                bucket = family_index * len(_GAIN_AXES) + axis_index
+                totals[bucket, 0].add_(effective_gain.sum())
+                totals[bucket, 1].add_(effective_gain.square().sum())
+                totals[bucket, 2].add_(effective_gain.numel())
                 minima[bucket].copy_(torch.minimum(minima[bucket], effective_gain.min()))
                 maxima[bucket].copy_(torch.maximum(maxima[bucket], effective_gain.max()))
 
     if distributed:
-        torch.distributed.all_reduce(sums)
-        torch.distributed.all_reduce(sum_squares)
-        torch.distributed.all_reduce(counts)
+        torch.distributed.all_reduce(totals)
         torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
         torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
 
-    sums, sum_squares, counts, minima, maxima = (
-        tensor.cpu() for tensor in (sums, sum_squares, counts, minima, maxima)
-    )
+    totals, minima, maxima = (tensor.cpu() for tensor in (totals, minima, maxima))
     stats = {}
     for family_index, family in enumerate(_GAIN_FAMILIES):
         for axis_index, axis in enumerate(_GAIN_AXES):
             bucket = family_index * len(_GAIN_AXES) + axis_index
-            count = counts[bucket].item()
+            total, sum_square, count = totals[bucket].tolist()
             if count == 0:
                 continue
             prefix = f"muon-md/gains/{family}/{axis}"
-            stats[f"{prefix}/mean"] = sums[bucket].item() / count
-            stats[f"{prefix}/rms"] = math.sqrt(sum_squares[bucket].item() / count)
+            stats[f"{prefix}/mean"] = total / count
+            stats[f"{prefix}/rms"] = math.sqrt(sum_square / count)
             stats[f"{prefix}/min"] = minima[bucket].item()
             stats[f"{prefix}/max"] = maxima[bucket].item()
     return stats
