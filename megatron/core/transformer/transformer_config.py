@@ -895,8 +895,17 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_quantile_balancing_ema: float = 0.0
     """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
     `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
-    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
-    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+    updated as `qb_beta = ema * qb_beta + (1 - ema) * quantile_estimate`. The default 0.0 means
+    no memory: the bias is replaced by the latest global-batch estimate each step."""
+
+    moe_router_quantile_balancing_method: Literal['average', 'histogram'] = 'histogram'
+    """Quantile estimator used by quantile balancing. "average" is the legacy estimator that
+    averages independently computed microbatch/rank quantiles; this generally differs from the
+    pooled global-batch quantile. "histogram" accumulates fixed-size per-expert histograms over all
+    microbatches and approximates the true pooled quantile at the global-batch boundary."""
+
+    moe_router_quantile_balancing_num_bins: int = 1000
+    """Number of uniform bins per expert used by histogram quantile balancing."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1735,6 +1744,21 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "quantile_balancing can only be combined with seq_aux_loss"
                     )
+
+        if "quantile_balancing" in self.moe_router_load_balancing_type:
+            if self.moe_router_quantile_balancing_method not in {'average', 'histogram'}:
+                raise ValueError(
+                    "moe_router_quantile_balancing_method must be 'average' or 'histogram'"
+                )
+            if self.moe_router_quantile_balancing_num_bins <= 0:
+                raise ValueError("moe_router_quantile_balancing_num_bins must be positive")
+            if (
+                self.num_moe_experts is not None
+                and self.moe_router_topk >= self.num_moe_experts
+            ):
+                raise ValueError(
+                    "quantile_balancing requires moe_router_topk < num_moe_experts"
+                )
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:

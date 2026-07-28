@@ -25,6 +25,7 @@ from ..num_microbatches_calculator import get_num_microbatches
 from ..transformer.moe.moe_utils import (
     expert_load_violation_batchwise,
     get_updated_expert_bias,
+    recover_qb_beta_from_histogram,
     save_to_aux_losses_tracker,
 )
 from ..transformer.transformer_config import TransformerConfig
@@ -299,6 +300,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
             if getattr(module, 'qb_beta_accum', None) is not None:
                 module.qb_beta_accum.zero_()
                 module.qb_beta_count.zero_()
+            if getattr(module, 'qb_histogram', None) is not None:
+                module.qb_histogram.zero_()
 
 
 def _log_global_router_metrics(model: List[torch.nn.Module], config: TransformerConfig):
@@ -386,8 +389,48 @@ def _update_router_qb_beta(
     model: List[torch.nn.Module],
     config: TransformerConfig,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Update the quantile-balancing per-expert bias once per global batch."""
+    if config.moe_router_quantile_balancing_method == 'histogram':
+        assert tp_dp_cp_group is not None, (
+            "Histogram quantile balancing requires a TP+DP+CP process group."
+        )
+        qb_beta_list = []
+        qb_histogram_list = []
+        for model_chunk in model:
+            for module in get_attr_wrapped_model(model_chunk, 'modules')():
+                if getattr(module, 'qb_histogram', None) is not None and module.training:
+                    qb_beta_list.append(module.qb_beta)
+                    qb_histogram_list.append(module.qb_histogram)
+
+        if len(qb_beta_list) == 0:
+            return
+
+        stacked_beta = torch.stack(qb_beta_list, dim=0)
+        stacked_histogram = torch.stack(qb_histogram_list, dim=0)
+        torch.distributed.all_reduce(
+            stacked_histogram,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_dp_cp_group, # We need all the tokens from the global batch to estimate the quantile
+        )
+
+        estimated_beta = recover_qb_beta_from_histogram(
+            stacked_histogram, stacked_beta, config.moe_router_topk
+        )
+        ema = config.moe_router_quantile_balancing_ema
+        stacked_new_beta = ema * stacked_beta + (1.0 - ema) * estimated_beta
+
+        stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True) # mean center the new beta value
+
+        has_observations = stacked_histogram.sum(dim=(-1, -2)) > 0
+        stacked_new_beta = torch.where(
+            has_observations.unsqueeze(-1), stacked_new_beta, stacked_beta
+        )
+        for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
+            qb_beta.copy_(new_beta)
+        return
+
     qb_beta_list = []
     qb_beta_accum_list = []
     qb_beta_count_list = []
@@ -405,7 +448,7 @@ def _update_router_qb_beta(
     stacked_accum = torch.stack(qb_beta_accum_list, dim=0)
     stacked_count = torch.stack(qb_beta_count_list, dim=0)
 
-    # NOTE: quantile_balancing gathers router logits across TP/CP before accumulating beta,
+    # NOTE: average quantile_balancing gathers router scores across TP/CP before accumulating beta,
     # so TP/CP replicas already contribute sequence-wide beta estimates here. Revisit
     # this reduction if the TP/CP gather is removed or narrowed.
 
@@ -564,6 +607,10 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    uses_histogram_qb = (
+        "quantile_balancing" in config.moe_router_load_balancing_type
+        and config.moe_router_quantile_balancing_method == 'histogram'
+    )
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -587,12 +634,22 @@ def finalize_model_grads(
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
         dp_cp_group = pg_collection.dp_cp
+        if uses_histogram_qb:
+            assert hasattr(pg_collection, 'tp_dp_cp')
+            tp_dp_cp_group = pg_collection.tp_dp_cp
+        else:
+            tp_dp_cp_group = None
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        tp_dp_cp_group = (
+            parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+            if uses_histogram_qb
+            else None
+        )
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
@@ -637,7 +694,12 @@ def finalize_model_grads(
     _log_global_router_metrics(model, config)
 
     if "quantile_balancing" in config.moe_router_load_balancing_type:
-        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
+        _update_router_qb_beta(
+            model,
+            config,
+            dp_cp_group=dp_cp_group,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
 
     _log_router_bias_metrics(model, config)
 

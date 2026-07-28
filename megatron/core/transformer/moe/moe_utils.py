@@ -220,6 +220,103 @@ def qb_dual_update(
     return indices, beta_local
 
 
+def compute_qb_histogram(
+    scores: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    num_bins: int,
+) -> torch.Tensor:
+    """Histogram the per-token QB bias required by every expert.
+
+    Implements the histogram estimator from the Kimi K3 Technical Report:
+    https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf
+
+    ``beta`` is the threshold subtracted from ``scores`` by Megatron's QB
+    implementation, while the Kimi K3 derivation uses an additive bias. Thus
+    the required additive bias is ``r = alpha - scores`` and its bounded range
+    is ``[-beta.max() - 1, -beta.min() + 1]`` for scores in ``[0, 1]``.
+
+    Args:
+        scores: Router scores in ``[0, 1]``, shaped ``[num_tokens, num_experts]``.
+        alpha: Biased Top-(k+1) cutoff for each token, shaped ``[num_tokens]``.
+        beta: Current per-expert subtractive QB threshold, shaped ``[num_experts]``.
+        num_bins: Number of uniform histogram bins.
+
+    Returns:
+        Per-expert integer counts shaped ``[num_experts, num_bins]``.
+    """
+    assert scores.dim() == 2
+    assert alpha.dim() == 1 and alpha.shape[0] == scores.shape[0]
+    assert beta.dim() == 1 and beta.shape[0] == scores.shape[1]
+    assert num_bins > 0
+
+    num_experts = scores.shape[1]
+    # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
+    lower = -beta.max() - 1.0
+    upper = -beta.min() + 1.0
+    width = (upper - lower) / num_bins
+
+    # Offset each expert's bin IDs into a disjoint range so one bincount builds
+    # the complete 2D histogram without materializing an equally large tensor
+    # of integer ones for scatter_add.
+    r = alpha.unsqueeze(1) - scores
+    bin_indices = ((r - lower) / width).clamp_(
+        min=0, max=num_bins - 1
+    ) # upper bin index is part of the last bin, so clamp to num_bins - 1
+    bin_indices = bin_indices.to(torch.long)
+
+    expert_offsets = torch.arange(num_experts, device=scores.device) * num_bins
+    bin_indices.add_(expert_offsets)
+    return torch.bincount(
+        bin_indices.reshape(-1), minlength=num_experts * num_bins
+    ).reshape(num_experts, num_bins)
+
+
+def recover_qb_beta_from_histogram(
+    histogram: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Recover Megatron's subtractive QB threshold from pooled histogram counts.
+
+    Leading dimensions are supported so all MoE layers can be decoded together.
+    The first bin whose cumulative count reaches ``ceil(num_tokens * topk /
+    num_experts)`` is selected and the quantile is linearly interpolated inside
+    that bin. Empty histograms preserve the current beta.
+    """
+    assert histogram.dim() >= 2
+    assert beta.shape == histogram.shape[:-1]
+    assert histogram.shape[-2] > topk > 0
+
+    num_experts, num_bins = histogram.shape[-2:]
+    token_counts = histogram.sum(dim=-1)
+    target_rank = torch.div(
+        token_counts * topk + num_experts - 1, # round up to ceil(num_tokens * topk / num_experts)
+        num_experts,
+        rounding_mode='floor',
+    ) # This is the q variable in the Kimi K3 Technical Report.
+
+    cumulative = histogram.cumsum(dim=-1)
+    selected_bin = (cumulative >= target_rank.unsqueeze(-1)).to(torch.int64).argmax(dim=-1)
+    selected_count = histogram.gather(-1, selected_bin.unsqueeze(-1)).squeeze(-1)
+    cumulative_at_bin = cumulative.gather(-1, selected_bin.unsqueeze(-1)).squeeze(-1)
+    count_before = cumulative_at_bin - selected_count # This is the number of tokens that are in bins before the selected bin. seelcted_count is the number of tokens that are in the selected bin.
+    fraction = (
+        (target_rank - count_before).to(beta.dtype)
+        / selected_count.clamp_min(1).to(beta.dtype)
+    ).clamp_(0, 1)
+
+    # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
+    lower = -beta.max(dim=-1).values - 1.0
+    upper = -beta.min(dim=-1).values + 1.0
+    width = (upper - lower) / num_bins
+    required_additive_bias = lower.unsqueeze(-1) + (
+        selected_bin.to(beta.dtype) + fraction
+    ) * width.unsqueeze(-1)
+    estimated_beta = -required_additive_bias
+    return torch.where(token_counts > 0, estimated_beta, beta)
+
+
 def get_capacity(
     num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
 ) -> int:
