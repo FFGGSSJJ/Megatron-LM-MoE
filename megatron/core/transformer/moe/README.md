@@ -308,6 +308,13 @@ histograms before the bias is decoded, mean-centered, and applied to the next ba
 generally differs from the true pooled quantile. This implementation follows the
 [Kimi K3 Technical Report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf).
 
+Global-batch expert-load violation is always logged. Optional scopes selected with
+`--moe-router-violation-metrics` retain local expert counts and batch their communication at the
+global-batch boundary. By default, `mbs` logs `expert_*` after pooling each microbatch across TP+CP.
+`seq` logs `seq_expert_*` over the same TP+CP domain, and `ep` additionally pools each microbatch
+across EP before logging `ep_expert_*`. Violations are computed only after these count reductions,
+avoiding nonlinear averages of rank-local violation values.
+
 ### Token Dispatching
 
 After routing, tokens are **dispatched** to the GPU hosting the assigned expert. After expert computation, tokens are sent back and **combined** to restore the original sequence.
@@ -540,7 +547,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-quantile-balancing-method | QB estimator: average or histogram | histogram |
 | --moe-router-quantile-balancing-num-bins | Per-expert histogram bins for histogram QB | 1000 |
 | --moe-router-bias-metrics | Log router bias mean, standard deviation, minimum, and maximum | False |
-| --moe-router-ep-violation-metrics | Log expert-load violation over EP times MBS | False |
+| --moe-router-violation-metrics | Optional violation scopes: mbs, seq, ep; global is always logged | [mbs] |
 | --moe-router-fusion | Enable router fusion | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |

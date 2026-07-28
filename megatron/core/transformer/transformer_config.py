@@ -1020,9 +1020,12 @@ class TransformerConfig(ModelParallelConfig):
     """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
     aux-loss-free (DeepSeek-style) router biases."""
 
-    moe_router_ep_violation_metrics: bool = False
-    """Log per-microbatch expert-load violation metrics after aggregating token counts across
-    the expert-parallel group (an effective batch size of EP times MBS)."""
+    moe_router_violation_metrics: List[Literal['mbs', 'seq', 'ep']] = field(
+        default_factory=lambda: ['mbs']
+    )
+    """Optional expert-load violation scopes to log. Global-batch violation is always logged.
+    Defaults to "mbs", which pools each microbatch across TP/CP. "seq" measures each sequence
+    across TP/CP, and "ep" additionally pools each microbatch across EP."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
@@ -1671,6 +1674,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
+
+        valid_violation_metrics = {'mbs', 'seq', 'ep'}
+        invalid_violation_metrics = set(self.moe_router_violation_metrics) - valid_violation_metrics
+        if invalid_violation_metrics:
+            raise ValueError(
+                "moe_router_violation_metrics entries must be 'mbs', 'seq', or 'ep'; "
+                f"got {sorted(invalid_violation_metrics)}"
+            )
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size

@@ -302,6 +302,132 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_histogram', None) is not None:
                 module.qb_histogram.zero_()
+            if getattr(module, 'mbs_expert_load_samples', None):
+                module.mbs_expert_load_samples.clear()
+            if getattr(module, 'seq_expert_load_samples', None):
+                module.seq_expert_load_samples.clear()
+
+
+def _log_microbatch_router_metrics(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    dp_group: torch.distributed.ProcessGroup,
+):
+    """Reduce batched expert counts and log exact TP/CP-aware MBS and sequence metrics."""
+    enabled_metrics = set(config.moe_router_violation_metrics)
+    if not enabled_metrics:
+        return
+
+    # Repeated MTP routers contribute multiple logical depths to one tracker slot. Aggregate
+    # metrics remain correct, but per-layer attribution combines those depths.
+
+    collect_mbs = bool(enabled_metrics & {'mbs', 'ep'})
+    collect_seq = 'seq' in enabled_metrics
+    router_modules = []
+    microbatch_counts = []
+    mbs_sample_sizes = []
+    seq_sample_sizes = []
+    samples = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            mbs_samples = getattr(module, 'mbs_expert_load_samples', None)
+            seq_samples = getattr(module, 'seq_expert_load_samples', None)
+            if (collect_mbs and mbs_samples) or (collect_seq and seq_samples):
+                module_samples = []
+                router_modules.append(module)
+                microbatch_count = len(mbs_samples) if collect_mbs else len(seq_samples)
+                if collect_mbs and collect_seq:
+                    assert len(mbs_samples) == len(seq_samples)
+                microbatch_counts.append(microbatch_count)
+                if collect_mbs:
+                    stacked_mbs_samples = torch.stack(mbs_samples)
+                    mbs_sample_sizes.append(stacked_mbs_samples.shape[0])
+                    module_samples.append(stacked_mbs_samples)
+                else:
+                    mbs_sample_sizes.append(0)
+                if collect_seq:
+                    stacked_seq_samples = torch.cat(seq_samples)
+                    seq_sample_sizes.append(stacked_seq_samples.shape[0])
+                    module_samples.append(stacked_seq_samples)
+                else:
+                    seq_sample_sizes.append(0)
+                samples.append(
+                    torch.cat(module_samples) if len(module_samples) > 1 else module_samples[0]
+                )
+
+    if not samples:
+        return
+
+    stacked_samples = torch.cat(samples)
+    # Pool additive token counts before computing nonlinear violation metrics.
+    torch.distributed.all_reduce(
+        stacked_samples,
+        op=torch.distributed.ReduceOp.SUM,
+        group=router_modules[0].tp_cp_group,
+    )
+
+    num_layers = config.num_layers
+    if config.mtp_num_layers is not None:
+        num_layers += config.mtp_num_layers
+
+    def save_metrics(
+        prefix: str,
+        module: torch.nn.Module,
+        module_samples: torch.Tensor,
+        samples_per_microbatch: int = 1,
+    ):
+        tokens_per_expert = module_samples[:, :-1]
+        total_num_tokens = module_samples[:, -1:]
+        ideal_tokens_per_expert = total_num_tokens * module.topk / tokens_per_expert.shape[-1]
+        violation = torch.where(
+            ideal_tokens_per_expert > 0,
+            (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert,
+            torch.zeros_like(tokens_per_expert),
+        )
+
+        for name, values in (
+            (f"{prefix}_max_violation", violation.max(dim=-1).values),
+            (f"{prefix}_min_violation", violation.min(dim=-1).values),
+            (f"{prefix}_median_violation", violation.median(dim=-1).values),
+        ):
+            save_to_aux_losses_tracker(
+                name,
+                values.sum() / samples_per_microbatch,
+                module.layer_number,
+                num_layers,
+                avg_group=dp_group,
+            )
+
+    offset = 0
+    reduced_mbs_samples = []
+    for module, microbatch_count, mbs_sample_count, seq_sample_count in zip(
+        router_modules, microbatch_counts, mbs_sample_sizes, seq_sample_sizes
+    ):
+        module_mbs_samples = stacked_samples[offset : offset + mbs_sample_count]
+        offset += mbs_sample_count
+        module_seq_samples = stacked_samples[offset : offset + seq_sample_count]
+        offset += seq_sample_count
+
+        if 'mbs' in enabled_metrics:
+            save_metrics("expert", module, module_mbs_samples)
+        if 'ep' in enabled_metrics:
+            reduced_mbs_samples.append(module_mbs_samples)
+        if 'seq' in enabled_metrics:
+            assert seq_sample_count % microbatch_count == 0
+            save_metrics(
+                "seq_expert",
+                module,
+                module_seq_samples,
+                samples_per_microbatch=seq_sample_count // microbatch_count,
+            )
+
+    if 'ep' in enabled_metrics:
+        ep_samples = torch.cat(reduced_mbs_samples)
+        torch.distributed.all_reduce(ep_samples, group=router_modules[0].ep_group)
+        offset = 0
+        for module, sample_count in zip(router_modules, mbs_sample_sizes):
+            save_metrics("ep_expert", module, ep_samples[offset : offset + sample_count])
+            offset += sample_count
 
 
 def _log_global_router_metrics(model: List[torch.nn.Module], config: TransformerConfig):
@@ -634,6 +760,9 @@ def finalize_model_grads(
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
         dp_cp_group = pg_collection.dp_cp
+        dp_group = getattr(pg_collection, 'dp', None)
+        if dp_group is None:
+            dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
         if uses_histogram_qb:
             tp_dp_cp_group = getattr(pg_collection, 'tp_dp_cp', None)
             if tp_dp_cp_group is None:
@@ -648,6 +777,7 @@ def finalize_model_grads(
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
         tp_dp_cp_group = (
             parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
             if uses_histogram_qb
@@ -694,6 +824,7 @@ def finalize_model_grads(
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
 
+    _log_microbatch_router_metrics(model, config, dp_group)
     _log_global_router_metrics(model, config)
 
     if "quantile_balancing" in config.moe_router_load_balancing_type:

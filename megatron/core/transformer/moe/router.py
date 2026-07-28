@@ -15,7 +15,6 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
-    expert_load_violation_batchwise,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
     router_gating_linear,
@@ -27,17 +26,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-
-def _aggregate_expert_load_across_ep(
-    tokens_per_expert: torch.Tensor,
-    total_num_tokens: int,
-    ep_group: torch.distributed.ProcessGroup,
-):
-    """Aggregate expert and valid-token counts over the expert-parallel group."""
-    counts = torch.cat((tokens_per_expert, tokens_per_expert.new_tensor([total_num_tokens])))
-    torch.distributed.all_reduce(counts, group=ep_group)
-    return counts[:-1], counts[-1]
 
 
 class Router(ABC, MegatronModule):
@@ -193,6 +181,9 @@ class TopKRouter(Router):
             ),
             persistent=False,
         )
+        # Retain local counts until finalization so TP/CP communication is batched.
+        self.mbs_expert_load_samples = []
+        self.seq_expert_load_samples = []
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -861,64 +852,38 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        if self.training and torch.is_grad_enabled():
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and self.config.moe_router_violation_metrics
+        ):
             with torch.no_grad():
-                num_layers = self.config.num_layers
-                if self.config.mtp_num_layers is not None:
-                    num_layers += self.config.mtp_num_layers
-
-                expert_max_violation_routing_map = routing_map
-                total_num_tokens = routing_map.shape[0]
+                violation_metrics = self.config.moe_router_violation_metrics
+                expert_load_routing_map = routing_map.reshape(seq_length, bsz, -1)
                 if padding_mask is not None:
-                    expert_max_violation_routing_map = routing_map & (~padding_mask.unsqueeze(-1))
-                    total_num_tokens = (~padding_mask).sum().item()
-
-                tokens_per_expert = expert_max_violation_routing_map.sum(dim=0).float()
-                max_violation, min_violation, median_violation = expert_load_violation_batchwise(
-                    tokens_per_expert=tokens_per_expert,
-                    num_experts=self.config.num_moe_experts,
-                    total_num_tokens=total_num_tokens,
-                    topk=self.topk,
-                )
-                for name, value in (
-                    ("expert_max_violation", max_violation),
-                    ("expert_min_violation", min_violation),
-                    ("expert_median_violation", median_violation),
-                ):
-                    save_to_aux_losses_tracker(
-                        name,
-                        value,
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
+                    valid_tokens = ~padding_mask.reshape(seq_length, bsz)
+                    expert_load_routing_map = expert_load_routing_map & valid_tokens.unsqueeze(-1)
+                    seq_num_tokens = valid_tokens.sum(dim=0, dtype=torch.float32).unsqueeze(-1)
+                else:
+                    seq_num_tokens = torch.full(
+                        (bsz, 1),
+                        seq_length,
+                        dtype=torch.float32,
+                        device=routing_map.device,
                     )
 
-                if self.config.moe_router_ep_violation_metrics:
-                    ep_tokens_per_expert, ep_total_num_tokens = (
-                        _aggregate_expert_load_across_ep(
-                            tokens_per_expert, total_num_tokens, self.ep_group
-                        )
+                seq_tokens_per_expert = expert_load_routing_map.sum(dim=0, dtype=torch.float32)
+                if "seq" in violation_metrics:
+                    self.seq_expert_load_samples.append(
+                        torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1)
                     )
-                    ep_max_violation, ep_min_violation, ep_median_violation = (
-                        expert_load_violation_batchwise(
-                            tokens_per_expert=ep_tokens_per_expert,
-                            num_experts=self.config.num_moe_experts,
-                            total_num_tokens=ep_total_num_tokens,
-                            topk=self.topk,
-                        )
+
+                if "mbs" in violation_metrics or "ep" in violation_metrics:
+                    mbs_tokens_per_expert = seq_tokens_per_expert.sum(dim=0)
+                    mbs_num_tokens = seq_num_tokens.sum(dim=0)
+                    self.mbs_expert_load_samples.append(
+                        torch.cat((mbs_tokens_per_expert, mbs_num_tokens))
                     )
-                    for name, value in (
-                        ("ep_expert_max_violation", ep_max_violation),
-                        ("ep_expert_min_violation", ep_min_violation),
-                        ("ep_expert_median_violation", ep_median_violation),
-                    ):
-                        save_to_aux_losses_tracker(
-                            name,
-                            value,
-                            self.layer_number,
-                            num_layers,
-                            reduce_group=self.tp_cp_group,
-                        )
 
         return probs, routing_map
 
