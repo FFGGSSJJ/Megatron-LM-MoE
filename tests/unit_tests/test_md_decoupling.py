@@ -136,6 +136,48 @@ def test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis():
     assert not any("/other/" in metric_name for metric_name in stats)
 
 
+def test_md_gain_stats_tp_and_dp_ownership(monkeypatch):
+    tp_group = object()
+    dp_group = object()
+    expert_tp_group = object()
+    expert_dp_group = object()
+    ranks = {
+        tp_group: 1,
+        dp_group: 0,
+        expert_tp_group: 0,
+        expert_dp_group: 0,
+    }
+    monkeypatch.setattr(md_module, "get_pg_rank", lambda group: ranks[group])
+    optimizer = SimpleNamespace(
+        pg_collection=SimpleNamespace(
+            tp=tp_group,
+            dp_cp=dp_group,
+            expt_tp=expert_tp_group,
+            expt_dp=expert_dp_group,
+        )
+    )
+
+    dim0_shard = torch.nn.Parameter(torch.ones(3, 4))
+    dim0_shard.partition_dim = 0
+    assert md_module._include_gain_in_global_stats(optimizer, dim0_shard, "row", False)
+    assert not md_module._include_gain_in_global_stats(optimizer, dim0_shard, "col", False)
+    assert not md_module._include_gain_in_global_stats(optimizer, dim0_shard, "flat", False)
+
+    dim1_shard = torch.nn.Parameter(torch.ones(3, 4))
+    dim1_shard.partition_dim = 1
+    assert not md_module._include_gain_in_global_stats(optimizer, dim1_shard, "row", False)
+    assert md_module._include_gain_in_global_stats(optimizer, dim1_shard, "col", False)
+
+    ranks[dp_group] = 1
+    assert not md_module._include_gain_in_global_stats(optimizer, dim0_shard, "row", False)
+    assert md_module._include_gain_in_global_stats(optimizer, dim0_shard, "row", True)
+
+    expert = torch.nn.Parameter(torch.ones(3, 4))
+    expert.expert_tp = True
+    ranks[expert_dp_group] = 1
+    assert not md_module._include_gain_in_global_stats(optimizer, expert, "flat", False)
+
+
 def _gqa_qkv_optimizer(param, **kwargs):
     return MDDecoupling(
         params=[param],
@@ -1131,6 +1173,28 @@ class TestMDDecouplingMultiRankTP:
         Utils.initialize_model_parallel(tensor_model_parallel_size=min(world, 2))
         yield
         Utils.destroy_model_parallel()
+
+    def test_gain_stats_count_tp_shards_once_and_deduplicate_replicas(self):
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        param = torch.nn.Parameter(torch.ones(2, 3, device="cuda"))
+        param.partition_dim = 0
+        param.md_gain_log_family = "attention-in"
+        optimizer = MDDecoupling(
+            [param],
+            hypersphere_gains_mode="rowcol",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        optimizer.state[param]["row_gain"] = torch.tensor(
+            [1.0, 2.0] if tp_rank == 0 else [3.0, 4.0], device="cuda"
+        )
+        optimizer.state[param]["col_gain"] = torch.tensor([5.0, 7.0, 9.0], device="cuda")
+
+        stats = collect_md_gain_stats(SimpleNamespace(optimizer=optimizer))
+
+        assert stats["muon-md/gains/attention-in/row/mean"] == pytest.approx(2.5)
+        assert stats["muon-md/gains/attention-in/row/rms"] == pytest.approx(7.5**0.5)
+        assert stats["muon-md/gains/attention-in/col/mean"] == pytest.approx(7.0)
+        assert stats["muon-md/gains/attention-in/col/rms"] == pytest.approx((155.0 / 3.0) ** 0.5)
 
     def create_tp_model_and_optimizer(self, tp_mode):
         rank = int(os.getenv("RANK", "0"))

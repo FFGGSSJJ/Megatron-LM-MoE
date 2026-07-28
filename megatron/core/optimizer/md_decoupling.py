@@ -30,7 +30,7 @@ from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_te
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 # NOTE: these package-level imports are safe because this module is only imported lazily from
 # megatron.training.training (never from this package's __init__), so megatron.core.optimizer is
@@ -118,6 +118,47 @@ def _gain_log_family(name: str, param: torch.Tensor) -> str:
     if ".mlp." in name or "linear_fc" in name:
         return "dense-mlp-out" if is_out else "dense-mlp-in"
     return "other"
+
+
+def _include_gain_in_global_stats(
+    md_optimizer: "MDDecoupling",
+    param: torch.Tensor,
+    axis: str,
+    dp_state_is_sharded: bool,
+) -> bool:
+    """Return whether this rank owns a unique logical copy of a gain tensor.
+
+    For a weight partitioned on dim 0, row gains are TP-sharded while col/flat gains are
+    replicated; dim 1 is the converse. Layer-wise DP already assigns each optimizer state tensor
+    to one DP rank, while the ordinary optimizer keeps identical state on every DP replica.
+    """
+    pg_collection = md_optimizer.pg_collection
+    if pg_collection is None:
+        return True
+
+    is_expert = getattr(param, "expert_tp", False)
+    if not dp_state_is_sharded:
+        dp_group = (
+            getattr(pg_collection, "expt_dp", None)
+            if is_expert
+            else getattr(pg_collection, "dp_cp", None)
+        )
+        if dp_group is not None and get_pg_rank(dp_group) != 0:
+            return False
+
+    retained_dim = {"row": 0, "col": 1, "flat": None}[axis]
+    gain_is_tp_sharded = (
+        retained_dim is not None and getattr(param, "partition_dim", None) == retained_dim
+    )
+    if not gain_is_tp_sharded:
+        tp_group = (
+            getattr(pg_collection, "expt_tp", None)
+            if is_expert
+            else getattr(pg_collection, "tp", None)
+        )
+        if tp_group is not None and get_pg_rank(tp_group) != 0:
+            return False
+    return True
 
 
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
@@ -1283,12 +1324,7 @@ class MDDecoupling(_MDDecouplingBase):
 
 @torch.no_grad()
 def collect_md_gain_stats(optimizer) -> Dict[str, float]:
-    """Collect global effective-gain statistics from wrapped MDDecoupling optimizers.
-
-    This diagnostic intentionally uses simple global reductions. Replicated gains can therefore
-    be counted more than once, but identical replicas do not change their bucket's min/max and
-    normally do not change its mean/RMS.
-    """
+    """Collect global effective-gain statistics from wrapped MDDecoupling optimizers."""
 
     def iter_md_optimizers(wrapped):
         if isinstance(wrapped, MDDecoupling):
@@ -1303,6 +1339,7 @@ def collect_md_gain_stats(optimizer) -> Dict[str, float]:
             yield from iter_md_optimizers(inner)
 
     md_optimizers = list(iter_md_optimizers(optimizer))
+    dp_state_is_sharded = isinstance(optimizer, LayerWiseDistributedOptimizer)
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not md_optimizers and not distributed:
         return {}
@@ -1337,7 +1374,9 @@ def collect_md_gain_stats(optimizer) -> Dict[str, float]:
             family_index = family_indices.get(family, family_indices["other"])
             for axis in _GAIN_AXES:
                 raw_gain = state.get(f"{axis}_gain")
-                if raw_gain is None:
+                if raw_gain is None or not _include_gain_in_global_stats(
+                    md_optimizer, param, axis, dp_state_is_sharded
+                ):
                     continue
                 effective_gain = md_optimizer._phi(raw_gain).to(dtype=torch.float64)
                 bucket = family_index * len(_GAIN_AXES) + axis_indices[axis]

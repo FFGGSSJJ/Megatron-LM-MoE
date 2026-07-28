@@ -50,7 +50,8 @@ statistics to TensorBoard and Weights & Biases at `--tensorboard-log-interval`. 
 statistics are `mean`, `rms`, `min`, and `max`. Families distinguish routers, embeddings,
 outputs, attention inputs/outputs, expert inputs/outputs, dense MLP inputs/outputs, and other
 matrices. Softplus gains are transformed before logging, so the values match the multipliers
-applied to model weights.
+applied to model weights. Global aggregation counts each logical gain element once: TP-sharded
+gain vectors contribute all shards, while replicated TP/DP copies contribute from one owner rank.
 
 ## About
 
