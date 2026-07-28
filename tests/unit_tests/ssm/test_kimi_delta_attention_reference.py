@@ -151,13 +151,22 @@ class TestKimiDeltaAttentionReferenceParameterization:
             self.kda.gated_delta_rule = original_gated_delta_rule
 
         assert kernel_kwargs["use_qk_l2norm_in_kernel"] is False
-        assert kernel_kwargs["use_gate_in_kernel"] is True
+        assert (
+            kernel_kwargs.get("use_gate_in_kernel", False)
+            == self.kda._use_fused_decay_gate
+        )
         assert kernel_kwargs["g"].shape[-2:] == (
             self.kda.num_value_heads,
             self.kda.key_head_dim,
         )
-        assert kernel_kwargs["A_log"] is self.kda.A_log
-        assert kernel_kwargs["dt_bias"].shape == self.kda.dt_bias.shape
+        if self.kda._use_fused_decay_gate:
+            assert kernel_kwargs["A_log"] is self.kda.A_log
+            assert kernel_kwargs["dt_bias"].shape == self.kda.dt_bias.shape
+        else:
+            # Fallback path: chunk_kda doesn't take A_log/dt_bias at all, since
+            # the decay activation was already applied to `g` in Python.
+            assert "A_log" not in kernel_kwargs
+            assert "dt_bias" not in kernel_kwargs
         assert (
             kernel_kwargs.get("use_beta_sigmoid_in_kernel", False)
             == self.kda._use_fused_beta_sigmoid

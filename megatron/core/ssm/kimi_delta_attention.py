@@ -86,6 +86,10 @@ _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
 )
 _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL = _chunk_kda_supports("allow_neg_eigval")
 
+_KDA_SUPPORTS_FUSED_DECAY_GATE = _chunk_kda_supports("use_gate_in_kernel") and _chunk_kda_supports(
+    "A_log"
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -117,7 +121,11 @@ class KimiDeltaAttention(GatedDeltaNet):
       1. `__init__` builds the reference factorized decay/output-gate projections
          and resizes `self.A_log` / `self.dt_bias`.
       2. `forward` delegates the vector decay activation to FLA's fused KDA gate
-         and uses the fused beta sigmoid when the installed kernel exposes it.
+         and uses the fused beta sigmoid when the installed kernel exposes it;
+         on older chunk_kda builds without the fused decay gate (e.g. flash-
+         linear-attention 0.4.0 — no use_gate_in_kernel/A_log/dt_bias params),
+         it instead computes g = -exp(A_log) * softplus(alpha + dt_bias) itself
+         in Python (see _activate_decay) so A_log/dt_bias stay trainable.
       3. `forward` overrides only the splitting + reshape of `qkvzba` (alpha
          is wider) and the FLA-op call (chunk_kda instead of
          chunk_gated_delta_rule). All other plumbing (conv1d, CP/TP all-to-all,
@@ -147,7 +155,19 @@ class KimiDeltaAttention(GatedDeltaNet):
         if not HAVE_KDA:
             raise ImportError(
                 "FLA's chunk_kda op is required for Kimi Delta Attention. "
-                "Install flash-linear-attention >= 0.4.2."
+                "Install a flash-linear-attention build that provides fla.ops.kda.chunk_kda."
+            )
+        if not _KDA_SUPPORTS_FUSED_DECAY_GATE:
+            logger.warning(
+                "The installed flash-linear-attention's chunk_kda does not expose "
+                "'use_gate_in_kernel'/'A_log' (only accepted as inert **kwargs on older "
+                "builds, e.g. flash-linear-attention 0.4.0 — see this repo's own "
+                "pyproject.toml pin). Falling back to computing the decay activation "
+                "g = -exp(A_log) * softplus(alpha + dt_bias) in Python before calling "
+                "chunk_kda, instead of relying on the kernel to do it (loses the fused-"
+                "kernel speed benefit, but keeps A_log/dt_bias trainable and correct). "
+                "Upgrade flash-linear-attention to a build whose chunk_kda signature "
+                "includes 'use_gate_in_kernel' and 'A_log' to use the fused path instead."
             )
         if not config.linear_attention_use_output_gate:
             raise ValueError(
@@ -236,7 +256,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
-            bias=False,
+            bias=True,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="kda_gate_out",
@@ -270,6 +290,7 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Bind the FLA op.
         self.gated_delta_rule = chunk_kda
+        self._use_fused_decay_gate = _KDA_SUPPORTS_FUSED_DECAY_GATE
         self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
             not self.config.linear_attention_allow_neg_eigval
             or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
@@ -339,7 +360,20 @@ class KimiDeltaAttention(GatedDeltaNet):
             beta = beta * 2.0
         return beta
 
-    def _in_proj_to_attn_inputs(
+    @jit_fuser
+    def _activate_decay(self, alpha, A_log_local_cp, dt_bias_local_cp):
+        """Fallback decay activation for FLA versions without the fused in-kernel gate.
+
+        Computes exactly what chunk_kda's use_gate_in_kernel=True path computes
+        internally: g = -exp(A_log) * softplus(alpha + dt_bias), in fp32. A_log
+        is one scalar per value head (broadcast over key_head_dim); dt_bias is
+        channel-wise within each head (broadcast over batch/seq).
+        """
+        decay_scale = A_log_local_cp.exp().view(1, 1, -1, 1)
+        bias = dt_bias_local_cp.view(1, 1, *dt_bias_local_cp.shape)
+        return -decay_scale * F.softplus(alpha.float() + bias)
+
+    def forward(
         self,
         hidden_states: torch.Tensor,
         batch: int,
@@ -512,6 +546,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         dt_bias_local_cp = get_parameter_local_cp(
             dt_bias_local_tp, dim=0, cp_group=self.pg_collection.cp
         )
+        if not self._use_fused_decay_gate:
+            alpha = self._activate_decay(alpha, A_log_local_cp, dt_bias_local_cp)
         if not self._use_fused_beta_sigmoid:
             beta = self._activate_beta(beta)
         nvtx_range_pop(suffix="g_and_beta")
@@ -545,14 +581,14 @@ class KimiDeltaAttention(GatedDeltaNet):
         kda_kwargs = {
             "g": alpha,
             "beta": beta,
-            "A_log": A_log_local_cp,
-            "dt_bias": dt_bias_local_cp.reshape(-1),
             "initial_state": initial_state_f32,
             "output_final_state": need_final_state,
             "use_qk_l2norm_in_kernel": False,
-            "use_gate_in_kernel": True,
-
         }
+        if self._use_fused_decay_gate:
+            kda_kwargs["use_gate_in_kernel"] = True
+            kda_kwargs["A_log"] = A_log_local_cp
+            kda_kwargs["dt_bias"] = dt_bias_local_cp.reshape(-1)
         if self._use_fused_beta_sigmoid:
             kda_kwargs["use_beta_sigmoid_in_kernel"] = True
             if _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
