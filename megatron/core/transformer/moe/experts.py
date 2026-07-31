@@ -85,6 +85,15 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
+from megatron.core.transformer.moe.experts_offloading_util import (
+    StreamManager,
+    ExpertsWgradScheduler,
+)
+
+from megatron.core.transformer.moe.experts_offloading import (
+    offloading_grouped_swiglu_mlp,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1418,4 +1427,404 @@ class SequentialMLP(MegatronModule):
                 sh_ten.replica_id = (*replica_id[:2], self.dp_group.rank())
 
             sharded_state_dict.update(expert_state_dict)
+        return sharded_state_dict
+
+class OffloadingExpertsMLP(MegatronModule):
+    """An implementation of the Experts layer with fine-grained experts offloading.
+
+    This class executes each expert sequentially and offloads expert to CPU
+    to save GPU memory.
+    """
+
+    def __init__(
+        self, 
+        num_local_experts: int,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        from torch.nn import Parameter
+        from megatron.core.tensor_parallel.layers import (
+            _initialize_affine_weight_cpu,
+        )
+
+        super().__init__(config)
+        self.num_local_experts = num_local_experts
+
+        assert config.gradient_accumulation_fusion
+
+        self.ep_group = pg_collection.ep
+        # use pg_collection.expt_tp_group as tensor parallel group in this module.
+        self.tp_group = pg_collection.expt_tp
+        # use pg_collection.expt_dp_group as data parallel group in this module.
+        self.dp_group = pg_collection.expt_dp
+        # How many feature each rank holds for fc1 and fc2, respectively.
+        etp_size = self.tp_group.size()
+        etp_rank = self.tp_group.rank()
+
+        assert etp_size == 1, "Expert-Tensor parallelism is not supported in OffloadingExpertsMLP"
+        self.expert_parallel = config.expert_model_parallel_size > 1
+        
+        self.input_size = self.config.hidden_size \
+            if self.config.moe_latent_size is None \
+            else self.config.moe_latent_size
+        
+        fc1_output_size = self.config.moe_ffn_hidden_size * (2 if self.config.gated_linear_unit else 1)
+        fc1_output_size_per_partition = fc1_output_size
+        fc2_input_size = self.config.moe_ffn_hidden_size
+        fc2_input_size_per_partition = fc2_input_size
+
+        # determine expert shape (d_in, d_out) for fc1 and fc2
+        fc1_expert_weight_shape = (
+            self.input_size,
+            fc1_output_size,
+        )
+
+        fc2_expert_weight_shape = (
+            fc2_input_size,
+            self.input_size,
+        )
+        
+        # for now all expert weights are offloaded in CPU.
+        self.weight1 = []
+        self.weight2 = []
+        for i in range(self.num_local_experts):
+            self.register_parameter(
+                f'weight1_expert_{i}',
+                Parameter(
+                    torch.empty(
+                        *fc1_expert_weight_shape,
+                        dtype=config.params_dtype,
+                        device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                        pin_memory= not self.config.moe_offloading_experts_debug_mode,
+                    )
+                ),
+            )
+            self.weight1.append(getattr(self, f'weight1_expert_{i}'))
+            self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook and not config.moe_offloading_experts_debug_mode
+            self.weight1[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+
+            self.register_parameter(
+                f'weight2_expert_{i}',
+                Parameter(
+                    torch.empty(
+                        *fc2_expert_weight_shape,
+                        dtype=config.params_dtype,
+                        device="cpu" if not self.config.moe_offloading_experts_debug_mode else torch.cuda.current_device(),
+                        pin_memory= not self.config.moe_offloading_experts_debug_mode,
+                    )
+                ),
+            )
+            self.weight2.append(getattr(self, f'weight2_expert_{i}'))
+            self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook and not config.moe_offloading_experts_debug_mode
+            self.weight2[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+
+            # Set for the expert weights
+            setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
+            setattr(self.weight2[i], 'allreduce', not self.expert_parallel)
+
+            # TE-style init runs as a group after all params are registered
+            # (see below); the original CPU init runs per-expert here.
+            if config.perform_initialization and not config.moe_offloading_experts_te_style_init:
+                _initialize_affine_weight_cpu(
+                    self.weight1[i],
+                    self.input_size,
+                    fc1_output_size,
+                    fc1_output_size_per_partition,
+                    partition_dim=1,
+                    init_method=config.init_method,
+                    params_dtype=config.params_dtype,
+                    rank=etp_rank,
+                    world_size=etp_size,
+                )
+                _initialize_affine_weight_cpu(
+                    self.weight2[i],
+                    fc2_input_size,
+                    self.input_size,
+                    fc2_input_size_per_partition,
+                    partition_dim=0,
+                    init_method=config.output_layer_init_method,
+                    params_dtype=config.params_dtype,
+                    rank=etp_rank,
+                    world_size=etp_size,
+                )
+
+        # perform TE-style initialization
+        if config.perform_initialization and config.moe_offloading_experts_te_style_init:
+            self._init_expert_weights_like_te(
+                self.weight1,
+                self.weight2,
+                fc1_out_size=fc1_output_size,
+                fc1_in_size=self.input_size,
+                fc2_out_size=self.input_size,
+                fc2_in_size=fc2_input_size,
+                weights_in_te_layout=False,
+            )
+
+        # gpu buffer to prefetch CPU weights
+        self.num_stages = self.config.moe_offloading_num_stages
+        self.num_chunks = self.config.moe_offloading_num_chunks
+        assert num_local_experts % self.num_chunks == 0, "num_local_experts should be divisible by num_steps."
+        self.chunk_size = num_local_experts // self.num_chunks # one chunk contains num_local_experts // self.num_chunks experts
+        self.config.moe_offloading_chunk_size = self.chunk_size
+
+        # allocate tensors for gpu buffers
+        buffer_dtype = config.params_dtype
+        experts1_gpu_buffers_storage = torch.empty(
+            self.num_stages * self.chunk_size * fc1_expert_weight_shape[0] * fc1_expert_weight_shape[1],
+            device=torch.cuda.current_device(),
+            dtype=buffer_dtype,
+        ).view(
+            self.num_stages, self.chunk_size, fc1_expert_weight_shape[0], fc1_expert_weight_shape[1]
+        )
+        experts2_gpu_buffers_storage = torch.empty(
+            self.num_stages * self.chunk_size * fc2_expert_weight_shape[0] * fc2_expert_weight_shape[1],
+            device=torch.cuda.current_device(),
+            dtype=buffer_dtype,
+        ).view(
+            self.num_stages, self.chunk_size, fc2_expert_weight_shape[0], fc2_expert_weight_shape[1]
+        )
+
+        # organize as [num_stages, chunk_size, (in, out)]
+        self.experts1_gpu_buffers = [
+            [experts1_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
+            for s in range(self.num_stages)
+        ]
+        self.experts2_gpu_buffers = [
+            [experts2_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
+            for s in range(self.num_stages)
+        ]
+
+        # organize as [num_stages, (chunk_size, in, out)]
+        self.experts1_gpu_chunks = [
+            experts1_gpu_buffers_storage[s] for s in range(self.num_stages)
+        ]
+        self.experts2_gpu_chunks = [
+            experts2_gpu_buffers_storage[s] for s in range(self.num_stages)
+        ]
+
+        # cuda stream manager for h2d transfer and computation
+        self.stream_manager = StreamManager.get_instance(num_compute_streams=1 if self.config.moe_use_inplace_fp8_param else 4)
+
+        # scheduler to determine when to trigger wgrad compute
+        self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
+
+        # store hooks after wgrad reduce
+        self.wgrad_accumulation_and_reduce_hooks = []
+
+    def _init_expert_weights_like_te(
+        self,
+        weights1,
+        weights2,
+        fc1_out_size: int,
+        fc1_in_size: int,
+        fc2_out_size: int,
+        fc2_in_size: int,
+        weights_in_te_layout: bool,
+    ):
+        """Initialize expert weights to match the TEGroupedMLP path.
+
+        TEGroupedMLP delegates to TE's ``GroupedLinear``, which builds each expert weight on
+        GPU in ``[out_features, in_features]`` layout and applies ``init_method`` under the
+        expert-parallel CUDA RNG tracker, looping over experts within a single fork so that
+        consecutive experts draw distinct values (and different EP ranks differ). The default
+        CPU path (``_initialize_affine_weight_cpu``) instead builds an fp32 master weight with
+        the un-forked global CPU RNG, so it produces different values. This method reproduces
+        the TE behaviour:
+
+        - ``linear_fc1`` is initialized before ``linear_fc2`` so the tracker's RNG stream
+          advances in the same order as TE (which constructs fc1 before fc2).
+        - each expert weight is created on GPU in ``params_dtype`` and ``[out, in]`` layout,
+          matching TE's weight tensors element-for-element.
+        - the result is copied into our (CPU-resident, possibly transposed) parameter, and the
+          tensor-model-parallel attributes that ``_initialize_affine_weight_cpu`` would have
+          stamped are preserved.
+
+        ``weights_in_te_layout`` is True when the parameters are already stored as
+        ``[out, in]`` (the inplace-FP8 case) and False when stored transposed as ``[in, out]``.
+        """
+        from megatron.core.tensor_parallel import (
+            get_cuda_rng_tracker,
+            get_expert_parallel_rng_tracker_name,
+            set_tensor_model_parallel_attributes,
+        )
+
+        device = torch.cuda.current_device()
+        # TE only forks the tracker once it has been seeded (e.g. via
+        # model_parallel_cuda_manual_seed); otherwise it falls back to the default RNG.
+        use_tracker = get_cuda_rng_tracker().is_initialized()
+
+        def _init_group(weights, out_size, in_size, init_method, partition_dim):
+            def _do_init():
+                for i in range(self.num_local_experts):
+                    # TE orientation: [out_features, in_features], params_dtype, on GPU.
+                    weight = torch.empty(
+                        out_size, in_size, dtype=self.config.params_dtype, device=device
+                    )
+                    init_method(weight)
+                    if not weights_in_te_layout:
+                        # Our parameter stores [in_features, out_features]; transpose to match.
+                        weight = weight.t()
+                    with torch.no_grad():
+                        weights[i].data.copy_(weight)
+                    # Preserve the TP attributes set by _initialize_affine_weight_cpu, which are
+                    # read by sharded_state_dict and gradient bookkeeping.
+                    set_tensor_model_parallel_attributes(
+                        tensor=weights[i], is_parallel=True, dim=partition_dim, stride=1
+                    )
+
+            if use_tracker:
+                with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+                    _do_init()
+            else:
+                _do_init()
+
+        # TE constructs linear_fc1 before linear_fc2.
+        _init_group(
+            weights1, fc1_out_size, fc1_in_size, self.config.init_method, partition_dim=1
+        )
+        _init_group(
+            weights2, fc2_out_size, fc2_in_size, self.config.output_layer_init_method, partition_dim=0
+        )
+
+    def _apply(self, fn, recurse=True):
+        saved = {}
+        for name, p in list(self._parameters.items()):
+            if p is not None and getattr(p, 'is_cpu_offloaded', False):
+                saved[name] = self._parameters.pop(name)
+        out = super()._apply(fn, recurse=recurse)
+        for name, p in saved.items():
+            self._parameters[name] = p
+        return out
+
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
+        if permuted_local_hidden_states.nelement() != 0:
+            output = offloading_grouped_swiglu_mlp(
+                self.weight1,
+                self.weight2,
+                self.experts1_gpu_buffers,
+                self.experts2_gpu_buffers,
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                self.num_local_experts,
+                permuted_probs,
+                self.expert_wgrad_scheduler,
+                self.stream_manager,
+                self.config,
+                self.wgrad_accumulation_and_reduce_hooks,
+            )
+
+            return output, None
+        else:
+            # NOTE: it should be safe to pass empty tensor to the custom function,
+            # but it will introduce meanless h2d transfer.
+            # TODO: add cost free path for empty input
+            output = offloading_grouped_swiglu_mlp(
+                self.weight1,
+                self.weight2,
+                self.experts1_gpu_buffers,
+                self.experts2_gpu_buffers,
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                self.num_local_experts,
+                permuted_probs,
+                self.expert_wgrad_scheduler,
+                self.stream_manager,
+                self.config,
+                self.wgrad_accumulation_and_reduce_hooks,
+            )
+            return output, None
+        
+    def backward_dw(self):
+        if self.config.delay_wgrad_compute:
+            self.expert_wgrad_scheduler.pop_callback()
+            self.expert_wgrad_scheduler.pop_callback()
+
+            # trigger grad reduce hook
+            for hook_fn in self.wgrad_accumulation_and_reduce_hooks:
+                hook_fn()
+    
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook_fn):
+        self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
+    
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Maps local experts to global experts (interchangeable across variants).
+
+        Both OffloadingExpertsMLP variants emit the same per-expert, expert-parallel
+        sharded layout under keys ``{prefix}experts.weight{1,2}`` in ``(in, out)``
+        orientation, so a checkpoint saved by one is loadable by the other:
+
+        - bf16 variant: per-expert params already ``(in, out)`` -> saved directly.
+        - inplace-fp8 variant: a single fused ``(num_local, out, in)`` master is
+          transposed per expert via a ``ShardedTensorFactory`` (one per fused
+          param, keyed by the real param name so ``load_state_dict`` maps it back).
+        """
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        assert self.tp_group.size() == 1, "OffloadingExpertsMLP assumes ETP size == 1"
+
+        num_global_experts = self.ep_group.size() * self.num_local_experts
+        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+        replica_id = (0, 0, self.dp_group.rank())
+
+        if self.config.moe_use_inplace_fp8_param:
+            # The fused bf16 master is only valid when fp8 lives in extra storage;
+            # otherwise self.weight1/2 are overwritten in place with packed fp8 bytes
+            # (see _quantize_weight in experts_offloading_fp8_util.py).
+            assert self.config.moe_use_extra_fp8_param_storage, (
+                "Checkpointing inplace-fp8 OffloadingExpertsMLP requires "
+                "moe_use_extra_fp8_param_storage=True so the bf16 weights are "
+                "preserved (otherwise self.weight1/2 hold packed fp8 bytes)."
+            )
+            sharded_state_dict = {}
+            for wname, fused_weight in (('weight1', self.weight1), ('weight2', self.weight2)):
+                sharded_state_dict[f'{prefix}{wname}'] = make_fused_experts_sharded_factory(
+                    fused_weight,
+                    prefix,
+                    wname,
+                    num_local_experts=self.num_local_experts,
+                    local_expert_indices_offset=local_expert_indices_offset,
+                    num_global_experts=num_global_experts,
+                    sharded_offsets=sharded_offsets,
+                    replica_id=replica_id,
+                    singleton_local_shards=singleton_local_shards,
+                )
+            return sharded_state_dict
+
+        sharded_state_dict = {}
+        for i in range(self.num_local_experts):
+            g_idx = local_expert_indices_offset + i
+            w1 = getattr(self, f'weight1_expert_{i}')
+            w2 = getattr(self, f'weight2_expert_{i}')
+
+            sharded_state_dict[f'{prefix}weight1_expert_{i}'] = (
+                build_offloading_expert_sharded_tensor(
+                    w1,
+                    prefix,
+                    'weight1',
+                    g_idx,
+                    sharded_offsets=sharded_offsets,
+                    num_global_experts=num_global_experts,
+                    replica_id=replica_id,
+                    singleton_local_shards=singleton_local_shards,
+                    transpose=False,
+                )
+            )
+            sharded_state_dict[f'{prefix}weight2_expert_{i}'] = (
+                build_offloading_expert_sharded_tensor(
+                    w2,
+                    prefix,
+                    'weight2',
+                    g_idx,
+                    sharded_offsets=sharded_offsets,
+                    num_global_experts=num_global_experts,
+                    replica_id=replica_id,
+                    singleton_local_shards=singleton_local_shards,
+                    transpose=False,
+                )
+            )
         return sharded_state_dict
