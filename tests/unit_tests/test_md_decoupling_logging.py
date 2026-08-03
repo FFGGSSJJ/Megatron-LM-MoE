@@ -170,6 +170,58 @@ def test_collect_md_gain_stats_logs_global_layer_buckets():
     assert not any("muon-md/layers/1/" in name for name in stats)
 
 
+def test_collect_md_gain_stats_logs_effective_weight_sparsity_per_matrix():
+    layer_zero = torch.nn.Parameter(torch.tensor([[0.0, 1e-21], [1e-20, -1.0]]))
+    layer_zero.md_gain_log_family = "expert-in"
+    layer_zero.md_gain_log_layer = 0
+    layer_one = torch.nn.Parameter(torch.tensor([[2.0]]))
+    layer_one.md_gain_log_family = "expert-in"
+    layer_one.md_gain_log_layer = 1
+    optimizer = MDDecoupling(
+        [layer_zero, layer_one],
+        hypersphere_gains_mode="row",
+        gain_parametrization="direct",
+    )
+    # Parameters contain the gain-baked effective weights when logging runs. Large gain state here
+    # ensures collection does not incorrectly apply the gain a second time.
+    optimizer.state[layer_zero]["row_gain"] = torch.tensor([100.0, 100.0])
+    optimizer.state[layer_one]["row_gain"] = torch.tensor([100.0])
+    wrapped_optimizer = SimpleNamespace(optimizer=optimizer)
+
+    stats = collect_md_gain_stats(wrapped_optimizer, per_layer=True)
+
+    assert stats["muon-md/sparsity/expert-in/fraction-below-1e-20"] == pytest.approx(
+        0.25
+    )
+    assert stats["muon-md/sparsity/expert-in/fraction-below-1e-10"] == pytest.approx(
+        0.375
+    )
+    assert stats["muon-md/sparsity/expert-in/fraction-below-1e-30"] == pytest.approx(
+        0.125
+    )
+    assert stats[
+        "muon-md/layers/0/sparsity/expert-in/fraction-below-1e-20"
+    ] == pytest.approx(0.5)
+    assert stats[
+        "muon-md/layers/1/sparsity/expert-in/fraction-below-1e-20"
+    ] == pytest.approx(0.0)
+
+    custom_stats = collect_md_gain_stats(wrapped_optimizer, sparsity_thresholds=[0.5])
+    assert custom_stats[
+        "muon-md/sparsity/expert-in/fraction-below-0.5"
+    ] == pytest.approx(0.375)
+    assert not any("fraction-below-1e-20" in name for name in custom_stats)
+
+    sparsity_only_stats = collect_md_gain_stats(wrapped_optimizer, log_gains=False)
+    assert any("/sparsity/" in name for name in sparsity_only_stats)
+    assert not any("/gains/" in name for name in sparsity_only_stats)
+    assert not any("/gain-field/" in name for name in sparsity_only_stats)
+
+    gains_only_stats = collect_md_gain_stats(wrapped_optimizer, log_sparsity=False)
+    assert any("/gains/" in name for name in gains_only_stats)
+    assert not any("/sparsity/" in name for name in gains_only_stats)
+
+
 def test_collect_md_gain_stats_pairs_row_and_col_within_each_matrix():
     first = torch.nn.Parameter(torch.ones(2, 2))
     first.md_gain_log_family = "attention-in"
@@ -366,7 +418,11 @@ def test_gain_stats_count_tp_shards_once_and_deduplicate_replicas():
     Utils.initialize_model_parallel(tensor_model_parallel_size=min(world, 2))
     try:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        param = torch.nn.Parameter(torch.ones(2, 3, device="cuda"))
+        param = torch.nn.Parameter(
+            torch.zeros(2, 3, device="cuda")
+            if tp_rank == 0
+            else torch.ones(2, 3, device="cuda")
+        )
         param.partition_dim = 0
         param.md_gain_log_family = "attention-in"
         optimizer = MDDecoupling(
@@ -389,6 +445,9 @@ def test_gain_stats_count_tp_shards_once_and_deduplicate_replicas():
         assert stats["muon-md/gains/attention-in/col/rms"] == pytest.approx(
             (155.0 / 3.0) ** 0.5
         )
+        assert stats[
+            "muon-md/sparsity/attention-in/fraction-below-1e-20"
+        ] == pytest.approx(0.5)
     finally:
         Utils.destroy_model_parallel()
 

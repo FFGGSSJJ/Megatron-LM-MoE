@@ -42,11 +42,11 @@ git submodule update --remote _research
 
 The submodule pointer pinned in this repo deliberately lags what's checked out; everyone pulls `_research` directly to stay current, and the pin is bumped only occasionally. Each run logs `PRETRAIN CONFIG COMMIT: <sha>[-dirty]` — that logged SHA, not the pin, is the source of truth for which config produced a run.
 
-## Muon-MD gain logging
+## Muon-MD logging
 
 For `--optimizer md_decoupling`, pass `--log-muon-md-gains` to write effective gain
 `mean`, `rms`, `effective-rms`, `min`, and `max` to TensorBoard and Weights & Biases at
-`--tensorboard-log-interval`. Metrics use `muon-md/gains/<family>/<row|col|flat>/<stat>` for
+the Muon-MD logging interval. Metrics use `muon-md/gains/<family>/<row|col|flat>/<stat>` for
 routers, embeddings, outputs, attention, experts, dense MLPs, and unclassified matrices. Values are
 transformed to the multipliers applied to weights, with TP shards combined and replicated TP/DP
 copies counted once. Row-column configurations also log their combined gain-field RMS at
@@ -57,6 +57,25 @@ each matrix first and then averaged with equal matrix weight, so row and column 
 unrelated matrices are never paired. Each slice of a merged
 expert tensor counts as a separate matrix. The legacy `mean`, `rms`, `min`, `max`, and saturation
 fraction remain element-level distribution summaries.
+
+Pass `--log-muon-md-sparsity` to report effective-weight sparsity at
+`muon-md/sparsity/<family>/fraction-below-<threshold>`. The default thresholds are `1e-20`,
+`1e-10`, and `1e-30`; override them with, for example,
+`--muon-md-sparsity-thresholds 1e-8 1e-12`. Use `--muon-md-log-interval N` to set the collection
+and logging cadence; when omitted, it inherits `--log-interval`. Logging runs after Muon-MD
+reapplies the gains, so the model parameter already contains the effective weight, for example
+$W_{\mathrm{eff},ij}=W_{ij}\phi(r_i)\phi(c_j)$ for row-column gains. For each logical matrix $m$,
+
+$$
+\operatorname{sparsity}_{\tau}(W_{\mathrm{eff},m})
+=\frac{\#\{(i,j): |W_{\mathrm{eff},m,ij}|<\tau\}}
+       {\#\{(i,j)\}}.
+$$
+
+The family metric is the equal-weight average of these per-matrix fractions. TP shards are
+combined before computing the fraction, and each slice of a merged expert tensor is treated as a
+separate expert matrix. If a threshold is below the parameter dtype's smallest positive value,
+the metric counts exact zeros without underflowing the comparison threshold.
 
 The logged values are computed as follows:
 
@@ -134,10 +153,9 @@ and column gains are mostly rescaling each other rather than changing the combin
 Thus, `rms` weights every gain element equally, whereas `effective-rms`, `gain-field-rms`, and the
 gauge metrics weight every matrix equally.
 
-Pass `--log-muon-md-gains-per-layer` to additionally emit the same metrics for each global,
-zero-based transformer layer under `muon-md/layers/<layer>/...`. The per-layer flag also enables
-the family-wide metrics and should be used selectively for large models because it creates one
-curve per layer, family, axis, and statistic.
+Pass `--log-muon-md-per-layer` to additionally emit whichever Muon-MD metrics are enabled for
+each global, zero-based transformer layer under `muon-md/layers/<layer>/...`. It should be used
+selectively for large models because it creates one curve per layer, family, axis, and statistic.
 
 ## About
 
