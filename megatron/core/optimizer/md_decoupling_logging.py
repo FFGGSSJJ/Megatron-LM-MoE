@@ -350,7 +350,7 @@ def _accumulate_md_matrix_stats(
             ):
                 continue
             present_axes = [axis for axis in _GAIN_AXES if f"{axis}_gain" in state]
-            if not present_axes:
+            if not present_axes and not sparsity_thresholds:
                 continue
 
             is_expert = getattr(param, "expert_tp", False)
