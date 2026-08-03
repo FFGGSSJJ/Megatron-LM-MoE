@@ -105,6 +105,7 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'is_out_proj',
     'is_router',
     'md_gain_log_family',
+    'md_gain_log_layer',
     'is_embedding_or_output_parameter',
     'is_embedding_parameter',
     'is_md_embedding_parameter',

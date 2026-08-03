@@ -19,10 +19,8 @@ from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.md_decoupling import MDDecoupling
 from megatron.core.optimizer.md_decoupling import _get_muon_scale_factor
-from megatron.core.optimizer.md_decoupling import _gain_log_family
 from megatron.core.optimizer.md_decoupling import _md_init_state_fn
 from megatron.core.optimizer.md_decoupling import _split_qkv
-from megatron.core.optimizer.md_decoupling import collect_md_gain_stats
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
 from megatron.core.optimizer.optimizer import FP32Optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -76,106 +74,6 @@ def _record_md_split_output(param, grad, **md_kwargs):
     return optimizer._orthogonalize_param(
         param, grad, is_qkv=getattr(param, "is_qkv", False)
     ), calls
-
-
-def test_md_gain_log_family_classifies_matrix_types():
-    cases = [
-        ("decoder.layers.0.mlp.router.weight", "is_router", "router"),
-        ("embedding.word_embeddings.weight", "is_md_embedding_parameter", "embedding"),
-        ("output_layer.weight", "is_md_output_parameter", "output"),
-        ("decoder.layers.0.self_attention.linear_qkv.weight", None, "attention-in"),
-        (
-            "decoder.layers.0.self_attention.linear_proj.weight",
-            "is_out_proj",
-            "attention-out",
-        ),
-        ("decoder.layers.0.mlp.experts.linear_fc1.weight", None, "expert-in"),
-        (
-            "decoder.layers.0.mlp.experts.linear_fc2.weight",
-            "is_out_proj",
-            "expert-out",
-        ),
-        ("decoder.layers.0.mlp.linear_fc1.weight", None, "dense-mlp-in"),
-        (
-            "decoder.layers.0.mlp.linear_fc2.weight",
-            "is_out_proj",
-            "dense-mlp-out",
-        ),
-        ("some_unclassified_matrix.weight", None, "other"),
-    ]
-    for name, attribute, expected in cases:
-        param = torch.nn.Parameter(torch.ones(2, 2))
-        if attribute:
-            setattr(param, attribute, True)
-        assert _gain_log_family(name, param) == expected
-
-
-def test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis():
-    router = torch.nn.Parameter(torch.ones(2, 2))
-    router.md_gain_log_family = "router"
-    attention = torch.nn.Parameter(torch.ones(2, 2))
-    attention.md_gain_log_family = "attention-in"
-    md_optimizer = MDDecoupling(
-        [router, attention],
-        hypersphere_gains_mode="rowcol",
-        gain_parametrization="softplus",
-    )
-    md_optimizer.state[router]["row_gain"] = md_optimizer._phi_inv(torch.tensor([1.0, 3.0]))
-    md_optimizer.state[router]["col_gain"] = md_optimizer._phi_inv(torch.tensor([2.0, 4.0]))
-    md_optimizer.state[attention]["flat_gain"] = md_optimizer._phi_inv(torch.tensor(5.0))
-
-    stats = collect_md_gain_stats(SimpleNamespace(optimizer=md_optimizer))
-
-    assert stats["muon-md/gains/router/row/mean"] == pytest.approx(2.0)
-    assert stats["muon-md/gains/router/row/rms"] == pytest.approx(5.0**0.5)
-    assert stats["muon-md/gains/router/row/min"] == pytest.approx(1.0)
-    assert stats["muon-md/gains/router/row/max"] == pytest.approx(3.0)
-    assert stats["muon-md/gains/router/col/mean"] == pytest.approx(3.0)
-    assert stats["muon-md/gains/router/col/rms"] == pytest.approx(10.0**0.5)
-    assert stats["muon-md/gains/attention-in/flat/mean"] == pytest.approx(5.0)
-    assert not any("/other/" in metric_name for metric_name in stats)
-
-
-def test_md_gain_stats_tp_and_dp_ownership(monkeypatch):
-    tp_group = object()
-    dp_group = object()
-    expert_tp_group = object()
-    expert_dp_group = object()
-    ranks = {
-        tp_group: 1,
-        dp_group: 0,
-        expert_tp_group: 0,
-        expert_dp_group: 0,
-    }
-    monkeypatch.setattr(md_module, "get_pg_rank", lambda group: ranks[group])
-    optimizer = SimpleNamespace(
-        pg_collection=SimpleNamespace(
-            tp=tp_group,
-            dp_cp=dp_group,
-            expt_tp=expert_tp_group,
-            expt_dp=expert_dp_group,
-        )
-    )
-
-    cases = [
-        (0, "row", 1, 0, False, False, True),
-        (0, "col", 1, 0, False, False, False),
-        (0, "flat", 1, 0, False, False, False),
-        (1, "row", 1, 0, False, False, False),
-        (1, "col", 1, 0, False, False, True),
-        (0, "row", 0, 1, False, False, False),
-        (0, "row", 0, 1, True, False, True),
-        (None, "flat", 0, 1, False, True, False),
-    ]
-    for partition_dim, axis, tp_rank, dp_rank, sharded, expert, expected in cases:
-        ranks[expert_tp_group if expert else tp_group] = tp_rank
-        ranks[expert_dp_group if expert else dp_group] = dp_rank
-        param = torch.nn.Parameter(torch.ones(3, 4))
-        param.partition_dim = partition_dim
-        param.expert_tp = expert
-        assert (
-            md_module._include_gain_in_global_stats(optimizer, param, axis, sharded) is expected
-        )
 
 
 def _gqa_qkv_optimizer(param, **kwargs):
@@ -1173,28 +1071,6 @@ class TestMDDecouplingMultiRankTP:
         Utils.initialize_model_parallel(tensor_model_parallel_size=min(world, 2))
         yield
         Utils.destroy_model_parallel()
-
-    def test_gain_stats_count_tp_shards_once_and_deduplicate_replicas(self):
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        param = torch.nn.Parameter(torch.ones(2, 3, device="cuda"))
-        param.partition_dim = 0
-        param.md_gain_log_family = "attention-in"
-        optimizer = MDDecoupling(
-            [param],
-            hypersphere_gains_mode="rowcol",
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-        )
-        optimizer.state[param]["row_gain"] = torch.tensor(
-            [1.0, 2.0] if tp_rank == 0 else [3.0, 4.0], device="cuda"
-        )
-        optimizer.state[param]["col_gain"] = torch.tensor([5.0, 7.0, 9.0], device="cuda")
-
-        stats = collect_md_gain_stats(SimpleNamespace(optimizer=optimizer))
-
-        assert stats["muon-md/gains/attention-in/row/mean"] == pytest.approx(2.5)
-        assert stats["muon-md/gains/attention-in/row/rms"] == pytest.approx(7.5**0.5)
-        assert stats["muon-md/gains/attention-in/col/mean"] == pytest.approx(7.0)
-        assert stats["muon-md/gains/attention-in/col/rms"] == pytest.approx((155.0 / 3.0) ** 0.5)
 
     def create_tp_model_and_optimizer(self, tp_mode):
         rank = int(os.getenv("RANK", "0"))

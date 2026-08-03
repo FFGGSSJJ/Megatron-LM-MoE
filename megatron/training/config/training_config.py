@@ -211,6 +211,9 @@ class LoggerConfig:
     log_muon_md_gains: bool = False
     """If set, log effective Muon-MD gain statistics by parameter family and gain axis."""
 
+    log_muon_md_gains_per_layer: bool = False
+    """If set, additionally log effective Muon-MD gain statistics by global layer."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 

@@ -30,7 +30,7 @@ from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_te
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_size, log_single_rank
 
 # NOTE: these package-level imports are safe because this module is only imported lazily from
 # megatron.training.training (never from this package's __init__), so megatron.core.optimizer is
@@ -42,6 +42,7 @@ from . import (
     get_standard_config_overrides,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
+from .md_decoupling_logging import _gain_log_family
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -75,83 +76,8 @@ _MD_GAIN_STATE_KINDS = {
     "flat_gain_v": "flat",
 }
 
-_GAIN_AXES = ("row", "col", "flat")
-_GAIN_FAMILIES = (
-    "router",
-    "embedding",
-    "output",
-    "attention-in",
-    "attention-out",
-    "expert-in",
-    "expert-out",
-    "dense-mlp-in",
-    "dense-mlp-out",
-    "other",
-)
-
-
 def _normalize_embedding_mode(mode):
     return None if mode == "external" else mode
-
-
-def _gain_log_family(name: str, param: torch.Tensor) -> str:
-    """Assign a stable, low-cardinality logging family while the parameter name is available."""
-    if getattr(param, "is_router", False):
-        return "router"
-    if getattr(param, "is_md_embedding_parameter", False):
-        return "embedding"
-    if getattr(param, "is_md_output_parameter", False):
-        return "output"
-
-    is_out = getattr(param, "is_out_proj", False)
-    if "experts" in name:
-        return "expert-out" if is_out else "expert-in"
-    if "attention" in name:
-        return "attention-out" if is_out else "attention-in"
-    if ".mlp." in name:
-        return "dense-mlp-out" if is_out else "dense-mlp-in"
-    return "other"
-
-
-def _include_gain_in_global_stats(
-    md_optimizer: "MDDecoupling",
-    param: torch.Tensor,
-    axis: str,
-    dp_state_is_sharded: bool,
-) -> bool:
-    """Return whether this rank owns a unique logical copy of a gain tensor.
-
-    For a weight partitioned on dim 0, row gains are TP-sharded while col/flat gains are
-    replicated; dim 1 is the converse. Layer-wise DP already assigns each optimizer state tensor
-    to one DP rank, while the ordinary optimizer keeps identical state on every DP replica.
-    """
-    pg_collection = md_optimizer.pg_collection
-    if pg_collection is None:
-        return True
-
-    is_expert = getattr(param, "expert_tp", False)
-    if not dp_state_is_sharded:
-        dp_group = (
-            getattr(pg_collection, "expt_dp", None)
-            if is_expert
-            else getattr(pg_collection, "dp_cp", None)
-        )
-        if dp_group is not None and get_pg_rank(dp_group) != 0:
-            return False
-
-    retained_dim = {"row": 0, "col": 1, "flat": None}[axis]
-    gain_is_tp_sharded = (
-        retained_dim is not None and getattr(param, "partition_dim", None) == retained_dim
-    )
-    if not gain_is_tp_sharded:
-        tp_group = (
-            getattr(pg_collection, "expt_tp", None)
-            if is_expert
-            else getattr(pg_collection, "tp", None)
-        )
-        if tp_group is not None and get_pg_rank(tp_group) != 0:
-            return False
-    return True
 
 
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
@@ -1315,79 +1241,6 @@ class MDDecoupling(_MDDecouplingBase):
         return self.hypersphere_gains_mode
 
 
-@torch.no_grad()
-def collect_md_gain_stats(optimizer) -> Dict[str, float]:
-    """Collect global effective-gain statistics from wrapped MDDecoupling optimizers."""
-
-    wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
-    md_optimizers = [getattr(wrapped, "optimizer", wrapped) for wrapped in wrapped_optimizers]
-    md_optimizers = [wrapped for wrapped in md_optimizers if isinstance(wrapped, MDDecoupling)]
-    dp_state_is_sharded = isinstance(optimizer, LayerWiseDistributedOptimizer)
-    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-    if not md_optimizers and not distributed:
-        return {}
-
-    bucket_count = len(_GAIN_FAMILIES) * len(_GAIN_AXES)
-    gain_params = (
-        param
-        for md_optimizer in md_optimizers
-        for param, state in md_optimizer.state.items()
-        if any(f"{axis}_gain" in state for axis in _GAIN_AXES)
-    )
-    gain_param = next(gain_params, None)
-    if gain_param is None:
-        device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-    else:
-        device = gain_param.device
-
-    totals = torch.zeros((bucket_count, 3), dtype=torch.float64, device=device)
-    minima = torch.full((bucket_count,), float("inf"), dtype=torch.float64, device=device)
-    maxima = torch.full_like(minima, float("-inf"))
-
-    family_indices = {name: index for index, name in enumerate(_GAIN_FAMILIES)}
-    for md_optimizer in md_optimizers:
-        for param, state in md_optimizer.state.items():
-            family = getattr(param, "md_gain_log_family", "other")
-            family_index = family_indices.get(family, family_indices["other"])
-            for axis_index, axis in enumerate(_GAIN_AXES):
-                raw_gain = state.get(f"{axis}_gain")
-                if raw_gain is None or not _include_gain_in_global_stats(
-                    md_optimizer, param, axis, dp_state_is_sharded
-                ):
-                    continue
-                effective_gain = md_optimizer._phi(raw_gain).to(dtype=torch.float64)
-                bucket = family_index * len(_GAIN_AXES) + axis_index
-                totals[bucket, 0].add_(effective_gain.sum())
-                totals[bucket, 1].add_(effective_gain.square().sum())
-                totals[bucket, 2].add_(effective_gain.numel())
-                minima[bucket].copy_(torch.minimum(minima[bucket], effective_gain.min()))
-                maxima[bucket].copy_(torch.maximum(maxima[bucket], effective_gain.max()))
-
-    if distributed:
-        torch.distributed.all_reduce(totals)
-        torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
-        torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
-
-    totals, minima, maxima = (tensor.cpu() for tensor in (totals, minima, maxima))
-    stats = {}
-    for family_index, family in enumerate(_GAIN_FAMILIES):
-        for axis_index, axis in enumerate(_GAIN_AXES):
-            bucket = family_index * len(_GAIN_AXES) + axis_index
-            total, sum_square, count = totals[bucket].tolist()
-            if count == 0:
-                continue
-            prefix = f"muon-md/gains/{family}/{axis}"
-            stats[f"{prefix}/mean"] = total / count
-            stats[f"{prefix}/rms"] = math.sqrt(sum_square / count)
-            stats[f"{prefix}/min"] = minima[bucket].item()
-            stats[f"{prefix}/max"] = maxima[bucket].item()
-    return stats
-
-
 @torch.compile(dynamic=True)
 def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
     """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
@@ -1674,6 +1527,9 @@ def get_megatron_mddecoupling_optimizer(
             cfg.kv_lora_rank + cfg.qk_pos_emb_head_dim,
         ) if is_mla and getattr(cfg, 'q_lora_rank', None) is not None else None
 
+        named_modules = (
+            dict(model_chunk.named_modules()) if hasattr(model_chunk, 'named_modules') else {}
+        )
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -1712,6 +1568,14 @@ def get_megatron_mddecoupling_optimizer(
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
+            module_name = name.rpartition('.')[0]
+            while module_name:
+                module = named_modules.get(module_name)
+                layer_number = getattr(module, 'layer_number', None)
+                if layer_number is not None:
+                    param.md_gain_log_layer = int(layer_number) - 1
+                    break
+                module_name = module_name.rpartition('.')[0]
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
     hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)

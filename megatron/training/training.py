@@ -178,10 +178,8 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-from megatron.core.optimizer.md_decoupling import (
-    collect_md_gain_stats,
-    get_megatron_mddecoupling_optimizer,
-)
+from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.md_decoupling_logging import collect_md_gain_stats
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -3252,8 +3250,12 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if args.log_muon_md_gains and iteration % args.tensorboard_log_interval == 0:
-            md_gain_stats = collect_md_gain_stats(optimizer)
+        if (
+            args.log_muon_md_gains or args.log_muon_md_gains_per_layer
+        ) and iteration % args.tensorboard_log_interval == 0:
+            md_gain_stats = collect_md_gain_stats(
+                optimizer, per_layer=args.log_muon_md_gains_per_layer
+            )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

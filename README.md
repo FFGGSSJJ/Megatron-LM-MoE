@@ -45,11 +45,99 @@ The submodule pointer pinned in this repo deliberately lags what's checked out; 
 ## Muon-MD gain logging
 
 For `--optimizer md_decoupling`, pass `--log-muon-md-gains` to write effective gain
-`mean`, `rms`, `min`, and `max` to TensorBoard and Weights & Biases at
+`mean`, `rms`, `effective-rms`, `min`, and `max` to TensorBoard and Weights & Biases at
 `--tensorboard-log-interval`. Metrics use `muon-md/gains/<family>/<row|col|flat>/<stat>` for
-routers, embeddings, outputs, attention, experts, dense MLPs, and other matrices. Values are
+routers, embeddings, outputs, attention, experts, dense MLPs, and unclassified matrices. Values are
 transformed to the multipliers applied to weights, with TP shards combined and replicated TP/DP
-copies counted once.
+copies counted once. Row-column configurations also log their combined gain-field RMS at
+`muon-md/gain-field/<family>/rms`. Softplus gains additionally log per-axis saturation based on
+the softplus derivative, plus combined log scale and row-column imbalance under
+`muon-md/gauge/<family>/...`. Effective RMS, combined scale, and gauge values are computed for
+each matrix first and then averaged with equal matrix weight, so row and column gains from
+unrelated matrices are never paired. Each slice of a merged
+expert tensor counts as a separate matrix. The legacy `mean`, `rms`, `min`, `max`, and saturation
+fraction remain element-level distribution summaries.
+
+The logged values are computed as follows:
+
+For a raw gain vector $g$, let $e=\phi(g)$ be its effective multiplier. The element-weighted
+statistics are
+
+$$
+\operatorname{mean}(e)=\frac{\sum_i e_i}{N},\qquad
+\operatorname{RMS}(e)=\sqrt{\frac{\sum_i e_i^2}{N}}.
+$$
+
+`min` and `max` are the extrema over the same effective-gain elements. For softplus gains,
+
+$$
+\text{saturated-fraction}
+=\frac{\#\{i:\operatorname{sigmoid}(g_i)<10^{-2}\}}{N}.
+$$
+
+For a TP-sharded gain axis, each rank first contributes $[\sum_i e_i^2,\,N]$, plus
+$\sum_i\log e_i$ for softplus gains. Their TP `SUM` all-reduce reconstructs the corresponding
+full-axis sums and count. The matrix-level statistics are computed only after that reduction.
+
+For matrices $m=1,\ldots,M$ in a family and axis,
+
+$$
+\text{effective-rms}
+=\frac{1}{M}\sum_{m=1}^{M}\operatorname{RMS}(e_m).
+$$
+
+Muon-MD applies row and column gains by broadcasting, so each matrix entry is multiplied as
+$W'_{ij}=W_{ij}r_i c_j$. The combined multiplier is therefore the outer-product gain field
+$rc^\top$. Its RMS factorizes exactly as
+
+$$
+\operatorname{RMS}(rc^\top)=\operatorname{RMS}(r)\operatorname{RMS}(c).
+$$
+
+For $M$ matched row and column gains $r_m,c_m$, the logged family value is
+
+$$
+\text{gain-field-rms}
+  =\frac{1}{M}\sum_{m=1}^{M}\operatorname{RMS}(r_m)\operatorname{RMS}(c_m).
+$$
+
+This describes only the multiplicative gain field. It is not the RMS of the resulting effective
+weight $W\odot rc^\top$.
+
+For positive softplus gains, row and column gains have a scale redundancy: replacing
+$r$ with $a r$ and $c$ with $c/a$ leaves the gain field $rc^\top$ unchanged. The gauge metrics
+separate the meaningful combined scale from this otherwise invisible redistribution:
+
+- `combined-log-scale` is
+  $\operatorname{mean}(\log r)+\operatorname{mean}(\log c)$, the log of the product of the row
+  and column geometric means. It tracks their combined multiplicative scale.
+- `row-col-imbalance` is
+  $\operatorname{mean}(\log r)-\operatorname{mean}(\log c)$, the log ratio between those geometric
+  means. It tracks whether scale is moving from the column gains into the row gains or vice versa.
+
+For the $M_+$ matched softplus matrices, the logged family averages are
+
+$$
+\begin{aligned}
+\text{combined-log-scale}
+  &=\frac{1}{M_+}\sum_{m=1}^{M_+}
+    \left(\operatorname{mean}(\log r_m)+\operatorname{mean}(\log c_m)\right),\\
+\text{row-col-imbalance}
+  &=\frac{1}{M_+}\sum_{m=1}^{M_+}
+    \left(\operatorname{mean}(\log r_m)-\operatorname{mean}(\log c_m)\right).
+\end{aligned}
+$$
+
+If `row-col-imbalance` drifts while `combined-log-scale` and `gain-field-rms` remain stable, the row
+and column gains are mostly rescaling each other rather than changing the combined gain field.
+
+Thus, `rms` weights every gain element equally, whereas `effective-rms`, `gain-field-rms`, and the
+gauge metrics weight every matrix equally.
+
+Pass `--log-muon-md-gains-per-layer` to additionally emit the same metrics for each global,
+zero-based transformer layer under `muon-md/layers/<layer>/...`. The per-layer flag also enables
+the family-wide metrics and should be used selectively for large models because it creates one
+curve per layer, family, axis, and statistic.
 
 ## About
 
