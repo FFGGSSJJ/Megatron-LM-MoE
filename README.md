@@ -47,7 +47,8 @@ The submodule pointer pinned in this repo deliberately lags what's checked out; 
 For `--optimizer md_decoupling`, pass `--log-muon-md-gains` to write effective gain
 `mean`, `rms`, `effective-rms`, `min`, and `max` to TensorBoard and Weights & Biases at
 the Muon-MD logging interval. Metrics use `muon-md/gains/<family>/<row|col|flat>/<stat>` for
-routers, embeddings, outputs, attention, experts, dense MLPs, and unclassified matrices. Values are
+routers, embeddings, outputs, attention, experts, MoE latent projections, dense MLPs, and
+unclassified matrices. Values are
 transformed to the multipliers applied to weights, with TP shards combined and replicated TP/DP
 copies counted once. Row-column configurations also log their combined gain-field RMS at
 `muon-md/gain-field/<family>/rms`. Softplus gains additionally log per-axis saturation based on
@@ -76,6 +77,17 @@ The family metric is the equal-weight average of these per-matrix fractions. TP 
 combined before computing the fraction, and each slice of a merged expert tensor is treated as a
 separate expert matrix. If a threshold is below the parameter dtype's smallest positive value,
 the metric counts exact zeros without underflowing the comparison threshold.
+
+Pass `--log-muon-md-param-rms` to report effective-parameter RMS at
+`muon-md/params/<family>/rms`. For each logical matrix $m$ this is
+
+$$
+\operatorname{RMS}(W_m)=\frac{\lVert W_m\rVert_F}{\sqrt{N_m}}
+=\sqrt{\frac{\sum_{i,j}W_{m,ij}^2}{N_m}}.
+$$
+
+As with sparsity, $W_m$ already includes its applied gains, TP shards are combined, merged experts
+remain separate matrices, and the family metric averages the per-matrix RMS values equally.
 
 The logged values are computed as follows:
 

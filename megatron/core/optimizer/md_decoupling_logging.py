@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 _GAIN_AXES = ("row", "col", "flat")
-_MATRIX_SQUARE_SUM, _MATRIX_ELEMENT_COUNT, _MATRIX_LOG_SUM, _MATRIX_NEAR_ZERO_START = range(4)  # fmt: skip
+_MATRIX_SQUARE_SUM, _MATRIX_ELEMENT_COUNT, _MATRIX_LOG_SUM, _WEIGHT_SQUARE_SUM, _WEIGHT_ELEMENT_COUNT, _MATRIX_NEAR_ZERO_START = range(6)  # fmt: skip
 
 # Columns of ``totals``: element-weighted effective-gain distribution statistics.
 _GAIN_SUM, _GAIN_SQUARE_SUM, _GAIN_ELEMENT_COUNT, _GAIN_SOFTPLUS_COUNT, _GAIN_SATURATED_COUNT, _GAIN_STAT_COUNT = range(6)  # fmt: skip
@@ -34,7 +34,7 @@ _GAIN_SUM, _GAIN_SQUARE_SUM, _GAIN_ELEMENT_COUNT, _GAIN_SOFTPLUS_COUNT, _GAIN_SA
 _MATRIX_RMS_SUM, _MATRIX_COUNT, _MATRIX_AXIS_STAT_COUNT = range(3)
 
 # Fixed columns of ``matrix_totals``; one sparsity-sum column per threshold follows these.
-_SCALE_SUM, _PAIR_COUNT, _COMBINED_LOG_SCALE_SUM, _ROW_COL_IMBALANCE_SUM, _SOFTPLUS_PAIR_COUNT, _SPARSITY_SUM_START = range(6)  # fmt: skip
+_SCALE_SUM, _PAIR_COUNT, _COMBINED_LOG_SCALE_SUM, _ROW_COL_IMBALANCE_SUM, _SOFTPLUS_PAIR_COUNT, _SPARSITY_MATRIX_COUNT, _PARAM_RMS_SUM, _PARAM_RMS_COUNT, _SPARSITY_SUM_START = range(9)  # fmt: skip
 
 _DEFAULT_SPARSITY_THRESHOLDS = (1e-20, 1e-10, 1e-30)
 _GAIN_FAMILIES = (
@@ -45,6 +45,8 @@ _GAIN_FAMILIES = (
     "attention-out",
     "expert-in",
     "expert-out",
+    "moe-latent-in",
+    "moe-latent-out",
     "dense-mlp-in",
     "dense-mlp-out",
     "unclassified",
@@ -61,6 +63,10 @@ def _gain_log_family(name: str, param: torch.Tensor) -> str:
         return "output"
 
     is_out = getattr(param, "is_out_proj", False)
+    if "fc1_latent_proj" in name:
+        return "moe-latent-in"
+    if "fc2_latent_proj" in name:
+        return "moe-latent-out"
     if "experts" in name:
         return "expert-out" if is_out else "expert-in"
     if "attention" in name:
@@ -129,6 +135,7 @@ def _accumulate_reduced_matrix_batch(
     matrix_totals: torch.Tensor,
     sparsity_thresholds: tuple[float, ...],
     log_gains: bool,
+    log_param_rms: bool,
 ) -> None:
     """Compute per-matrix metrics after TP has reconstructed each gain axis.
 
@@ -163,8 +170,7 @@ def _accumulate_reduced_matrix_batch(
                     matrix_axis_totals[scope, bucket, _MATRIX_COUNT].add_(matrix_count)
 
         if sparsity_thresholds:
-            weight_count_index = _MATRIX_NEAR_ZERO_START + len(sparsity_thresholds)
-            weight_element_count = values[:, 0, weight_count_index]
+            weight_element_count = values[:, 0, _WEIGHT_ELEMENT_COUNT]
             for threshold_index in range(len(sparsity_thresholds)):
                 sparsity = (
                     values[:, 0, _MATRIX_NEAR_ZERO_START + threshold_index]
@@ -176,11 +182,18 @@ def _accumulate_reduced_matrix_batch(
                         family_index,
                         _SPARSITY_SUM_START + threshold_index,
                     ].add_(sparsity.sum())
-            sparsity_count_index = _SPARSITY_SUM_START + len(sparsity_thresholds)
             for scope in scopes:
-                matrix_totals[scope, family_index, sparsity_count_index].add_(
+                matrix_totals[scope, family_index, _SPARSITY_MATRIX_COUNT].add_(
                     matrix_count
                 )
+
+        if log_param_rms:
+            param_rms = torch.sqrt(
+                values[:, 0, _WEIGHT_SQUARE_SUM] / values[:, 0, _WEIGHT_ELEMENT_COUNT]
+            )
+            for scope in scopes:
+                matrix_totals[scope, family_index, _PARAM_RMS_SUM].add_(param_rms.sum())
+                matrix_totals[scope, family_index, _PARAM_RMS_COUNT].add_(matrix_count)
 
         if not log_gains or "row" not in present_axes or "col" not in present_axes:
             continue
@@ -220,6 +233,7 @@ def _accumulate_md_matrix_stats(
     matrix_totals: torch.Tensor,
     sparsity_thresholds: tuple[float, ...],
     log_gains: bool,
+    log_param_rms: bool,
 ) -> None:
     """Build the sufficient statistics needed for matrix-level metrics.
 
@@ -248,14 +262,16 @@ def _accumulate_md_matrix_stats(
                 )
             tp_rank = get_pg_rank(tp_group) if tp_group is not None else 0
             matrix_count = param.size(0) if param.ndim == 3 else 1
-            matrix_stat_count = _MATRIX_NEAR_ZERO_START + len(sparsity_thresholds) + 1
+            matrix_stat_count = _MATRIX_NEAR_ZERO_START + len(sparsity_thresholds)
             record = torch.zeros(
                 (matrix_count, len(_GAIN_AXES), matrix_stat_count),
                 dtype=torch.float64,
                 device=param.device,
             )
             partition_dim = getattr(param, "partition_dim", None)
-            if sparsity_thresholds and (partition_dim in {0, 1} or tp_rank == 0):
+            if (sparsity_thresholds or log_param_rms) and (
+                partition_dim in {0, 1} or tp_rank == 0
+            ):
                 # MDDecoupling reapplies gains to the parameter at the end of every optimizer
                 # step, before logging runs. ``param`` is therefore already the effective weight.
                 matrix_weights = param.detach().reshape(matrix_count, -1)
@@ -268,11 +284,15 @@ def _accumulate_md_matrix_stats(
                         matrix_weights.eq(0)
                         if threshold <= smallest_positive
                         else matrix_weights.abs().lt(threshold)
-                    )
+                    ) # NOTE: Needs to create a full sized temporary matrix for abs and then another int8 one for the boolean comparison.
                     record[:, 0, _MATRIX_NEAR_ZERO_START + threshold_index] = (
                         below_threshold.sum(dim=1)
                     )
-                record[:, 0, matrix_stat_count - 1] = matrix_weights.size(1)
+                if log_param_rms:
+                    record[:, 0, _WEIGHT_SQUARE_SUM] = torch.linalg.vector_norm(
+                        matrix_weights, dim=1, dtype=torch.float32
+                    ).square()
+                record[:, 0, _WEIGHT_ELEMENT_COUNT] = matrix_weights.size(1)
             for axis_index, axis in enumerate(_GAIN_AXES):
                 raw_gain = state.get(f"{axis}_gain")
                 if raw_gain is None or not log_gains:
@@ -336,6 +356,7 @@ def _accumulate_md_matrix_stats(
             matrix_totals,
             sparsity_thresholds,
             log_gains,
+            log_param_rms,
         )
 
 
@@ -376,7 +397,7 @@ def _append_md_gain_stats(
                 )
 
         scale_sum, pair_count, combined_sum, imbalance_sum, softplus_pair_count = (
-            matrix_totals[family_index, :_SPARSITY_SUM_START].tolist()
+            matrix_totals[family_index, :_SPARSITY_MATRIX_COUNT].tolist()
         )
         if pair_count:
             stats[f"{prefix}/gain-field/{family}/rms"] = scale_sum / pair_count
@@ -387,8 +408,9 @@ def _append_md_gain_stats(
             stats[f"{prefix}/gauge/{family}/row-col-imbalance"] = (
                 imbalance_sum / softplus_pair_count
             )
-        sparsity_count_index = _SPARSITY_SUM_START + len(sparsity_thresholds)
-        sparsity_matrix_count = matrix_totals[family_index, sparsity_count_index].item()
+        sparsity_matrix_count = matrix_totals[
+            family_index, _SPARSITY_MATRIX_COUNT
+        ].item()
         if sparsity_matrix_count:
             for threshold_index, threshold in enumerate(sparsity_thresholds):
                 sparsity_sum = matrix_totals[
@@ -398,6 +420,10 @@ def _append_md_gain_stats(
                 stats[f"{prefix}/sparsity/{family}/fraction-below-{threshold}"] = (
                     sparsity_sum / sparsity_matrix_count
                 )
+        param_rms_sum = matrix_totals[family_index, _PARAM_RMS_SUM].item()
+        param_rms_count = matrix_totals[family_index, _PARAM_RMS_COUNT].item()
+        if param_rms_count:
+            stats[f"{prefix}/params/{family}/rms"] = param_rms_sum / param_rms_count
 
 
 @torch.no_grad()
@@ -407,6 +433,7 @@ def collect_md_gain_stats(
     sparsity_thresholds=_DEFAULT_SPARSITY_THRESHOLDS,
     log_gains: bool = True,
     log_sparsity: bool = True,
+    log_param_rms: bool = True,
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-MD statistics.
 
@@ -414,7 +441,7 @@ def collect_md_gain_stats(
     sufficient statistics are accumulated on-device, all scopes are reduced together, and only
     the final scalar divisions happen on CPU.
     """
-    if not log_gains and not log_sparsity:
+    if not log_gains and not log_sparsity and not log_param_rms:
         return {}
     sparsity_thresholds = (
         tuple(dict.fromkeys(float(value) for value in sparsity_thresholds))
@@ -499,7 +526,7 @@ def collect_md_gain_stats(
         (
             scope_count,
             len(_GAIN_FAMILIES),
-            _SPARSITY_SUM_START + len(sparsity_thresholds) + 1,
+            _SPARSITY_SUM_START + len(sparsity_thresholds),
         ),
         dtype=torch.float64,
         device=device,
@@ -514,6 +541,7 @@ def collect_md_gain_stats(
         matrix_totals,
         sparsity_thresholds,
         log_gains,
+        log_param_rms,
     )
     for md_optimizer in md_optimizers:
         for param, state in md_optimizer.state.items():

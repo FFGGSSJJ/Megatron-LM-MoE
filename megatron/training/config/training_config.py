@@ -214,6 +214,9 @@ class LoggerConfig:
     log_muon_md_sparsity: bool = False
     """If set, log effective-weight sparsity by Muon-MD parameter family."""
 
+    log_muon_md_param_rms: bool = False
+    """If set, log effective-weight RMS by Muon-MD parameter family."""
+
     log_muon_md_per_layer: bool = False
     """If set, additionally log all Muon-MD statistics by global layer."""
 

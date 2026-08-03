@@ -3252,7 +3252,11 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if args.log_muon_md_gains or args.log_muon_md_sparsity:
+        if (
+            args.log_muon_md_gains
+            or args.log_muon_md_sparsity
+            or args.log_muon_md_param_rms
+        ):
             muon_md_log_interval = args.muon_md_log_interval or args.log_interval
             if iteration % muon_md_log_interval == 0:
                 md_gain_stats = collect_md_gain_stats(
@@ -3261,6 +3265,7 @@ def train(
                     sparsity_thresholds=args.muon_md_sparsity_thresholds,
                     log_gains=args.log_muon_md_gains,
                     log_sparsity=args.log_muon_md_sparsity,
+                    log_param_rms=args.log_muon_md_param_rms,
                 )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)

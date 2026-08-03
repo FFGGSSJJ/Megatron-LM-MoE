@@ -35,6 +35,8 @@ def test_md_gain_log_family_classifies_matrix_types():
             "is_out_proj",
             "expert-out",
         ),
+        ("decoder.layers.0.mlp.fc1_latent_proj.weight", None, "moe-latent-in"),
+        ("decoder.layers.0.mlp.fc2_latent_proj.weight", None, "moe-latent-out"),
         ("decoder.layers.0.mlp.linear_fc1.weight", None, "dense-mlp-in"),
         (
             "decoder.layers.0.mlp.linear_fc2.weight",
@@ -205,6 +207,9 @@ def test_collect_md_gain_stats_logs_effective_weight_sparsity_per_matrix():
     assert stats[
         "muon-md/layers/1/sparsity/expert-in/fraction-below-1e-20"
     ] == pytest.approx(0.0)
+    assert stats["muon-md/params/expert-in/rms"] == pytest.approx(1.25)
+    assert stats["muon-md/layers/0/params/expert-in/rms"] == pytest.approx(0.5)
+    assert stats["muon-md/layers/1/params/expert-in/rms"] == pytest.approx(2.0)
 
     custom_stats = collect_md_gain_stats(wrapped_optimizer, sparsity_thresholds=[0.5])
     assert custom_stats[
@@ -212,14 +217,26 @@ def test_collect_md_gain_stats_logs_effective_weight_sparsity_per_matrix():
     ] == pytest.approx(0.375)
     assert not any("fraction-below-1e-20" in name for name in custom_stats)
 
-    sparsity_only_stats = collect_md_gain_stats(wrapped_optimizer, log_gains=False)
+    sparsity_only_stats = collect_md_gain_stats(
+        wrapped_optimizer, log_gains=False, log_param_rms=False
+    )
     assert any("/sparsity/" in name for name in sparsity_only_stats)
     assert not any("/gains/" in name for name in sparsity_only_stats)
     assert not any("/gain-field/" in name for name in sparsity_only_stats)
+    assert not any("/params/" in name for name in sparsity_only_stats)
 
-    gains_only_stats = collect_md_gain_stats(wrapped_optimizer, log_sparsity=False)
+    gains_only_stats = collect_md_gain_stats(
+        wrapped_optimizer, log_sparsity=False, log_param_rms=False
+    )
     assert any("/gains/" in name for name in gains_only_stats)
     assert not any("/sparsity/" in name for name in gains_only_stats)
+    assert not any("/params/" in name for name in gains_only_stats)
+
+    param_only_stats = collect_md_gain_stats(
+        wrapped_optimizer, log_gains=False, log_sparsity=False
+    )
+    assert param_only_stats["muon-md/params/expert-in/rms"] == pytest.approx(1.25)
+    assert all("/params/" in name for name in param_only_stats)
 
 
 def test_collect_md_gain_stats_pairs_row_and_col_within_each_matrix():
@@ -448,6 +465,7 @@ def test_gain_stats_count_tp_shards_once_and_deduplicate_replicas():
         assert stats[
             "muon-md/sparsity/attention-in/fraction-below-1e-20"
         ] == pytest.approx(0.5)
+        assert stats["muon-md/params/attention-in/rms"] == pytest.approx(0.5**0.5)
     finally:
         Utils.destroy_model_parallel()
 
