@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, EPFL / Swiss AI Initiative.
 
 """Distributed TensorBoard/W&B statistics for MDDecoupling gains.
 
@@ -16,7 +16,12 @@ from typing import Dict, List, TYPE_CHECKING
 
 import torch
 
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 
@@ -36,7 +41,6 @@ _MATRIX_RMS_SUM, _MATRIX_COUNT, _MATRIX_AXIS_STAT_COUNT = range(3)
 # Fixed columns of ``matrix_totals``; one sparsity-sum column per threshold follows these.
 _SCALE_SUM, _PAIR_COUNT, _COMBINED_LOG_SCALE_SUM, _ROW_COL_IMBALANCE_SUM, _SOFTPLUS_PAIR_COUNT, _SPARSITY_MATRIX_COUNT, _PARAM_RMS_SUM, _PARAM_RMS_COUNT, _SPARSITY_SUM_START = range(9)  # fmt: skip
 
-_DEFAULT_SPARSITY_THRESHOLDS = (1e-20, 1e-10, 1e-30)
 _GAIN_FAMILIES = (
     "router",
     "embedding",
@@ -51,6 +55,38 @@ _GAIN_FAMILIES = (
     "dense-mlp-out",
     "unclassified",
 )
+
+
+def _matrix_weight_stats(
+    matrix_weights: torch.Tensor, thresholds: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Count near-zero values and accumulate squared weights."""
+    absolute = matrix_weights.abs()
+    near_zero_counts = torch.stack(
+        [(absolute < threshold).sum(dim=1) for threshold in thresholds.unbind()], dim=1
+    )
+    return near_zero_counts, matrix_weights.float().square().sum(dim=1)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def _compiled_matrix_weight_stats(
+    matrix_weights: torch.Tensor, thresholds: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # NOTE: With the compilation we remove the problem of having the sparsity generate two full temporal matrices and also iterating over the whole matrix 3 times.
+    return _matrix_weight_stats(matrix_weights, thresholds)
+
+
+def _softplus_matrix_gain_stats(raw_gains: torch.Tensor) -> torch.Tensor:
+    """Compute the two softplus matrix reductions in one pass."""
+    effective_gains = torch.nn.functional.softplus(raw_gains.to(torch.float64))
+    return torch.stack(
+        (effective_gains.square().sum(dim=1), effective_gains.log().sum(dim=1)), dim=1
+    )
+
+
+@torch.compile(dynamic=True, fullgraph=True)
+def _compiled_softplus_matrix_gain_stats(raw_gains: torch.Tensor) -> torch.Tensor:
+    return _softplus_matrix_gain_stats(raw_gains)
 
 
 def _gain_log_family(name: str, param: torch.Tensor) -> str:
@@ -145,84 +181,143 @@ def _accumulate_reduced_matrix_batch(
     threshold. The resulting values are summed here and divided by their matrix counts in
     :func:`_append_md_gain_stats`.
     """
-    offset = 0
-    for family_index, layer, matrix_count, present_axes, is_softplus in metadata:
-        values = reduced[offset : offset + matrix_count]
-        offset += matrix_count
-        scopes = (
-            (0, layer + 1)
-            if layer is not None and layer + 1 < matrix_axis_totals.size(0)
-            else (0,)
+    family_indices = torch.tensor(
+        [family for family, _, count, _ in metadata for _ in range(count)],
+        dtype=torch.long,
+        device=reduced.device,
+    )
+    expanded_layers = [
+        (-1 if layer is None else layer)
+        for _, layer, count, _ in metadata
+        for _ in range(count)
+    ]
+    layers = torch.tensor(expanded_layers, dtype=torch.long, device=reduced.device)
+    softplus = torch.tensor(
+        [enabled for _, _, count, enabled in metadata for _ in range(count)],
+        dtype=torch.bool,
+        device=reduced.device,
+    )
+    layer_positions = torch.tensor(
+        [
+            position
+            for position, layer in enumerate(expanded_layers)
+            if 0 <= layer and layer + 1 < matrix_axis_totals.size(0)
+        ],
+        dtype=torch.long,
+        device=reduced.device,
+    )
+
+    # Per-matrix gain effective RMS is formed here, after TP has combined the squared sums and
+    # element counts for any sharded gain axis: sqrt(sum(phi(g)^2) / number of gain elements).
+    # These matrix RMS values feed ``gains/.../effective-rms``; they are distinct from the
+    # element-weighted gain RMS computed later in ``collect_md_gain_stats``.
+    gain_counts = reduced[:, :, _MATRIX_ELEMENT_COUNT]
+    axis_valid = gain_counts > 0
+    matrix_rms = torch.sqrt(
+        reduced[:, :, _MATRIX_SQUARE_SUM] / gain_counts.clamp_min(1)
+    )
+    if log_gains:
+        buckets = family_indices[:, None] * len(_GAIN_AXES) + torch.arange(
+            len(_GAIN_AXES), device=reduced.device
         )
-        if log_gains:
-            for axis_index, axis in enumerate(_GAIN_AXES):
-                if axis not in present_axes:
-                    continue
-                matrix_rms = torch.sqrt(
-                    values[:, axis_index, _MATRIX_SQUARE_SUM]
-                    / values[:, axis_index, _MATRIX_ELEMENT_COUNT]
+        axis_indices = buckets.flatten()
+        axis_values = torch.stack(
+            (matrix_rms, axis_valid.to(matrix_rms.dtype)), dim=2
+        ).view(-1, 2)
+        if layer_positions.numel():
+            layer_buckets = buckets.index_select(0, layer_positions)
+            layer_scopes = layers.index_select(0, layer_positions) + 1
+            axis_indices = torch.cat(
+                (
+                    axis_indices,
+                    (
+                        layer_scopes[:, None] * matrix_axis_totals.size(1)
+                        + layer_buckets
+                    ).flatten(),
                 )
-                bucket = family_index * len(_GAIN_AXES) + axis_index
-                for scope in scopes:
-                    matrix_axis_totals[scope, bucket, _MATRIX_RMS_SUM].add_(
-                        matrix_rms.sum()
-                    )
-                    matrix_axis_totals[scope, bucket, _MATRIX_COUNT].add_(matrix_count)
-
-        if sparsity_thresholds:
-            weight_element_count = values[:, 0, _WEIGHT_ELEMENT_COUNT]
-            for threshold_index in range(len(sparsity_thresholds)):
-                sparsity = (
-                    values[:, 0, _MATRIX_NEAR_ZERO_START + threshold_index]
-                    / weight_element_count
-                )
-                for scope in scopes:
-                    matrix_totals[
-                        scope,
-                        family_index,
-                        _SPARSITY_SUM_START + threshold_index,
-                    ].add_(sparsity.sum())
-            for scope in scopes:
-                matrix_totals[scope, family_index, _SPARSITY_MATRIX_COUNT].add_(
-                    matrix_count
-                )
-
-        if log_param_rms:
-            param_rms = torch.sqrt(
-                values[:, 0, _WEIGHT_SQUARE_SUM] / values[:, 0, _WEIGHT_ELEMENT_COUNT]
             )
-            for scope in scopes:
-                matrix_totals[scope, family_index, _PARAM_RMS_SUM].add_(param_rms.sum())
-                matrix_totals[scope, family_index, _PARAM_RMS_COUNT].add_(matrix_count)
+            layer_matrix_rms = matrix_rms.index_select(0, layer_positions)
+            layer_axis_valid = axis_valid.index_select(0, layer_positions)
+            axis_values = torch.cat(
+                (
+                    axis_values,
+                    torch.stack(
+                        (layer_matrix_rms, layer_axis_valid.to(matrix_rms.dtype)), dim=2
+                    ).view(-1, 2),
+                )
+            )
+        matrix_axis_totals.view(-1, _MATRIX_AXIS_STAT_COUNT).index_add_(
+            0, axis_indices, axis_values
+        )
 
-        if not log_gains or "row" not in present_axes or "col" not in present_axes:
-            continue
-        row = values[:, _GAIN_AXES.index("row")]
-        col = values[:, _GAIN_AXES.index("col")]
+    matrix_values = torch.zeros(
+        (reduced.size(0), matrix_totals.size(2)),
+        dtype=matrix_totals.dtype,
+        device=matrix_totals.device,
+    )
+    weight_element_count = reduced[:, 0, _WEIGHT_ELEMENT_COUNT]
+    weight_valid = weight_element_count > 0
+    if sparsity_thresholds:
+        # ``_matrix_weight_stats`` counted abs(effective weight) < threshold per matrix. Convert
+        # those counts into per-matrix fractions before families/layers average the matrices.
+        matrix_values[:, _SPARSITY_MATRIX_COUNT] = weight_valid
+        matrix_values[:, _SPARSITY_SUM_START:] = reduced[
+            :, 0, _MATRIX_NEAR_ZERO_START:
+        ] / weight_element_count[:, None].clamp_min(1)
+
+    # Frobenious RMS norm of the gain-baked weight (the effective weight)
+    if log_param_rms:
+        # ``params/.../rms`` = sqrt(sum(W_effective^2) / numel(W_effective)), computed per matrix
+        # here and then averaged with equal weight across matrices in the same family/scope.
+        matrix_values[:, _PARAM_RMS_SUM] = torch.sqrt(
+            reduced[:, 0, _WEIGHT_SQUARE_SUM] / weight_element_count.clamp_min(1)
+        )
+        matrix_values[:, _PARAM_RMS_COUNT] = weight_valid
+
+    if log_gains:
+        row, col = reduced[:, :2].unbind(dim=1)
+        row_rms, col_rms = matrix_rms[:, :2].unbind(dim=1)
+        row_col_valid = row[:, _MATRIX_ELEMENT_COUNT].gt(0) & col[
+            :, _MATRIX_ELEMENT_COUNT
+        ].gt(0)
+
         # RMS of the complete outer-product gain field: RMS(r c^T) = RMS(r) * RMS(c).
-        row_rms = torch.sqrt(row[:, _MATRIX_SQUARE_SUM] / row[:, _MATRIX_ELEMENT_COUNT])
-        col_rms = torch.sqrt(col[:, _MATRIX_SQUARE_SUM] / col[:, _MATRIX_ELEMENT_COUNT])
         scale = row_rms * col_rms
+        matrix_values[:, _SCALE_SUM] = torch.where(row_col_valid, scale, 0)
+        matrix_values[:, _PAIR_COUNT] = row_col_valid
 
-        for scope in scopes:
-            matrix_totals[scope, family_index, _SCALE_SUM].add_(scale.sum())
-            matrix_totals[scope, family_index, _PAIR_COUNT].add_(matrix_count)
+        # Gauge metrics use positive effective softplus gains. Their sum tracks the combined
+        # multiplicative log scale; their difference exposes row/column rescaling redundancy.
+        softplus_pair = row_col_valid & softplus
+        row_mean_log = row[:, _MATRIX_LOG_SUM] / row[
+            :, _MATRIX_ELEMENT_COUNT
+        ].clamp_min(1)
+        col_mean_log = col[:, _MATRIX_LOG_SUM] / col[
+            :, _MATRIX_ELEMENT_COUNT
+        ].clamp_min(1)
+        matrix_values[:, _COMBINED_LOG_SCALE_SUM] = torch.where(
+            softplus_pair, row_mean_log + col_mean_log, 0
+        )
+        matrix_values[:, _ROW_COL_IMBALANCE_SUM] = torch.where(
+            softplus_pair, row_mean_log - col_mean_log, 0
+        )
+        matrix_values[:, _SOFTPLUS_PAIR_COUNT] = softplus_pair
 
-        if is_softplus:
-            row_mean_log = row[:, _MATRIX_LOG_SUM] / row[:, _MATRIX_ELEMENT_COUNT]
-            col_mean_log = col[:, _MATRIX_LOG_SUM] / col[:, _MATRIX_ELEMENT_COUNT]
-            combined_sum = (row_mean_log + col_mean_log).sum()
-            imbalance_sum = (row_mean_log - col_mean_log).sum()
-            for scope in scopes:
-                matrix_totals[scope, family_index, _COMBINED_LOG_SCALE_SUM].add_(
-                    combined_sum
-                )
-                matrix_totals[scope, family_index, _ROW_COL_IMBALANCE_SUM].add_(
-                    imbalance_sum
-                )
-                matrix_totals[scope, family_index, _SOFTPLUS_PAIR_COUNT].add_(
-                    matrix_count
-                )
+    matrix_indices = family_indices
+    if layer_positions.numel():
+        matrix_indices = torch.cat(
+            (
+                matrix_indices,
+                (layers.index_select(0, layer_positions) + 1) * matrix_totals.size(1)
+                + family_indices.index_select(0, layer_positions),
+            )
+        )
+        matrix_values = torch.cat(
+            (matrix_values, matrix_values.index_select(0, layer_positions))
+        )
+    matrix_totals.view(-1, matrix_totals.size(2)).index_add_(
+        0, matrix_indices, matrix_values
+    )
 
 
 def _accumulate_md_matrix_stats(
@@ -277,21 +372,37 @@ def _accumulate_md_matrix_stats(
                 matrix_weights = param.detach().reshape(matrix_count, -1)
                 dtype_info = torch.finfo(matrix_weights.dtype)
                 smallest_positive = dtype_info.tiny * dtype_info.eps
-                for threshold_index, threshold in enumerate(sparsity_thresholds):
-                    # A threshold below the dtype's smallest positive value selects exact zeros.
-                    # Handling that case explicitly avoids underflowing the comparison scalar.
-                    below_threshold = (
-                        matrix_weights.eq(0)
-                        if threshold <= smallest_positive
-                        else matrix_weights.abs().lt(threshold)
-                    ) # NOTE: Needs to create a full sized temporary matrix for abs and then another int8 one for the boolean comparison.
-                    record[:, 0, _MATRIX_NEAR_ZERO_START + threshold_index] = (
-                        below_threshold.sum(dim=1)
+                weight_square_sum = None
+                if sparsity_thresholds:
+                    # This is where exact effective-weight sparsity is measured. Merged expert
+                    # tensors are reshaped with one row per expert, so every expert remains a
+                    # separate matrix rather than one combined 3D sparsity measurement.
+                    # The smallest representable positive threshold selects exact zeros without
+                    # underflowing the comparison value in the weight dtype.
+                    thresholds = matrix_weights.new_tensor(
+                        [
+                            max(threshold, smallest_positive)
+                            for threshold in sparsity_thresholds
+                        ]
                     )
-                if log_param_rms:
-                    record[:, 0, _WEIGHT_SQUARE_SUM] = torch.linalg.vector_norm(
+                    # NOTE: For now MuonMD always have the master FP32 parametes, so we will always have them in GPU
+                    matrix_stats = (
+                        _compiled_matrix_weight_stats
+                        if matrix_weights.is_cuda
+                        else _matrix_weight_stats
+                    )
+                    near_zero_counts, weight_square_sum = matrix_stats(
+                        matrix_weights, thresholds
+                    )
+                    record[:, 0, _MATRIX_NEAR_ZERO_START:] = near_zero_counts
+                if log_param_rms and weight_square_sum is None:
+                    # Parameter RMS needs the same sum(W_effective^2) as the sparsity kernel. If
+                    # sparsity is disabled, compute that sufficient statistic directly here.
+                    weight_square_sum = torch.linalg.vector_norm(
                         matrix_weights, dim=1, dtype=torch.float32
                     ).square()
+                if weight_square_sum is not None:
+                    record[:, 0, _WEIGHT_SQUARE_SUM] = weight_square_sum
                 record[:, 0, _WEIGHT_ELEMENT_COUNT] = matrix_weights.size(1)
             for axis_index, axis in enumerate(_GAIN_AXES):
                 raw_gain = state.get(f"{axis}_gain")
@@ -305,23 +416,27 @@ def _accumulate_md_matrix_stats(
                 if not gain_is_tp_sharded and tp_rank != 0:
                     continue
 
-                effective_gain = md_optimizer._phi(raw_gain).to(dtype=torch.float64)
-                matrix_gains = (
-                    effective_gain.reshape(matrix_count, -1)
+                raw_matrix_gains = (
+                    raw_gain.reshape(matrix_count, -1)
                     if param.ndim == 3
-                    else effective_gain.reshape(1, -1)
+                    else raw_gain.reshape(1, -1)
                 )
-                record[:, axis_index, _MATRIX_SQUARE_SUM] = matrix_gains.square().sum(
-                    dim=1
-                )
-                record[:, axis_index, _MATRIX_ELEMENT_COUNT] = matrix_gains.size(1)
+                # Matrix-level gain statistics are based on effective gains phi(raw_gain). Store
+                # their squared sum for effective RMS and, for softplus, their log sum for gauge
+                # metrics. TP combines these sufficient statistics before either value is formed.
                 if md_optimizer.gain_parametrization == "softplus":
-                    matrix_log_gains = torch.nn.functional.softplus(
-                        raw_gain.to(dtype=torch.float64)
-                    ).reshape(matrix_count, -1)
-                    record[:, axis_index, _MATRIX_LOG_SUM] = matrix_log_gains.log().sum(
-                        dim=1
+                    gain_stats = (
+                        _compiled_softplus_matrix_gain_stats
+                        if raw_gain.is_cuda
+                        else _softplus_matrix_gain_stats
+                    )(raw_matrix_gains)
+                    record[:, axis_index, _MATRIX_SQUARE_SUM] = gain_stats[:, 0]
+                    record[:, axis_index, _MATRIX_LOG_SUM] = gain_stats[:, 1]
+                else:
+                    record[:, axis_index, _MATRIX_SQUARE_SUM] = (
+                        raw_matrix_gains.to(torch.float64).square().sum(dim=1)
                     )
+                record[:, axis_index, _MATRIX_ELEMENT_COUNT] = raw_matrix_gains.size(1)
 
             records, metadata = batches.setdefault(tp_group, ([], []))
             records.append(record)
@@ -331,7 +446,6 @@ def _accumulate_md_matrix_stats(
                     family_indices.get(family, family_indices["unclassified"]),
                     getattr(param, "md_gain_log_layer", None),
                     matrix_count,
-                    present_axes,
                     md_optimizer.gain_parametrization == "softplus",
                 )
             )
@@ -362,11 +476,11 @@ def _accumulate_md_matrix_stats(
 
 def _append_md_gain_stats(
     stats: Dict[str, float],
-    totals: torch.Tensor,
-    minima: torch.Tensor,
-    maxima: torch.Tensor,
-    matrix_axis_totals: torch.Tensor,
-    matrix_totals: torch.Tensor,
+    totals: List,
+    minima: List,
+    maxima: List,
+    matrix_axis_totals: List,
+    matrix_totals: List,
     sparsity_thresholds: tuple[float, ...],
     prefix: str = "muon-md",
 ) -> None:
@@ -379,25 +493,23 @@ def _append_md_gain_stats(
     for family_index, family in enumerate(_GAIN_FAMILIES):
         for axis_index, axis in enumerate(_GAIN_AXES):
             bucket = family_index * len(_GAIN_AXES) + axis_index
-            total, sum_square, count, softplus_count, saturated_count = totals[
-                bucket
-            ].tolist()
+            total, sum_square, count, softplus_count, saturated_count = totals[bucket]
             if count == 0:
                 continue
             gain_prefix = f"{prefix}/gains/{family}/{axis}"
             stats[f"{gain_prefix}/mean"] = total / count
             stats[f"{gain_prefix}/rms"] = math.sqrt(sum_square / count)
-            matrix_rms_sum, matrix_count = matrix_axis_totals[bucket].tolist()
+            matrix_rms_sum, matrix_count = matrix_axis_totals[bucket]
             stats[f"{gain_prefix}/effective-rms"] = matrix_rms_sum / matrix_count
-            stats[f"{gain_prefix}/min"] = minima[bucket].item()
-            stats[f"{gain_prefix}/max"] = maxima[bucket].item()
+            stats[f"{gain_prefix}/min"] = minima[bucket]
+            stats[f"{gain_prefix}/max"] = maxima[bucket]
             if softplus_count:
                 stats[f"{gain_prefix}/saturated-fraction"] = (
                     saturated_count / softplus_count
                 )
 
         scale_sum, pair_count, combined_sum, imbalance_sum, softplus_pair_count = (
-            matrix_totals[family_index, :_SPARSITY_MATRIX_COUNT].tolist()
+            matrix_totals[family_index][:_SPARSITY_MATRIX_COUNT]
         )
         if pair_count:
             stats[f"{prefix}/gain-field/{family}/rms"] = scale_sum / pair_count
@@ -408,20 +520,17 @@ def _append_md_gain_stats(
             stats[f"{prefix}/gauge/{family}/row-col-imbalance"] = (
                 imbalance_sum / softplus_pair_count
             )
-        sparsity_matrix_count = matrix_totals[
-            family_index, _SPARSITY_MATRIX_COUNT
-        ].item()
+        sparsity_matrix_count = matrix_totals[family_index][_SPARSITY_MATRIX_COUNT]
         if sparsity_matrix_count:
             for threshold_index, threshold in enumerate(sparsity_thresholds):
-                sparsity_sum = matrix_totals[
-                    family_index,
-                    _SPARSITY_SUM_START + threshold_index,
-                ].item()
+                sparsity_sum = matrix_totals[family_index][
+                    _SPARSITY_SUM_START + threshold_index
+                ]
                 stats[f"{prefix}/sparsity/{family}/fraction-below-{threshold}"] = (
                     sparsity_sum / sparsity_matrix_count
                 )
-        param_rms_sum = matrix_totals[family_index, _PARAM_RMS_SUM].item()
-        param_rms_count = matrix_totals[family_index, _PARAM_RMS_COUNT].item()
+        param_rms_sum = matrix_totals[family_index][_PARAM_RMS_SUM]
+        param_rms_count = matrix_totals[family_index][_PARAM_RMS_COUNT]
         if param_rms_count:
             stats[f"{prefix}/params/{family}/rms"] = param_rms_sum / param_rms_count
 
@@ -430,7 +539,7 @@ def _append_md_gain_stats(
 def collect_md_gain_stats(
     optimizer,
     per_layer: bool = False,
-    sparsity_thresholds=_DEFAULT_SPARSITY_THRESHOLDS,
+    sparsity_thresholds=(1e-20, 1e-10, 1e-30),
     log_gains: bool = True,
     log_sparsity: bool = True,
     log_param_rms: bool = True,
@@ -471,6 +580,7 @@ def collect_md_gain_stats(
     if not md_optimizers and not distributed:
         return {}
 
+    nvtx_range_push("muon-md/logging")
     bucket_count = len(_GAIN_FAMILIES) * len(_GAIN_AXES)
     gain_params = (
         param
@@ -533,6 +643,7 @@ def collect_md_gain_stats(
     )
 
     family_indices = {name: index for index, name in enumerate(_GAIN_FAMILIES)}
+    nvtx_range_push("muon-md/logging/matrix-statistics")
     _accumulate_md_matrix_stats(
         md_optimizers,
         dp_state_is_sharded,
@@ -543,6 +654,9 @@ def collect_md_gain_stats(
         log_gains,
         log_param_rms,
     )
+    nvtx_range_pop("muon-md/logging/matrix-statistics")
+    nvtx_range_push("muon-md/logging/gain-statistics")
+    gain_entries = []
     for md_optimizer in md_optimizers:
         for param, state in md_optimizer.state.items():
             if not log_gains:
@@ -555,37 +669,91 @@ def collect_md_gain_stats(
                     md_optimizer, param, axis, dp_state_is_sharded
                 ):
                     continue
-                effective_gain = md_optimizer._phi(raw_gain).to(dtype=torch.float64)
                 bucket = family_index * len(_GAIN_AXES) + axis_index
-                gain_sum = effective_gain.sum()
-                gain_square_sum = effective_gain.square().sum()
-                gain_count = effective_gain.numel()
-                gain_min = effective_gain.min()
-                gain_max = effective_gain.max()
-                saturated_count = None
-
-                if md_optimizer.gain_parametrization == "softplus":
-                    # sigmoid(raw_gain) is d softplus(raw_gain) / d raw_gain. Below 1e-2, the
-                    # effective multiplier changes by less than 1% of the raw-gain update.
-                    saturated_count = torch.sigmoid(raw_gain).lt(1e-2).sum()
                 layer = getattr(param, "md_gain_log_layer", None)
-                scopes = (0, layer + 1) if per_layer and layer is not None else (0,)
-                for scope in scopes:
-                    totals[scope, bucket, _GAIN_SUM].add_(gain_sum)
-                    totals[scope, bucket, _GAIN_SQUARE_SUM].add_(gain_square_sum)
-                    totals[scope, bucket, _GAIN_ELEMENT_COUNT].add_(gain_count)
-                    if saturated_count is not None:
-                        totals[scope, bucket, _GAIN_SOFTPLUS_COUNT].add_(gain_count)
-                        totals[scope, bucket, _GAIN_SATURATED_COUNT].add_(
-                            saturated_count
-                        )
-                    minima[scope, bucket].copy_(
-                        torch.minimum(minima[scope, bucket], gain_min)
+                layer_scope = layer + 1 if per_layer and layer is not None else None
+                gain_entries.append(
+                    (
+                        raw_gain,
+                        bucket,
+                        layer_scope,
+                        md_optimizer.gain_parametrization == "softplus",
                     )
-                    maxima[scope, bucket].copy_(
-                        torch.maximum(maxima[scope, bucket], gain_max)
-                    )
+                )
+    if gain_entries:
+        # These are element-level gain distribution metrics: mean, RMS, min, max, and softplus
+        # saturation. Unlike ``effective-rms`` above, every gain element has equal weight here;
+        # differently sized matrices therefore contribute different numbers of observations.
+        entry_counts = torch.tensor(
+            [entry[0].numel() for entry in gain_entries],
+            dtype=torch.long,
+            device=device,
+        )
+        raw_values = torch.cat(
+            [entry[0].detach().flatten() for entry in gain_entries]
+        ).to(torch.float64)
+        entry_ids = torch.repeat_interleave(
+            torch.arange(len(gain_entries), device=device), entry_counts
+        )
+        softplus_values = torch.tensor(
+            [entry[3] for entry in gain_entries], dtype=torch.bool, device=device
+        )[entry_ids]
+        effective_gain = torch.where(
+            softplus_values, torch.nn.functional.softplus(raw_values), raw_values
+        )
+        # Saturation is evaluated on each raw softplus gain, not on the weight matrix. The raw
+        # threshold below is exactly equivalent to sigmoid(raw_gain) < 1e-2.
+        # sigmoid(raw_gain) is d softplus(raw_gain) / d raw_gain. Below 1e-2, the
+        # effective multiplier changes by less than 1% of the raw-gain update.
+        saturated = softplus_values & raw_values.lt(math.log(1e-2 / (1 - 1e-2)))
+        gain_values = torch.stack(
+            (
+                torch.segment_reduce(effective_gain, "sum", lengths=entry_counts),
+                torch.segment_reduce(
+                    effective_gain.square(), "sum", lengths=entry_counts
+                ),
+                entry_counts.to(torch.float64),
+                torch.segment_reduce(
+                    softplus_values.to(torch.float64), "sum", lengths=entry_counts
+                ),
+                torch.segment_reduce(
+                    saturated.to(torch.float64), "sum", lengths=entry_counts
+                ),
+            ),
+            dim=1,
+        )
+        gain_minima = torch.segment_reduce(effective_gain, "min", lengths=entry_counts)
+        gain_maxima = torch.segment_reduce(effective_gain, "max", lengths=entry_counts)
+        entry_buckets = torch.tensor(
+            [entry[1] for entry in gain_entries], dtype=torch.long, device=device
+        )
+        flat_totals = totals.view(-1, _GAIN_STAT_COUNT)
+        flat_minima = minima.view(-1)
+        flat_maxima = maxima.view(-1)
+        flat_totals.index_add_(0, entry_buckets, gain_values)
+        flat_minima.scatter_reduce_(0, entry_buckets, gain_minima, reduce="amin")
+        flat_maxima.scatter_reduce_(0, entry_buckets, gain_maxima, reduce="amax")
 
+        layer_entries = [
+            index for index, entry in enumerate(gain_entries) if entry[2] is not None
+        ]
+        if layer_entries:
+            layer_indices = [
+                gain_entries[index][2] * bucket_count + gain_entries[index][1]
+                for index in layer_entries
+            ]
+            layer_entries = torch.tensor(layer_entries, dtype=torch.long, device=device)
+            layer_indices = torch.tensor(layer_indices, dtype=torch.long, device=device)
+            flat_totals.index_add_(0, layer_indices, gain_values[layer_entries])
+            flat_minima.scatter_reduce_(
+                0, layer_indices, gain_minima[layer_entries], reduce="amin"
+            )
+            flat_maxima.scatter_reduce_(
+                0, layer_indices, gain_maxima[layer_entries], reduce="amax"
+            )
+    nvtx_range_pop("muon-md/logging/gain-statistics")
+
+    nvtx_range_push("muon-md/logging/global-reductions")
     if distributed:
         works = []
         if log_gains:
@@ -604,12 +772,16 @@ def collect_md_gain_stats(
         works.append(torch.distributed.all_reduce(matrix_totals, async_op=True))
         for work in works:
             work.wait()
+    nvtx_range_pop("muon-md/logging/global-reductions")
 
+    nvtx_range_push("muon-md/logging/cpu-transfer")
     totals, minima, maxima, matrix_axis_totals, matrix_totals = (
-        tensor.cpu()
+        tensor.cpu().tolist()
         for tensor in (totals, minima, maxima, matrix_axis_totals, matrix_totals)
     )
+    nvtx_range_pop("muon-md/logging/cpu-transfer")
     stats = {}
+    nvtx_range_push("muon-md/logging/format-statistics")
     for scope in range(scope_count):
         prefix = "muon-md" if scope == 0 else f"muon-md/layers/{scope - 1}"
         _append_md_gain_stats(
@@ -622,4 +794,6 @@ def collect_md_gain_stats(
             sparsity_thresholds,
             prefix=prefix,
         )
+    nvtx_range_pop("muon-md/logging/format-statistics")
+    nvtx_range_pop("muon-md/logging")
     return stats
