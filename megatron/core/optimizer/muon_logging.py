@@ -1,6 +1,6 @@
 # Copyright (c) 2026, EPFL / Swiss AI Initiative.
 
-"""Distributed TensorBoard/W&B statistics for MDDecoupling gains.
+"""Distributed TensorBoard/W&B statistics for Muon and Muon-MD parameters.
 
 The computation has three stages:
 
@@ -12,7 +12,7 @@ The computation has three stages:
 """
 
 import math
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List
 
 import torch
 
@@ -24,10 +24,6 @@ from megatron.core.utils import (
 )
 
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-
-if TYPE_CHECKING:
-    from .md_decoupling import MDDecoupling
-
 
 _GAIN_AXES = ("row", "col", "flat")
 _MATRIX_SQUARE_SUM, _MATRIX_ELEMENT_COUNT, _MATRIX_LOG_SUM, _WEIGHT_SQUARE_SUM, _WEIGHT_ELEMENT_COUNT, _MATRIX_NEAR_ZERO_START = range(6)  # fmt: skip
@@ -119,7 +115,7 @@ def _gain_log_family(name: str, param: torch.Tensor) -> str:
 
 
 def _include_gain_in_global_stats(
-    md_optimizer: "MDDecoupling",
+    md_optimizer: torch.optim.Optimizer,
     param: torch.Tensor,
     axis: str,
     dp_state_is_sharded: bool,
@@ -156,7 +152,7 @@ def _include_gain_in_global_stats(
 
 
 def _include_param_in_matrix_stats(
-    md_optimizer: "MDDecoupling", param: torch.Tensor, dp_state_is_sharded: bool
+    md_optimizer: torch.optim.Optimizer, param: torch.Tensor, dp_state_is_sharded: bool
 ) -> bool:
     """Select one DP/CP owner while retaining every unique TP/EP matrix shard."""
     if md_optimizer.pg_collection is None or dp_state_is_sharded:
@@ -327,7 +323,7 @@ def _accumulate_reduced_matrix_batch(
 
 
 def _accumulate_md_matrix_stats(
-    md_optimizers: List["MDDecoupling"],
+    md_optimizers: List[torch.optim.Optimizer],
     dp_state_is_sharded: bool,
     family_indices: Dict[str, int],
     matrix_axis_totals: torch.Tensor,
@@ -350,7 +346,7 @@ def _accumulate_md_matrix_stats(
             ):
                 continue
             present_axes = [axis for axis in _GAIN_AXES if f"{axis}_gain" in state]
-            if not present_axes and not sparsity_thresholds:
+            if not present_axes and not sparsity_thresholds and not log_param_rms:
                 continue
 
             is_expert = getattr(param, "expert_tp", False)
@@ -452,7 +448,7 @@ def _accumulate_md_matrix_stats(
                     family_indices.get(family, family_indices["unclassified"]),
                     getattr(param, "md_gain_log_layer", None),
                     matrix_count,
-                    md_optimizer.gain_parametrization == "softplus",
+                    getattr(md_optimizer, "gain_parametrization", "direct") == "softplus",
                 )
             )
 
@@ -541,7 +537,6 @@ def _append_md_gain_stats(
             stats[f"{prefix}/params/{family}/rms"] = param_rms_sum / param_rms_count
 
 
-@torch.no_grad()
 def collect_md_gain_stats(
     optimizer,
     per_layer: bool = False,
@@ -550,7 +545,56 @@ def collect_md_gain_stats(
     log_sparsity: bool = True,
     log_param_rms: bool = True,
 ) -> Dict[str, float]:
-    """Collect selected global and optionally per-layer Muon-MD statistics.
+    """Collect selected global and optionally per-layer Muon-MD statistics."""
+    from .md_decoupling import MDDecoupling
+
+    return _collect_muon_stats(
+        optimizer,
+        MDDecoupling,
+        "muon-md",
+        per_layer,
+        sparsity_thresholds,
+        log_gains,
+        log_sparsity,
+        log_param_rms,
+    )
+
+
+def collect_muon_stats(
+    optimizer,
+    per_layer: bool = False,
+    sparsity_thresholds=(1e-20, 1e-10, 1e-30),
+    log_gains: bool = True,
+    log_sparsity: bool = True,
+    log_param_rms: bool = True,
+) -> Dict[str, float]:
+    """Collect standard Muon LayerNorm gain, weight sparsity, and RMS statistics."""
+    from .muon import TensorParallelMuon
+
+    return _collect_muon_stats(
+        optimizer,
+        TensorParallelMuon,
+        "muon",
+        per_layer,
+        sparsity_thresholds,
+        log_gains,
+        log_sparsity,
+        log_param_rms,
+    )
+
+
+@torch.no_grad()
+def _collect_muon_stats(
+    optimizer,
+    optimizer_class,
+    namespace: str,
+    per_layer: bool,
+    sparsity_thresholds,
+    log_gains: bool,
+    log_sparsity: bool,
+    log_param_rms: bool,
+) -> Dict[str, float]:
+    """Collect selected global and optionally per-layer Muon-family statistics.
 
     Scope 0 holds the global aggregates; scope ``layer + 1`` holds a layer's aggregates. Local
     sufficient statistics are accumulated on-device, all scopes are reduced together, and only
@@ -567,24 +611,21 @@ def collect_md_gain_stats(
         not sparsity_thresholds
         or any(not math.isfinite(value) or value <= 0 for value in sparsity_thresholds)
     ):
-        raise ValueError("Muon-MD sparsity thresholds must be finite positive values")
-
-    # Local import avoids a module cycle: MDDecoupling imports the lightweight family classifier.
-    from .md_decoupling import MDDecoupling
+        raise ValueError(f"{namespace} sparsity thresholds must be finite positive values")
 
     wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
     inner_optimizers = [
         getattr(wrapped, "optimizer", wrapped) for wrapped in wrapped_optimizers
     ]
     md_optimizers = [
-        wrapped for wrapped in inner_optimizers if isinstance(wrapped, MDDecoupling)
+        wrapped for wrapped in inner_optimizers if isinstance(wrapped, optimizer_class)
     ]
     layernorm_params = [
         param
         for inner_optimizer in inner_optimizers
         for group in inner_optimizer.param_groups
         for param in group["params"]
-        if getattr(param, "md_gain_log_family", None) == "layernorm"
+        if log_gains and getattr(param, "md_gain_log_family", None) == "layernorm"
     ]
 
     logged_params = [
@@ -598,20 +639,11 @@ def collect_md_gain_stats(
     if not md_optimizers and not distributed:
         return {}
 
-    nvtx_range_push("muon-md/logging")
+    nvtx_range_push(f"{namespace}/logging")
     bucket_count = len(_GAIN_FAMILIES) * len(_GAIN_AXES)
-    gain_params = (
-        param
-        for md_optimizer in md_optimizers
-        for param, state in md_optimizer.state.items()
-        if any(f"{axis}_gain" in state for axis in _GAIN_AXES)
-    )
-    gain_param = next(gain_params, None)
     device = (
-        gain_param.device
-        if gain_param is not None
-        else layernorm_params[0].device
-        if layernorm_params
+        logged_params[0].device
+        if logged_params
         else (
             torch.device("cuda", torch.cuda.current_device())
             if torch.cuda.is_available()
@@ -662,7 +694,7 @@ def collect_md_gain_stats(
     )
 
     family_indices = {name: index for index, name in enumerate(_GAIN_FAMILIES)}
-    nvtx_range_push("muon-md/logging/matrix-statistics")
+    nvtx_range_push(f"{namespace}/logging/matrix-statistics")
     _accumulate_md_matrix_stats(
         md_optimizers,
         dp_state_is_sharded,
@@ -673,8 +705,8 @@ def collect_md_gain_stats(
         log_gains,
         log_param_rms,
     )
-    nvtx_range_pop("muon-md/logging/matrix-statistics")
-    nvtx_range_push("muon-md/logging/gain-statistics")
+    nvtx_range_pop(f"{namespace}/logging/matrix-statistics")
+    nvtx_range_push(f"{namespace}/logging/gain-statistics")
     gain_entries = []
     for md_optimizer in md_optimizers:
         for param, state in md_optimizer.state.items():
@@ -791,9 +823,9 @@ def collect_md_gain_stats(
             flat_maxima.scatter_reduce_(
                 0, layer_indices, gain_maxima[layer_entries], reduce="amax"
             )
-    nvtx_range_pop("muon-md/logging/gain-statistics")
+    nvtx_range_pop(f"{namespace}/logging/gain-statistics")
 
-    nvtx_range_push("muon-md/logging/global-reductions")
+    nvtx_range_push(f"{namespace}/logging/global-reductions")
     if distributed:
         works = []
         if log_gains:
@@ -812,18 +844,18 @@ def collect_md_gain_stats(
         works.append(torch.distributed.all_reduce(matrix_totals, async_op=True))
         for work in works:
             work.wait()
-    nvtx_range_pop("muon-md/logging/global-reductions")
+    nvtx_range_pop(f"{namespace}/logging/global-reductions")
 
-    nvtx_range_push("muon-md/logging/cpu-transfer")
+    nvtx_range_push(f"{namespace}/logging/cpu-transfer")
     totals, minima, maxima, matrix_axis_totals, matrix_totals = (
         tensor.cpu().tolist()
         for tensor in (totals, minima, maxima, matrix_axis_totals, matrix_totals)
     )
-    nvtx_range_pop("muon-md/logging/cpu-transfer")
+    nvtx_range_pop(f"{namespace}/logging/cpu-transfer")
     stats = {}
-    nvtx_range_push("muon-md/logging/format-statistics")
+    nvtx_range_push(f"{namespace}/logging/format-statistics")
     for scope in range(scope_count):
-        prefix = "muon-md" if scope == 0 else f"muon-md/layers/{scope - 1}"
+        prefix = namespace if scope == 0 else f"{namespace}/layers/{scope - 1}"
         _append_md_gain_stats(
             stats,
             totals[scope],
@@ -834,6 +866,6 @@ def collect_md_gain_stats(
             sparsity_thresholds,
             prefix=prefix,
         )
-    nvtx_range_pop("muon-md/logging/format-statistics")
-    nvtx_range_pop("muon-md/logging")
+    nvtx_range_pop(f"{namespace}/logging/format-statistics")
+    nvtx_range_pop(f"{namespace}/logging")
     return stats
