@@ -2594,6 +2594,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-no-split-fc1', action='store_false', default=True,
+                       dest='muon_split_fc1',
+                       help='Whether to split fused GLU FC1 parameters into gate/up matrices '
+                       'for Muon or MDDecoupling')
     group.add_argument('--muon-split-mla-per-head', action='store_true',
                        help='Split MLA up-projection parameters per attention head for Muon or '
                        'MDDecoupling.')
