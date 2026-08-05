@@ -306,10 +306,15 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         # constraint preserves Megatron's depth-aware init for residual-out projections.
         hypersphere_scale_out_proj_init: bool = False,
         num_layers: Optional[int] = None,
-        # Place each flat-mode matrix's sphere at its init Frobenius norm (init_std=1/sqrt(hidden))
-        # instead of the shape-native sqrt(max(d_out,d_in)). Fixes the narrow matrices (MLA lora,
-        # MoE fc2, GQA K/V) whose smaller dim != hidden and would otherwise be pulled off init.
-        hypersphere_radius_from_init: bool = False,
+        # Where to place the sphere, relative to the shape-native radius (unit row/col slices,
+        # sqrt(max(d_out,d_in)) for flat). See _init_radius_scale / _target_slice_radius.
+        #   "shape_native": unchanged.
+        #   "init":         flat-mode sphere at the init Frobenius norm (init_std=1/sqrt(hidden)),
+        #                   fixing narrow matrices (MLA lora, MoE fc2, GQA K/V) whose smaller dim
+        #                   != hidden and would otherwise be pulled off init.
+        #   "fan_in":       sphere at init_std=1/sqrt(d_in), i.e. ||W||_F = sqrt(d_out) for any
+        #                   shape (unit rows), independent of hidden_size.
+        hypersphere_radius_mode: Literal["shape_native", "init", "fan_in"] = "shape_native",
         hidden_size: Optional[int] = None,
         # Muon (orthogonalized updates).
         use_orthogonal_updates: bool = False,
@@ -353,12 +358,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         else:
             self.out_proj_radius_scale = 1.0
 
-        self.hypersphere_radius_from_init = hypersphere_radius_from_init
+        self.hypersphere_radius_mode = hypersphere_radius_mode
         self.hidden_size = hidden_size
-        if hypersphere_radius_from_init:
-            assert hidden_size is not None and hidden_size > 0, (
-                "hypersphere_radius_from_init=True requires hidden_size"
-            )
 
         self.split_qkv = split_qkv
         self.split_fc1 = split_fc1
@@ -387,6 +388,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
 
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
+
+        self._validate_radius_mode()
 
         defaults = dict(
             lr=lr,
@@ -487,9 +490,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 grad = grad.lerp(exp_avg, momentum_beta)
             else:
                 grad = exp_avg
-            flat_mode = self._resolve_mode(is_embedding, is_router) == "flat"
+            use_radius_scale = self._use_radius_scale(
+                self._resolve_mode(is_embedding, is_router), is_router
+            )
             with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, flat_mode=flat_mode, is_merged_offload_expert=is_merged_offload_expert, is_router=is_router)
+                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, use_radius_scale=use_radius_scale, is_merged_offload_expert=is_merged_offload_expert, is_router=is_router)
             # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
             # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
             # target radius 1/sqrt(2L) the bare update needs the same shrink factor.
@@ -620,15 +625,15 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         p,
         grad,
         is_qkv: bool = False,
-        flat_mode: bool = False,
+        use_radius_scale: bool = False,
         is_merged_offload_expert: bool = False,
         is_router: bool = False,
     ):
         """Newton-Schulz orthogonalization, with optional QKV/MLA/expert splitting.
 
-        ``flat_mode`` enables the init-radius rescale (see _init_radius_scale); it is per-block
-        so each Q/K/V, MLA, or expert block gets its own factor. ``is_router`` selects
-        router_scale_mode over scale_mode (see _resolve_scale_mode).
+        ``use_radius_scale`` enables the radius-mode rescale (see _orthogonalize_tensor); it is
+        per-block so each Q/K/V, MLA, or expert block gets its own factor from its own shape.
+        ``is_router`` selects router_scale_mode over scale_mode (see _resolve_scale_mode).
         """
         if self.pg_collection is not None:
             tp_group = (self.pg_collection.expt_tp
@@ -649,7 +654,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                     g,
                     tp_group,
                     split_partition_dim,
-                    flat_mode,
+                    use_radius_scale,
                     is_router=is_router,
                 )
                 for g in parts
@@ -659,9 +664,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if is_merged_offload_expert:
             experts = _split_experts(grad)
             for i, expert in enumerate(experts):
-                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, flat_mode, is_router=is_router)
+                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, use_radius_scale, is_router=is_router)
             return _merge_experts(experts)
-        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode, is_router=is_router)
+        return self._orthogonalize_tensor(grad, tp_group, partition_dim, use_radius_scale, is_router=is_router)
 
     def _resolve_scale_mode(self, is_router: bool) -> str:
         """Muon scale-factor mode for this param. Routers use ``router_scale_mode`` (default
@@ -670,7 +675,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         modulate the router update with width even when the matrix LR is held fixed."""
         return self.router_scale_mode if is_router else self.scale_mode
 
-    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False, is_router: bool = False):
+    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, use_radius_scale: bool = False, is_router: bool = False):
         assert grad.ndim == 2
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
@@ -684,9 +689,17 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             partition_dim=partition_dim,
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
-        scale = _get_muon_scale_factor(size[0], size[1], mode=self._resolve_scale_mode(is_router))
-        if flat_mode:
-            scale *= self._init_radius_scale(size[0], size[1])
+        if use_radius_scale and self.hypersphere_radius_mode == "fan_in":
+            # fan_in pins ||update||_F to the sphere radius outright, so the scale-mode factor
+            # drops out (it is exactly shape_up * _init_radius_scale, and scale_mode is asserted
+            # to be shape_up in _validate_radius_mode).
+            scale = self._fan_in_update_scale(size[0], size[1])
+        else:
+            scale = _get_muon_scale_factor(
+                size[0], size[1], mode=self._resolve_scale_mode(is_router)
+            )
+            if use_radius_scale:
+                scale *= self._init_radius_scale(size[0], size[1])
         return orth * scale * self.extra_scale_factor
 
     def _resolve_mode(self, is_embedding: bool, is_router: bool = False):
@@ -710,17 +723,124 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             return 1.0
         return self.out_proj_radius_scale
 
+    def _validate_radius_mode(self):
+        """Check the hypersphere_radius_mode preconditions. Called from __init__ once scale_mode
+        and tp_mode are set."""
+        if self.hypersphere_radius_mode == "shape_native":
+            return
+        if self.hypersphere_radius_mode == "init":
+            assert self.hidden_size is not None and self.hidden_size > 0, (
+                "hypersphere_radius_mode='init' requires hidden_size"
+            )
+            return
+        if self.hypersphere_radius_mode != "fan_in":
+            raise ValueError(
+                f"Unknown hypersphere_radius_mode {self.hypersphere_radius_mode!r} (expected "
+                "'shape_native', 'init' or 'fan_in')"
+            )
+        # fan_in derives every radius from the block's own d_out/d_in, so both sides of the
+        # constraint must see the same GLOBAL shape. blockwise scales the update from the LOCAL
+        # shard shape while _normalize keeps projecting with global sizes, so the two disagree
+        # (by sqrt(tp) in total update norm for an axis-1-sharded matrix).
+        assert self.tp_mode != "blockwise", (
+            "hypersphere_radius_mode='fan_in' is inconsistent under tp_mode='blockwise' (the "
+            "update is scaled from local shard shapes while the weight is projected with global "
+            "shapes); use tp_mode='duplicated' or 'distributed'."
+        )
+        # The update scale is derived assuming Newton-Schulz output scaled by shape_up (see
+        # _fan_in_update_scale); any other scale mode would put ||U||_F off the sphere radius.
+        assert self.scale_mode == "shape_up", (
+            "hypersphere_radius_mode='fan_in' targets ||update||_F = sqrt(d_out), which only "
+            f"agrees with scale_mode='shape_up'; got '{self.scale_mode}'."
+        )
+        # row gives unit rows and flat gives sqrt(d_out) outright, both landing ||W||_F on
+        # sqrt(d_out) = the update norm. col/embed normalize COLUMNS, which cannot reach
+        # sqrt(d_out) without a per-column radius of sqrt(d_out/d_in), so they would contradict
+        # the update scale (_target_slice_radius implements that radius, but the combination is
+        # rejected here rather than silently enabled).
+        unsupported = {
+            name: mode
+            for name, mode in (
+                ("hypersphere_mode", self.hypersphere_mode),
+                ("hypersphere_embedding_mode", self.hypersphere_embedding_mode),
+                ("hypersphere_router_mode", self.hypersphere_router_mode),
+            )
+            if mode not in (None, "none", "row", "flat")
+        }
+        assert not unsupported, (
+            "hypersphere_radius_mode='fan_in' only supports the 'row' and 'flat' sphere modes; "
+            f"got {unsupported}."
+        )
+
+    def _use_radius_scale(self, mode: Optional[str], is_router: bool) -> bool:
+        """Whether this param's Muon update gets the radius-mode rescale.
+
+        'init' only moves the flat-mode sphere, so only flat-mode params are rescaled. 'fan_in'
+        moves the sphere for row mode too (its update factor is mode-independent — see
+        _fan_in_update_scale), so every on-sphere param is rescaled, EXCEPT routers: they keep
+        router_scale_mode (default "none" → 1.0), which already lands their update on the
+        sqrt(num_experts) fan-in radius whenever num_experts <= hidden."""
+        if self.hypersphere_radius_mode == "fan_in":
+            return mode is not None and not is_router
+        return mode == "flat"
+
     def _init_radius_scale(self, size_out: int, size_in: int) -> float:
-        """Extra flat-mode radius multiplier that moves the sphere from the shape-native
-        sqrt(max(d_out,d_in)) onto the model's init Frobenius norm. With init_std=1/sqrt(hidden),
-        init_norm = sqrt(d_out*d_in/hidden), so init_norm/sqrt(max) = sqrt(min(d_out,d_in)/hidden).
-        Sizes must be GLOBAL (TP-unsharded), matching the flat target / Muon scale. Returns 1.0 when
-        disabled or when the smaller dim == hidden (already on the init sphere). Applied identically
-        to the projection target and the Muon update so the two stay consistent; the out_proj depth
-        factor cancels in the ratio and composes multiplicatively."""
-        if not self.hypersphere_radius_from_init or self.hidden_size is None:
+        """Radius multiplier that moves the flat-mode sphere off the shape-native
+        sqrt(max(d_out,d_in)). Sizes must be GLOBAL (TP-unsharded), matching the flat target /
+        Muon scale. Applied identically to the projection target and the Muon update so the two
+        stay consistent; the out_proj depth factor cancels in the ratio and composes
+        multiplicatively.
+
+        Under init_std = 1/sqrt(D) the init Frobenius norm is sqrt(d_out*d_in/D), so the
+        multiplier is sqrt(min(d_out,d_in)/D):
+            'shape_native' -> 1.0
+            'init'         -> D = hidden_size. Keeps narrow matrices (MLA lora, MoE fc2, GQA K/V)
+                              on their init sphere; a no-op when the smaller dim == hidden.
+            'fan_in'       -> D = d_in, i.e. the flat radius becomes sqrt(d_out) for any shape.
+                              Independent of hidden_size, so it stays correct for blocks that
+                              touch the residual stream on neither axis (e.g. latent-MoE experts).
+        """
+        if self.hypersphere_radius_mode == "shape_native":
             return 1.0
-        return (min(size_out, size_in) / self.hidden_size) ** 0.5
+        # hidden_size is guaranteed for 'init' by _validate_radius_mode.
+        denom = size_in if self.hypersphere_radius_mode == "fan_in" else self.hidden_size
+        return (min(size_out, size_in) / denom) ** 0.5
+
+    def _fan_in_update_scale(self, size_out: int, size_in: int) -> float:
+        """Muon update scale under radius_mode='fan_in'. Sizes must be GLOBAL (TP-unsharded).
+
+        Newton-Schulz returns a ~semi-orthogonal matrix (unit singular values, so
+        ||orth||_F = sqrt(min(d_out,d_in))), hence sqrt(max(d_out,d_in)/d_in) puts
+        ||U||_F = sqrt(d_out) = the fan-in sphere radius, for flat and row alike:
+            sqrt(min) * sqrt(max/d_in) = sqrt(min*max/d_in) = sqrt(d_out*d_in/d_in).
+        Equal to shape_up * _init_radius_scale, so it REPLACES the scale-mode factor instead of
+        composing with it (routers are excluded from the rescale altogether — see _param_step)."""
+        return (max(size_out, size_in) / size_in) ** 0.5
+
+    def _target_slice_radius(self, dim: Optional[int], size_out: int, size_in: int) -> float:
+        """Target L2 radius of one slice after normalization over `dim` (None = Frobenius/flat,
+        0 = col, 1 = row). Sizes must be GLOBAL (TP-unsharded). Excludes the out_proj depth
+        factor, which multiplies on top (see _resolve_radius_scale).
+
+        'shape_native'/'init' keep the historical radii: sqrt(max)*_init_radius_scale for flat,
+        unit slices for row/col. Under 'fan_in' (init_std = 1/sqrt(d_in)) a slice of |S| entries
+        has expected norm sqrt(|S|/d_in), giving flat -> sqrt(d_out), row -> 1 and
+        col -> sqrt(d_out/d_in); all three put ||W||_F at sqrt(d_out). Only the flat and row cases
+        are reachable today (_validate_radius_mode rejects col/embed under fan_in)."""
+        if self.hypersphere_radius_mode == "fan_in":
+            numel = size_out * size_in if dim is None else (size_out if dim == 0 else size_in)
+            return (numel / size_in) ** 0.5
+        if dim is None:
+            return max(size_out, size_in) ** 0.5 * self._init_radius_scale(size_out, size_in)
+        return 1.0
+
+    def _global_sizes(self, x, partition_dim: Optional[int], is_expert_tp: bool = False):
+        """TP-unsharded [d_out, d_in] for the trailing two axes of `x`, for radius/scale math."""
+        sizes = [x.size(-2), x.size(-1)]
+        if partition_dim in {0, 1} and self.pg_collection is not None:
+            tp_group = self.pg_collection.expt_tp if is_expert_tp else self.pg_collection.tp
+            sizes[partition_dim] *= get_pg_size(tp_group)
+        return sizes
 
     def _project_tangent_inplace(self, p, grad, is_qkv: bool = False, is_out_proj: bool = False,
                                   is_embedding: bool = False, is_router: bool = False,
@@ -776,6 +896,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             col    → unit-norm each input column   (dim=0)
             flat   → unit Frobenius then scale by sqrt(max(d_out, d_in))
             embed  → row for non-out_proj, col for out_proj
+        Each slice is then placed on its target radius (see _target_slice_radius), which is where
+        --hypersphere-radius-mode moves the sphere.
         """
         mode = self._resolve_mode(is_embedding, is_router)
         if mode is None:
@@ -830,17 +952,15 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         else:
             norm = torch.norm(x, dim=dim, keepdim=True).clamp_min(self.hypersphere_eps)
 
-        # Normalize x.
+        # Normalize x, then place each slice on its target radius. The radius is derived from
+        # GLOBAL (TP-unsharded) sizes so a matrix lands on the same sphere at any TP degree, and
+        # so it matches the globally-scaled Muon update.
         x.div_(norm)
-        if mode == "flat":
-            tp_size = get_pg_size(tp_group) if partition_dim in {0, 1} else 1
-            global_sizes = [x.size(-2), x.size(-1)]
-            if partition_dim in {0, 1}:
-                global_sizes[partition_dim] *= tp_size
-            x.mul_(max(global_sizes) ** 0.5)
-            init_scale = self._init_radius_scale(global_sizes[0], global_sizes[1])
-            if init_scale != 1.0:
-                x.mul_(init_scale)
+        radius = self._target_slice_radius(
+            dim, *self._global_sizes(x, partition_dim, is_expert_tp)
+        )
+        if radius != 1.0:
+            x.mul_(radius)
         if radius_scale != 1.0:
             x.mul_(radius_scale)
 
@@ -1078,13 +1198,12 @@ class MDDecoupling(_MDDecouplingBase):
         if wants_flat:
             if absorb_axis == "flat":
                 # full Frobenius norm → reduced iff the param is sharded at all. target_frob uses
-                # GLOBAL sizes so TP=1 and TP>1 match.
+                # GLOBAL sizes so TP=1 and TP>1 match, and it must be the SAME radius
+                # _normalize_single projects onto (radius mode included) — otherwise bare_p starts
+                # off-sphere and the post-step projection undoes the preserved init magnitude.
                 # For 3D experts this is per-expert: norm over the spatial axes (1, 2) → (E,), target_frob is a shared scalar.
-                gsizes = [p.size(-2), p.size(-1)]
-                if self.pg_collection is not None and partition_dim in {0, 1}:
-                    tp_group = self.pg_collection.expt_tp if is_expert_tp else self.pg_collection.tp
-                    gsizes[partition_dim] *= get_pg_size(tp_group)
-                target_frob = max(gsizes) ** 0.5
+                gsizes = self._global_sizes(p, partition_dim, is_expert_tp)
+                target_frob = self._target_slice_radius(None, *gsizes)
                 cur_frob = self._tp_reduced_norm(p.detach(), dim=layout["spatial_dims"],
                                                  partition_dim=partition_dim,
                                                  is_expert_tp=is_expert_tp)
@@ -1664,7 +1783,7 @@ def get_megatron_mddecoupling_optimizer(
         hypersphere_preserve_init=config.hypersphere_preserve_init,
         hypersphere_scale_out_proj_init=config.hypersphere_scale_out_proj_init,
         num_layers=model_chunks[0].config.num_layers,
-        hypersphere_radius_from_init=config.hypersphere_radius_from_init,
+        hypersphere_radius_mode=config.hypersphere_radius_mode,
         hidden_size=model_chunks[0].config.hidden_size,
         use_orthogonal_updates=config.use_orthogonal_updates,
         momentum_beta=config.muon_momentum,

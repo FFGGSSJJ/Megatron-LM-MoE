@@ -67,8 +67,8 @@ def _record_md_split_output(param, grad, **md_kwargs):
     )
     calls = []
 
-    def record_split(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
-        del tp_group, partition_dim, flat_mode, is_router
+    def record_split(split_grad, tp_group, partition_dim, use_radius_scale=False, is_router=False):
+        del tp_group, partition_dim, use_radius_scale, is_router
         calls.append(split_grad.detach().clone())
         return torch.full_like(split_grad, float(len(calls)))
 
@@ -211,7 +211,8 @@ def test_md_decoupling_recipe_defaults():
     assert config.hypersphere_mode == "flat"
     assert config.hypersphere_embedding_mode == "row"
     assert config.hypersphere_router_mode == "row"
-    assert config.hypersphere_radius_from_init is False
+    assert config.hypersphere_radius_mode == "shape_native"
+    assert config.muon_tp_mode == "duplicated"
     assert config.hypersphere_gains_mode == "rowcol"
     assert config.hypersphere_gains_mode_output == "inherit"
     assert config.hypersphere_gains_mode_embedding == "none"
@@ -1046,6 +1047,199 @@ def test_md_decoupling_qkv_split():
     assert not torch.equal(weight_with_split, weight_without_split)
 
 
+def _fan_in_optimizer(param, **kwargs):
+    kwargs.setdefault("scale_mode", "shape_up")
+    kwargs.setdefault("tp_mode", "duplicated")
+    kwargs.setdefault("pg_collection", _NoProcessGroups())
+    return MDDecoupling(
+        params=[param], lr=0.01, hypersphere_radius_mode="fan_in", **kwargs
+    )
+
+
+@pytest.mark.parametrize("shape", [(8, 4), (4, 8), (6, 6)])
+@pytest.mark.parametrize("mode", ["row", "flat"])
+def test_md_decoupling_fan_in_radius_puts_weight_norm_at_sqrt_out(shape, mode):
+    """fan_in normalizes every row to unit L2, i.e. ||W||_F = sqrt(d_out) for any shape, in both
+    the row and flat sphere modes."""
+    size_out, size_in = shape
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(size_out, size_in))
+    optimizer = _fan_in_optimizer(
+        param, hypersphere_mode=mode, hypersphere_preserve_init=True
+    )
+
+    with torch.no_grad():
+        optimizer._normalize(param, param)
+
+    torch.testing.assert_close(
+        torch.linalg.matrix_norm(param.detach()),
+        torch.tensor(math.sqrt(size_out)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    if mode == "row":
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(param.detach(), dim=1),
+            torch.ones(size_out),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("shape", [(8, 4), (4, 8), (6, 6)])
+def test_md_decoupling_fan_in_radius_and_update_scale_agree(shape):
+    """The fan-in update scale puts ||U||_F on the same sqrt(d_out) sphere as the weight, and is
+    exactly shape_up * _init_radius_scale (the composition the notes derive)."""
+    size_out, size_in = shape
+    optimizer = _fan_in_optimizer(
+        torch.nn.Parameter(torch.zeros(*shape)), hypersphere_mode="row"
+    )
+
+    # Weight radii: flat -> sqrt(d_out), row -> 1, col -> sqrt(d_out/d_in) (col is rejected at
+    # construction, but the radius rule is the same sqrt(|slice| / d_in) for all three).
+    assert optimizer._target_slice_radius(None, size_out, size_in) == pytest.approx(
+        math.sqrt(size_out)
+    )
+    assert optimizer._target_slice_radius(1, size_out, size_in) == pytest.approx(1.0)
+    assert optimizer._target_slice_radius(0, size_out, size_in) == pytest.approx(
+        math.sqrt(size_out / size_in)
+    )
+
+    update_scale = optimizer._fan_in_update_scale(size_out, size_in)
+    assert update_scale == pytest.approx(
+        _get_muon_scale_factor(size_out, size_in, mode="shape_up")
+        * optimizer._init_radius_scale(size_out, size_in)
+    )
+    # Newton-Schulz returns unit singular values, so ||orth||_F = sqrt(min(d_out, d_in)).
+    assert math.sqrt(min(shape)) * update_scale == pytest.approx(math.sqrt(size_out))
+
+
+@pytest.mark.parametrize("shape", [(8, 4), (4, 8)])
+def test_md_decoupling_fan_in_update_norm_matches_sphere_radius(shape, monkeypatch):
+    """End-to-end on the update path: a semi-orthogonal Newton-Schulz output comes out of
+    _orthogonalize_param with ||U||_F = sqrt(d_out) = the weight's fan-in radius."""
+    size_out, size_in = shape
+    monkeypatch.setattr(md_module, "newton_schulz_tp", lambda g, **kwargs: g, raising=False)
+    param = torch.nn.Parameter(torch.zeros(size_out, size_in))
+    optimizer = _fan_in_optimizer(param, hypersphere_mode="row")
+
+    torch.manual_seed(0)
+    q, _ = torch.linalg.qr(torch.randn(max(shape), min(shape)))
+    semi_orthogonal = q if size_out >= size_in else q.T
+
+    update = optimizer._orthogonalize_param(param, semi_orthogonal, use_radius_scale=True)
+
+    torch.testing.assert_close(
+        torch.linalg.matrix_norm(update),
+        torch.tensor(math.sqrt(size_out)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_md_decoupling_fan_in_leaves_router_update_scale_alone(monkeypatch):
+    """Routers keep router_scale_mode ("none" -> 1.0): their sphere radius is sqrt(num_experts),
+    which the bare Newton-Schulz output already has, so no fan-in rescale is applied."""
+    monkeypatch.setattr(md_module, "newton_schulz_tp", lambda g, **kwargs: g, raising=False)
+    param = torch.nn.Parameter(torch.zeros(4, 16))
+    optimizer = _fan_in_optimizer(
+        param, hypersphere_mode="row", hypersphere_router_mode="row"
+    )
+
+    assert optimizer._use_radius_scale("row", is_router=False) is True
+    assert optimizer._use_radius_scale("flat", is_router=False) is True
+    assert optimizer._use_radius_scale(None, is_router=False) is False
+    assert optimizer._use_radius_scale("row", is_router=True) is False
+
+    grad = torch.ones(4, 16)
+    router_update = optimizer._orthogonalize_param(
+        param, grad, use_radius_scale=False, is_router=True
+    )
+    torch.testing.assert_close(router_update, grad)
+
+
+@pytest.mark.parametrize("radius_mode", ["shape_native", "init"])
+def test_md_decoupling_non_fan_in_radius_modes_rescale_flat_only(radius_mode):
+    """'init' (and the default) only move the flat-mode sphere, and keep rescaling routers."""
+    optimizer = MDDecoupling(
+        params=[torch.nn.Parameter(torch.zeros(8, 4))],
+        lr=0.01,
+        hypersphere_mode="flat",
+        hypersphere_radius_mode=radius_mode,
+        hidden_size=8,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+    )
+
+    assert optimizer._use_radius_scale("flat", is_router=False) is True
+    assert optimizer._use_radius_scale("row", is_router=False) is False
+    assert optimizer._use_radius_scale("flat", is_router=True) is True
+    expected = 1.0 if radius_mode == "shape_native" else math.sqrt(4 / 8)
+    assert optimizer._init_radius_scale(8, 4) == pytest.approx(expected)
+    assert optimizer._target_slice_radius(1, 8, 4) == pytest.approx(1.0)
+    assert optimizer._target_slice_radius(None, 8, 4) == pytest.approx(
+        math.sqrt(8) * expected
+    )
+
+
+def test_md_decoupling_fan_in_uses_global_sizes_under_tp(monkeypatch):
+    """The fan-in radius is derived from GLOBAL (TP-unsharded) sizes, so a matrix lands on the
+    same sphere at any TP degree. Simulated here with tp_size=2 metadata over a single shard."""
+    monkeypatch.setattr(md_module, "get_pg_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    local_out, size_in = 4, 8
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(local_out, size_in))
+    param.partition_dim = 0  # column-parallel: d_out is sharded, so global d_out = 8
+    optimizer = _fan_in_optimizer(
+        param, hypersphere_mode="flat", hypersphere_preserve_init=True
+    )
+
+    with torch.no_grad():
+        optimizer._normalize(param, param)
+
+    # all_reduce is stubbed out, so the shard normalizes to unit Frobenius and is then placed on
+    # the GLOBAL radius sqrt(d_out) = sqrt(local_out * tp_size), not the local sqrt(4).
+    torch.testing.assert_close(
+        torch.linalg.matrix_norm(param.detach()),
+        torch.tensor(math.sqrt(local_out * 2)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert optimizer._global_sizes(param, partition_dim=0) == [local_out * 2, size_in]
+    assert optimizer._global_sizes(param, partition_dim=1) == [local_out, size_in * 2]
+    assert optimizer._global_sizes(param, partition_dim=None) == [local_out, size_in]
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"tp_mode": "blockwise"}, "blockwise"),
+        ({"scale_mode": "spectral"}, "shape_up"),
+        ({"hypersphere_mode": "col"}, "hypersphere_mode"),
+        ({"hypersphere_mode": "embed"}, "hypersphere_mode"),
+        ({"hypersphere_embedding_mode": "col"}, "hypersphere_embedding_mode"),
+        ({"hypersphere_router_mode": "embed"}, "hypersphere_router_mode"),
+    ],
+)
+def test_md_decoupling_fan_in_rejects_inconsistent_settings(kwargs, match):
+    kwargs.setdefault("hypersphere_mode", "row")
+    with pytest.raises(AssertionError, match=match):
+        _fan_in_optimizer(torch.nn.Parameter(torch.zeros(8, 4)), **kwargs)
+
+
+def test_md_decoupling_unknown_radius_mode_raises():
+    with pytest.raises(ValueError, match="hypersphere_radius_mode"):
+        MDDecoupling(
+            params=[torch.nn.Parameter(torch.zeros(8, 4))],
+            lr=0.01,
+            hypersphere_mode="row",
+            hypersphere_radius_mode="fanin",
+            pg_collection=_NoProcessGroups(),
+            tp_mode="duplicated",
+        )
+
+
 @requires_cuda_and_emerging
 @pytest.mark.parametrize("tp_mode", ["duplicated", "blockwise", "distributed"])
 def test_md_decoupling_different_tp_modes_single_rank(tp_mode):
@@ -1131,6 +1325,55 @@ class TestMDDecouplingMultiRankTP:
         optimizer.step()
 
         assert not torch.equal(model.weight.data, original_weight)
+
+    @pytest.mark.parametrize(
+        "hypersphere_mode, partition_dim", [("flat", 0), ("row", 1), ("row", 0), ("flat", 1)]
+    )
+    def test_md_decoupling_fan_in_radius_is_global_under_tp(
+        self, hypersphere_mode, partition_dim
+    ):
+        """The real TP check: whichever axis is sharded, the fan-in sphere is the GLOBAL one, so
+        the reassembled matrix has ||W||_F = sqrt(global d_out) (equivalently unit global rows)."""
+        rank = int(os.getenv("RANK", "0"))
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_size = torch.distributed.get_world_size(group=pg_collection.tp)
+        local_shape = (8, 16)
+
+        torch.manual_seed(42 + rank)
+        weight = torch.nn.Parameter(torch.randn(*local_shape, device="cuda"))
+        weight.partition_dim = partition_dim
+        # Constructing with preserve_init=False projects onto the sphere right away.
+        MDDecoupling(
+            params=[weight],
+            lr=0.01,
+            hypersphere_mode=hypersphere_mode,
+            hypersphere_radius_mode="fan_in",
+            scale_mode="shape_up",
+            pg_collection=pg_collection,
+            tp_mode="duplicated",
+        )
+
+        global_sizes = list(local_shape)
+        global_sizes[partition_dim] *= tp_size
+        # Every shard holds a disjoint slice of the global matrix, so the global Frobenius norm is
+        # the TP sum of the local ones either way.
+        squared_frobenius = (weight.detach().double() ** 2).sum()
+        torch.distributed.all_reduce(squared_frobenius, group=pg_collection.tp)
+
+        torch.testing.assert_close(
+            squared_frobenius,
+            torch.tensor(float(global_sizes[0]), dtype=torch.float64, device="cuda"),
+            rtol=1e-5,
+            atol=1e-4,
+        )
+
+        if hypersphere_mode == "row":
+            row_squared = (weight.detach().double() ** 2).sum(dim=1)
+            if partition_dim == 1:
+                torch.distributed.all_reduce(row_squared, group=pg_collection.tp)
+            torch.testing.assert_close(
+                row_squared, torch.ones_like(row_squared), rtol=1e-5, atol=1e-5
+            )
 
 
 def test_md_decoupling_gqa_qkv_split_mechanics():
@@ -1268,6 +1511,61 @@ def test_md_decoupling_glu_fc1_flat_normalization_is_block_local(shape, split_di
     )
     actual_norms = torch.stack([torch.linalg.vector_norm(part) for part in parts])
     torch.testing.assert_close(actual_norms, expected_norms, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["row", "flat"])
+@pytest.mark.parametrize(
+    "shape, split_dim", [((8, 2), 0), ((6, 12), 0), ((2, 8, 2), 1)]
+)
+def test_md_decoupling_fan_in_radius_is_per_glu_fc1_block(shape, split_dim, mode, monkeypatch):
+    """A fused GLU fc1 is two logical [ffn, hidden] matrices, so fan_in puts each half on its own
+    sqrt(ffn) sphere (fused total sqrt(2*ffn) = sqrt(d_out), same as with split_fc1=False), and the
+    update follows the same split so ||U|| = ||W|| holds per half."""
+    monkeypatch.setattr(md_module, "newton_schulz_tp", lambda g, **kwargs: g, raising=False)
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(*shape))
+    param.glu_split_dim = split_dim
+    optimizer = _fan_in_optimizer(
+        param, split_fc1=True, hypersphere_mode=mode, hypersphere_preserve_init=True
+    )
+    is_merged = param.ndim == 3
+
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_merged_offload_expert=is_merged)
+
+    # Each half is [ffn, hidden] -> radius sqrt(ffn) regardless of row vs flat.
+    parts, _ = optimizer._split_param_tensor(param, param)
+    block_out = parts[0].size(0)
+    _assert_split_flat_norms(optimizer, param, param, expected_norm=math.sqrt(block_out))
+    fused_out = shape[split_dim] if not is_merged else shape[0] * shape[1]
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(param.detach()),
+        torch.tensor(math.sqrt(fused_out)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    # Update side: a semi-orthogonal grad per half comes back at that half's radius.
+    grad = torch.zeros_like(param)
+    grad_parts, merge = optimizer._split_param_tensor(param, grad)
+    q, _ = torch.linalg.qr(torch.randn(max(grad_parts[0].shape), min(grad_parts[0].shape)))
+    semi_orthogonal = q if grad_parts[0].size(0) >= grad_parts[0].size(1) else q.T
+    for part in grad_parts:
+        part.copy_(semi_orthogonal)
+    grad.copy_(merge(grad_parts))
+
+    update = optimizer._orthogonalize_param(
+        param, grad, use_radius_scale=True, is_merged_offload_expert=is_merged
+    )
+    _assert_split_flat_norms(
+        optimizer, param, update, expected_norm=math.sqrt(block_out)
+    )
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(update),
+        torch.tensor(math.sqrt(fused_out)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 @requires_cuda_and_emerging
@@ -1561,13 +1859,13 @@ def test_md_decoupling_mla_kv_up_proj_per_head_ignores_head_partition_dim(monkey
     )
     partition_dims = []
 
-    def record_partition_dim(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
-        del tp_group, flat_mode, is_router
+    def record_partition_dim(split_grad, tp_group, partition_dim, use_radius_scale=False, is_router=False):
+        del tp_group, use_radius_scale, is_router
         partition_dims.append(partition_dim)
         return torch.full_like(split_grad, float(len(partition_dims)))
 
     optimizer._orthogonalize_tensor = record_partition_dim
-    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, flat_mode=True)
+    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, use_radius_scale=True)
 
     assert partition_dims == [None, None, None, None]
     expected = torch.tensor([1] * 3 + [2] * 2 + [3] * 3 + [4] * 2).view(10, 1)
@@ -1624,13 +1922,13 @@ def test_md_decoupling_mla_q_up_proj_per_head_ignores_head_partition_dim(monkeyp
     )
     partition_dims = []
 
-    def record_partition_dim(split_grad, tp_group, partition_dim, flat_mode=False, is_router=False):
-        del tp_group, flat_mode, is_router
+    def record_partition_dim(split_grad, tp_group, partition_dim, use_radius_scale=False, is_router=False):
+        del tp_group, use_radius_scale, is_router
         partition_dims.append(partition_dim)
         return torch.full_like(split_grad, float(len(partition_dims)))
 
     optimizer._orthogonalize_tensor = record_partition_dim
-    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, flat_mode=True)
+    output = optimizer._orthogonalize_param(param, grad, is_qkv=False, use_radius_scale=True)
 
     assert partition_dims == [None, None, None]
     expected = torch.tensor([1] * 4 + [2] * 4 + [3] * 4).view(12, 1)
