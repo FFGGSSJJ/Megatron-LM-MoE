@@ -593,7 +593,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
-            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
+            n = 0 if cu_seqlens is None else int(cu_seqlens.shape[-1])
             n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
             _broadcast(n_tensor)
 
@@ -602,7 +602,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             else:
                 assert isinstance(cu_seqlens, torch.Tensor)
                 assert cu_seqlens.dtype == torch.int32
-                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
