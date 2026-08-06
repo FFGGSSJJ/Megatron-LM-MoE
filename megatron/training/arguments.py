@@ -1604,6 +1604,12 @@ def validate_args(args, defaults={}):
                 "(unit rows) and 'flat' modes reach but the column-normalizing modes do not; got "
                 f"{unsupported}."
             )
+            if args.num_experts is not None:
+                assert args.num_experts <= args.hidden_size, (
+                    "--hypersphere-radius-mode fan_in keeps the router's Muon scale unmodified, "
+                    "which matches the sqrt(num_experts) router sphere only when num_experts <= "
+                    f"hidden_size; got {args.num_experts=} and {args.hidden_size=}."
+                )
             assert args.muon_scale_mode == "shape_up", (
                 "--hypersphere-radius-mode fan_in targets ||update||_F = sqrt(d_out), which only "
                 f"agrees with --muon-scale-mode shape_up; got {args.muon_scale_mode}."
