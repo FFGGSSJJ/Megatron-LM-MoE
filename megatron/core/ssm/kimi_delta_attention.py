@@ -63,6 +63,30 @@ except ImportError:
     HAVE_FUSED_RMSNORM_GATED = False
 
 
+def _have_causal_conv1d_cuda() -> bool:
+    """Whether `causal_conv1d(..., backend="cuda")` will actually dispatch.
+
+    Probe the causal_conv1d package, not FLA's re-export of it: the re-export
+    moved between FLA versions, and probing the wrong spelling silently reports
+    "unavailable" and leaves the layer on Triton.
+    """
+    try:
+        from causal_conv1d import causal_conv1d_fn  # noqa: F401
+
+        return True
+    except ImportError:
+        pass
+    try:
+        from fla.modules.convolution import causal_conv1d_fn
+
+        return causal_conv1d_fn is not None
+    except ImportError:
+        return False
+
+
+HAVE_CAUSAL_CONV1D_CUDA = _have_causal_conv1d_cuda()
+
+
 def _env_flag(name: str, default: bool) -> bool:
     """Read a KDA_* on/off override from the environment."""
     raw = os.environ.get(name)
@@ -311,6 +335,14 @@ class KimiDeltaAttention(GatedDeltaNet):
             and _env_flag("KDA_QK_L2NORM_IN_KERNEL", True)
         )
 
+        # Prefer the causal_conv1d CUDA package over FLA's Triton conv: same op,
+        # faster backend.
+        self._conv1d_backend = (
+            "cuda"
+            if (HAVE_CAUSAL_CONV1D_CUDA and _env_flag("KDA_CONV1D_CUDA", True))
+            else "triton"
+        )
+
         self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
             not self.config.linear_attention_allow_neg_eigval
             or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
@@ -520,7 +552,8 @@ class KimiDeltaAttention(GatedDeltaNet):
             assert self.activation in ["silu", "swish"]
             qkv, _ = causal_conv1d(
                 x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
-                activation=self.activation, initial_state=None, output_final_state=False,
+                activation=self.activation, initial_state=None,
+                output_final_state=False, backend=self._conv1d_backend,
             )
         nvtx_range_pop(suffix="conv1d")
 
