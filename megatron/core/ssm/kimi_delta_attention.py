@@ -30,6 +30,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import Tensor
 
 from megatron.core.jit import jit_fuser
@@ -61,7 +62,6 @@ try:
 except ImportError:
     FusedRMSNormGated = None
     HAVE_FUSED_RMSNORM_GATED = False
-
 
 try:
     # Present since fla 0.4.0, but its signature is not stable across versions;
@@ -384,10 +384,7 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Q/K L2-norm inside chunk_kda. Only the plain L2 path has an in-kernel
         # equivalent; the Schlag-style learnable qk_rmsnorm variant must stay
-        # external. Bit-identical to the external l2norm() call (same
-        # fla.modules.l2norm Triton kernels), minus one standalone kernel, one
-        # autograd node, and one full-size [b, s, 2h, d_k] activation held
-        # live for backward.
+        # external.
         self._qk_l2norm_in_kernel = (
             _KDA_SUPPORTS_QK_L2NORM_IN_KERNEL
             and self.use_qk_l2norm
@@ -405,6 +402,15 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # One all-gather for both low-rank bottlenecks instead of two.
         self._fuse_low_rank_gather = _env_flag("KDA_FUSED_LOW_RANK_GATHER", True)
+
+        # Checkpoint the KDA core (`--recompute-modules linear_attn`). This is
+        # what frees the tensors chunk_kda holds for its own backward -- q, k,
+        # v, the decay, beta -- which in-layer fusion cannot reach.
+        self._recompute_core = (
+            self.config.recompute_granularity == "selective"
+            and self.config.recompute_modules is not None
+            and "linear_attn" in self.config.recompute_modules
+        )
 
         self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
             not self.config.linear_attention_allow_neg_eigval
@@ -513,10 +519,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         (num_v_heads * key_head_dim vs num_v_heads). KDA has no DeltaProduct
         variant, so n_hh is forced to 1 and erase logic is skipped.
         """
-        import os
         from megatron.core.ssm.gated_delta_net import (
             tensor_a2a_cp2hp, tensor_a2a_hp2cp, get_parameter_local_cp,
-            nvtx_range_push, nvtx_range_pop, causal_conv1d,
+            nvtx_range_push, nvtx_range_pop,
         )
         from megatron.core.utils import deprecate_inference_params
 
@@ -627,8 +632,6 @@ class KimiDeltaAttention(GatedDeltaNet):
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
 
-        # Convolution on qkv (Q, K, V all per-token for KDA — no DeltaProduct).
-        nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
         conv1d_weight = get_parameter_local_cp(
             self.conv1d.weight, dim=0, cp_group=self.pg_collection.cp,
@@ -640,50 +643,17 @@ class KimiDeltaAttention(GatedDeltaNet):
                 split_sections=qkv_channels_split_sections,
             ) if self.conv_bias else None
         )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()
-            conv_out = F.conv1d(
-                input=qkv, weight=conv1d_weight, bias=conv1d_bias,
-                stride=self.conv1d.stride, padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)
-        else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
-                activation=self.activation, initial_state=None,
-                output_final_state=False, backend=self._conv1d_backend,
-            )
-        nvtx_range_pop(suffix="conv1d")
-
-        # Q/K/V split + reshape + alpha reshape (overridden helper handles the wider alpha).
-        nvtx_range_push(suffix="prepare_qkv_for_kda")
-        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
-        )
-        nvtx_range_pop(suffix="prepare_qkv_for_kda")
-
-        nvtx_range_push(suffix="g_and_beta")
         A_log_local_cp = get_parameter_local_cp(
             self.A_log, dim=0, cp_group=self.pg_collection.cp
         )
-        dt_bias_local_tp = self.dt_bias.view(
-            self.num_v_heads_local_tp, self.key_head_dim
-        )
+        # Stored flat but CP-sharded per head: view as [h, d_k] to slice, then
+        # flatten straight back -- every consumer wants it flat, and 0.4's
+        # autograd Function rejects a [h, d_k] grad.
         dt_bias_local_cp = get_parameter_local_cp(
-            dt_bias_local_tp, dim=0, cp_group=self.pg_collection.cp
-        )
-        g = (
-            alpha.reshape(batch, seq_len, -1, self.key_head_dim)
-            if self._use_fused_decay_gate
-            else self._activate_decay(alpha, A_log_local_cp, dt_bias_local_cp)
-        )
-        if not self._use_fused_beta_sigmoid:
-            beta = self._activate_beta(beta)
-        nvtx_range_pop(suffix="g_and_beta")
+            self.dt_bias.view(self.num_v_heads_local_tp, self.key_head_dim),
+            dim=0,
+            cp_group=self.pg_collection.cp,
+        ).reshape(-1)
 
         # Initial state: learnable param > carried full-batch state > None.
         if self.initial_state_param is not None:
@@ -710,29 +680,20 @@ class KimiDeltaAttention(GatedDeltaNet):
         # chunk_kda requires initial_state in float32 (asserted inside FLA).
         initial_state_f32 = initial_state.float() if initial_state is not None else None
 
-        nvtx_range_push(suffix="chunk_kda")
-        kda_kwargs = {
-            "g": g,
-            "beta": beta,
-            "initial_state": initial_state_f32,
-            "output_final_state": need_final_state,
-            "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
-        }
-        if self._use_fused_decay_gate:
-            kda_kwargs["use_gate_in_kernel"] = True
-            kda_kwargs["A_log"] = A_log_local_cp
-            kda_kwargs["dt_bias"] = dt_bias_local_cp.reshape(-1)
-        if self._use_fused_beta_sigmoid:
-            kda_kwargs["use_beta_sigmoid_in_kernel"] = True
-            if _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
-                kda_kwargs["allow_neg_eigval"] = (
-                    self.config.linear_attention_allow_neg_eigval
-                )
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query, key, value, **kda_kwargs
+        # Skip the checkpoint when a final recurrent state has to escape the
+        # region: the carry/state-stats bookkeeping below must not run twice.
+        core_args = (
+            qkv, gate, beta, alpha, conv1d_weight, conv1d_bias,
+            A_log_local_cp, dt_bias_local_cp, initial_state_f32,
+            batch, seq_len, need_final_state,
         )
-        nvtx_range_pop(suffix="chunk_kda")
-
+        if self._recompute_core and torch.is_grad_enabled() and not need_final_state:
+            norm_out, last_recurrent_state = torch.utils.checkpoint.checkpoint(
+                self._kda_core, *core_args, use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            norm_out, last_recurrent_state = self._kda_core(*core_args)
 
         # Carry-over (matches GDN; only active if linear_attention_carry_state=True).
         if self._carry_enabled and last_recurrent_state is not None:
@@ -765,11 +726,6 @@ class KimiDeltaAttention(GatedDeltaNet):
         else:
             self._last_state_stats = None
 
-        # RMSNorm + (optional) output gate
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
         # Transpose back to sbhd, CP a2a HP→CP, output projection.
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
@@ -778,6 +734,86 @@ class KimiDeltaAttention(GatedDeltaNet):
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
         return out, out_bias
+
+    def _kda_core(
+        self, qkv, gate, beta, alpha, conv1d_weight, conv1d_bias,
+        A_log_local_cp, dt_bias_local_cp, initial_state_f32,
+        batch, seq_len, need_final_state,
+    ):
+        """The KDA core: conv1d -> chunk_kda -> gated norm.
+
+        Self-contained so it can be handed to `torch.utils.checkpoint` (see
+        `self._recompute_core`). Excludes every TE linear, so the recomputed
+        region carries no FP8 GEMM and no `backward_dw` bookkeeping.
+        """
+        from megatron.core.ssm.gated_delta_net import (
+            nvtx_range_push, nvtx_range_pop, causal_conv1d,
+        )
+
+        # Convolution on qkv (Q, K, V all per-token for KDA — no DeltaProduct).
+        nvtx_range_push(suffix="conv1d")
+        if self.config.deterministic_mode:
+            qkv = qkv.transpose(1, 2).contiguous()
+            conv_out = F.conv1d(
+                input=qkv, weight=conv1d_weight, bias=conv1d_bias,
+                stride=self.conv1d.stride, padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // self.cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)
+        else:
+            assert self.activation in ["silu", "swish"]
+            qkv, _ = causal_conv1d(
+                x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
+                activation=self.activation, initial_state=None,
+                output_final_state=False, backend=self._conv1d_backend,
+            )
+        nvtx_range_pop(suffix="conv1d")
+
+        nvtx_range_push(suffix="prepare_qkv_for_kda")
+        query, key, value = self._prepare_qkv_for_kda(qkv, batch, seq_len)
+        nvtx_range_pop(suffix="prepare_qkv_for_kda")
+
+        nvtx_range_push(suffix="g_and_beta")
+        g = (
+            alpha.reshape(batch, seq_len, -1, self.key_head_dim)
+            if self._use_fused_decay_gate
+            else self._activate_decay(alpha, A_log_local_cp, dt_bias_local_cp)
+        )
+        if not self._use_fused_beta_sigmoid:
+            beta = self._activate_beta(beta)
+        beta = beta.contiguous()
+        nvtx_range_pop(suffix="g_and_beta")
+
+        nvtx_range_push(suffix="chunk_kda")
+        kda_kwargs = {
+            "g": g,
+            "beta": beta,
+            "initial_state": initial_state_f32,
+            "output_final_state": need_final_state,
+            "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
+        }
+        if self._use_fused_decay_gate:
+            kda_kwargs["use_gate_in_kernel"] = True
+            kda_kwargs["A_log"] = A_log_local_cp
+            kda_kwargs["dt_bias"] = dt_bias_local_cp.reshape(-1)
+        if self._use_fused_beta_sigmoid:
+            kda_kwargs["use_beta_sigmoid_in_kernel"] = True
+            if _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
+                kda_kwargs["allow_neg_eigval"] = (
+                    self.config.linear_attention_allow_neg_eigval
+                )
+        core_attn_out, last_recurrent_state = self.gated_delta_rule(
+            query, key, value, **kda_kwargs
+        )
+        nvtx_range_pop(suffix="chunk_kda")
+
+        # RMSNorm + (optional) output gate
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate.contiguous())
+        nvtx_range_pop(suffix="gated_norm")
+        return norm_out, last_recurrent_state
 
     def backward_dw(self):
         """Execute deferred weight-gradient computation for all KDA linear projections."""
@@ -804,11 +840,14 @@ class KimiDeltaAttention(GatedDeltaNet):
             y = y * torch.sigmoid(gate.float())
         return y.to(x_dtype)
 
-    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
-        """Q/K/V split + reshape for KDA. alpha stays flat; it is reshaped where
-        consumed, since the fused decay-gate path needs it flat.
+    @jit_fuser
+    def _prepare_qkv_for_kda(self, qkv, batch, seq_len):
+        """Split the post-conv qkv block into Q, K, V in [b, s, h, d] layout.
+
+        The Q/K L2-norm is normally deferred into chunk_kda
+        (self._qk_l2norm_in_kernel); only the learnable qk_rmsnorm variant,
+        which has no in-kernel equivalent, still normalizes here.
         """
-        # Same Q,K,V split as GDN
         query_key, value = torch.split(
             qkv,
             [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
@@ -817,8 +856,6 @@ class KimiDeltaAttention(GatedDeltaNet):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Normalize fused Q+K before splitting. Skipped here when chunk_kda
-        # will do it in-kernel instead (self._qk_l2norm_in_kernel).
         if self.use_qk_l2norm and not self._qk_l2norm_in_kernel:
             query_key = query_key.contiguous()
             if self.qk_rmsnorm is not None:
@@ -836,14 +873,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
 
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        gate = gate.contiguous()
-        beta = beta.contiguous()
-        alpha = alpha.contiguous()
-
-        return query, key, value, gate, beta, alpha
+        return query.contiguous(), key.contiguous(), value.contiguous()
 
 
 def get_kimi_delta_attention_module_spec(
