@@ -23,6 +23,7 @@ import copy
 import inspect
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -62,6 +63,14 @@ except ImportError:
     HAVE_FUSED_RMSNORM_GATED = False
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a KDA_* on/off override from the environment."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _chunk_kda_supports(option: str) -> bool:
     """Return whether the installed FLA explicitly exposes an optional KDA feature."""
     if not HAVE_KDA:
@@ -72,10 +81,15 @@ def _chunk_kda_supports(option: str) -> bool:
         return False
 
 
+_KDA_SUPPORTS_QK_L2NORM_IN_KERNEL = _chunk_kda_supports("use_qk_l2norm_in_kernel")
 _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
     "use_beta_sigmoid_in_kernel"
 )
 _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL = _chunk_kda_supports("allow_neg_eigval")
+# Probe "use_gate_in_kernel" only, NOT "A_log": FLA takes A_log/dt_bias through
+# chunk_kda's **kwargs, which inspect.signature() cannot see, so probing for
+# them would disable the fused path on builds that fully support it.
+_KDA_SUPPORTS_FUSED_DECAY_GATE = _chunk_kda_supports("use_gate_in_kernel")
 
 logger = logging.getLogger(__name__)
 
