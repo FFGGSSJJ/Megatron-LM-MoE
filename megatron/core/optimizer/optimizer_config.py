@@ -388,6 +388,11 @@ class OptimizerConfig:
     """Use Muon-style orthogonalized updates for matrix params under md_decoupling. Embedding +
     LM head ALWAYS use the Adam branch regardless of this flag."""
 
+    md_normalize_update_to_weight_norm: bool = False
+    """If true, rescale each MuonMD update ``U`` to
+    ``U / ||U||_F * R_W``. The weight norm ``R_W`` is measured once, immediately before the
+    first update, and cached; only the update norm is measured on subsequent steps."""
+
     hypersphere_gains_mode: Optional[str] = 'rowcol'
     """Learnable per-axis gains for matrix params. One of
     'row'/'col'/'rowcol'/'flat'/'embed'/'none'."""

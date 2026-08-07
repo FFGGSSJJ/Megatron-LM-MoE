@@ -78,6 +78,71 @@ def _record_md_split_output(param, grad, **md_kwargs):
     ), calls
 
 
+@requires_cuda_and_emerging
+@pytest.mark.parametrize(
+    ("preserve_init", "expected_weight_norm"),
+    [(False, math.sqrt(2.0)), (True, 13.0)],
+)
+def test_md_muon_normalizes_update_to_fixed_hypersphere_norm(
+    monkeypatch, preserve_init, expected_weight_norm
+):
+    param = torch.nn.Parameter(
+        torch.tensor([[3.0, 4.0], [0.0, 12.0]], device="cuda")
+    )
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.1,
+        weight_decay=0.0,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=preserve_init,
+        use_orthogonal_updates=True,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        normalize_update_to_weight_norm=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+    )
+    raw_update = torch.tensor([[1.0, -2.0], [3.0, -4.0]], device="cuda")
+    monkeypatch.setattr(
+        optimizer,
+        "_orthogonalize_param",
+        lambda *args, **kwargs: raw_update.clone(),
+    )
+    # Disable the post-step projection so the exact applied update can be recovered from the
+    # parameter delta; the first-step cache happens before that projection and weight decay.
+    monkeypatch.setattr(optimizer, "_normalize", lambda *args, **kwargs: None)
+    before = param.detach().clone()
+    param.grad = torch.ones_like(param)
+
+    optimizer.step()
+
+    applied_update = (before - param) / 0.1
+    fixed_norm = expected_weight_norm
+    assert torch.allclose(
+        torch.linalg.vector_norm(applied_update),
+        torch.tensor(fixed_norm, device="cuda"),
+    )
+    assert torch.allclose(
+        applied_update / torch.linalg.vector_norm(applied_update),
+        raw_update / torch.linalg.vector_norm(raw_update),
+    )
+    assert optimizer._fixed_weight_norms[param].item() == pytest.approx(fixed_norm)
+
+    # The target is cached; a subsequent call measures only the update, not the weight.
+    norm_calls = 0
+    compiled_squared_norm = md_module._local_squared_norm
+
+    def count_squared_norm(tensor):
+        nonlocal norm_calls
+        norm_calls += 1
+        return compiled_squared_norm(tensor)
+
+    monkeypatch.setattr(md_module, "_local_squared_norm", count_squared_norm)
+    second = optimizer._normalize_muon_update_to_fixed_weight_norm(param, raw_update * 3)
+    assert norm_calls == 1
+    assert torch.linalg.vector_norm(second).item() == pytest.approx(fixed_norm, rel=1e-6)
+
+
 def _gqa_qkv_optimizer(param, **kwargs):
     return MDDecoupling(
         params=[param],

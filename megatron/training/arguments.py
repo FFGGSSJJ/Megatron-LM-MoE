@@ -3011,6 +3011,10 @@ def _add_training_args(parser):
                        help='Use Muon-style orthogonalized updates for matrix params under '
                        'md_decoupling. Use --no-use-orthogonal-updates to disable. '
                        'Embedding + LM head ALWAYS use the Adam branch.')
+    group.add_argument('--md-normalize-update-to-weight-norm', action='store_true',
+                       help='For MuonMD updates, rescale U to U / ||U||_F * R_W. The weight '
+                       'norm R_W is measured once immediately before the first update and '
+                       'cached; only the update norm is measured on subsequent steps.')
     group.add_argument('--use-layer-wise-distributed-optimizer', action='store_true', default=False,
                        help='For --optimizer md_decoupling: wrap the optimizer with '
                        'LayerWiseDistributedOptimizer to shard optimizer state over the '

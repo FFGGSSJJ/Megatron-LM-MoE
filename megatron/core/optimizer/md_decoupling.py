@@ -64,6 +64,27 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _local_squared_norm(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a local FP32 squared Frobenius norm in a compiled graph."""
+    return tensor.float().square().sum()
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _scale_update_to_fixed_norm(
+    update: torch.Tensor,
+    update_squared_norm: torch.Tensor,
+    fixed_weight_norm: torch.Tensor,
+) -> torch.Tensor:
+    """Scale an update to a fixed norm, mapping a zero update to zero."""
+    scale = torch.where(
+        update_squared_norm > 0,
+        fixed_weight_norm / torch.sqrt(update_squared_norm),
+        torch.zeros_like(update_squared_norm),
+    )
+    return update * scale
+
+
 _MD_GAIN_STATE_KINDS = {
     "row_gain": "row",
     "row_gain_m": "row",
@@ -337,6 +358,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         num_ns_steps: int = 5,
         scale_mode: str = "spectral",
         router_scale_mode: str = "none",
+        normalize_update_to_weight_norm: bool = False,
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
@@ -384,7 +406,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.num_ns_steps = num_ns_steps
         self.scale_mode = scale_mode
         self.router_scale_mode = router_scale_mode
+        self.normalize_update_to_weight_norm = normalize_update_to_weight_norm
         self.extra_scale_factor = extra_scale_factor
+        self._fixed_weight_norms: Dict[torch.Tensor, torch.Tensor] = {}
 
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
@@ -471,6 +495,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_router = getattr(p, "is_router", False)
         is_merged_offload_expert = getattr(p, "merged_offload_expert", False)
 
+        if group["use_orthogonal_updates"] and self.normalize_update_to_weight_norm:
+            # Cache before decoupled weight decay so preserve-init captures the actual first-step
+            # weight norm and ordinary hypersphere mode captures its projected fixed radius.
+            self._cache_fixed_weight_norm(p, is_embedding, is_router)
+
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
         if self.hypersphere_tangential_grad:
@@ -501,6 +530,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             radius_scale = self._resolve_radius_scale(is_out_proj)
             if radius_scale != 1.0:
                 update = update * radius_scale
+            if self.normalize_update_to_weight_norm:
+                update = self._normalize_muon_update_to_fixed_weight_norm(p, update)
         else:  # AdamW branch.
             beta2 = group["beta2"]
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -833,6 +864,47 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if dim is None:
             return max(size_out, size_in) ** 0.5 * self._init_radius_scale(size_out, size_in)
         return 1.0
+
+    def _global_squared_norm(self, tensor: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """Compiled local norm plus a TP reduction when ``p`` is sharded."""
+        squared_norm = _local_squared_norm(tensor)
+        if getattr(p, "partition_dim", None) in (0, 1) and self.pg_collection is not None:
+            tp_group = (
+                self.pg_collection.expt_tp
+                if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp
+            )
+            if get_pg_size(tp_group) > 1:
+                torch.distributed.all_reduce(squared_norm, group=tp_group)
+        return squared_norm
+
+    def _cache_fixed_weight_norm(
+        self,
+        p: torch.Tensor,
+        is_embedding: bool,
+        is_router: bool,
+    ) -> None:
+        """Measure ``||W||_F`` once, before the first MuonMD decay/update."""
+        if p in self._fixed_weight_norms:
+            return
+        if self._resolve_mode(is_embedding, is_router) is None:
+            raise ValueError(
+                "--md-normalize-update-to-weight-norm requires an active hypersphere mode "
+                "for every MuonMD-managed weight"
+            )
+        self._fixed_weight_norms[p] = torch.sqrt(self._global_squared_norm(p, p))
+
+    def _normalize_muon_update_to_fixed_weight_norm(
+        self,
+        p: torch.Tensor,
+        update: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match ``||update||_F`` to the cached first-step norm of ``p``."""
+        return _scale_update_to_fixed_norm(
+            update,
+            self._global_squared_norm(update, p),
+            self._fixed_weight_norms[p],
+        )
 
     def _global_sizes(self, x, partition_dim: Optional[int], is_expert_tp: bool = False):
         """TP-unsharded [d_out, d_in] for the trailing two axes of `x`, for radius/scale math."""
@@ -1805,6 +1877,7 @@ def get_megatron_mddecoupling_optimizer(
         num_ns_steps=config.muon_num_ns_steps,
         scale_mode=config.muon_scale_mode,
         router_scale_mode=config.muon_router_scale_mode,
+        normalize_update_to_weight_norm=config.md_normalize_update_to_weight_norm,
         extra_scale_factor=config.muon_extra_scale_factor,
         pg_collection=pg_collection,
         tp_mode=config.muon_tp_mode,
