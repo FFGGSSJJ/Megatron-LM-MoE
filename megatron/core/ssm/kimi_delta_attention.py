@@ -19,6 +19,7 @@
 # exactly as released by Moonshot, while letting the rest of the layer reuse
 # Megatron's distributed conventions.
 
+import copy
 import inspect
 import logging
 import math
@@ -206,11 +207,19 @@ class KimiDeltaAttention(GatedDeltaNet):
             self.num_value_heads,       # beta
         )
 
+        # decay_low_rank/gate_low_rank are already full-sequence by this point
+        # (gathered by in_proj) and full-width (gathered explicitly in
+        # forward()), so these two must NOT also treat sequence_parallel as on,
+        # or TE re-gathers an already-complete sequence -- asserts under FP8
+        # blockwise, silently wrong shape otherwise.
+        second_stage_config = copy.copy(self.config)
+        second_stage_config.sequence_parallel = False
+
         self.decay_out_proj = build_module(
             submodules.decay_out_proj,
             self.gate_low_rank_dim,
             self.alpha_dim,
-            config=self.config,
+            config=second_stage_config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=False,
@@ -223,7 +232,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             submodules.gate_out_proj,
             self.gate_low_rank_dim,
             self.v_dim,
-            config=self.config,
+            config=second_stage_config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=False,
