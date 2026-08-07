@@ -105,7 +105,7 @@ def test_md_muon_normalizes_update_to_fixed_hypersphere_norm(
     raw_update = torch.tensor([[1.0, -2.0], [3.0, -4.0]], device="cuda")
     monkeypatch.setattr(
         optimizer,
-        "_orthogonalize_param",
+        "_orthogonalize_tensor",
         lambda *args, **kwargs: raw_update.clone(),
     )
     # Disable the post-step projection so the exact applied update can be recovered from the
@@ -126,7 +126,7 @@ def test_md_muon_normalizes_update_to_fixed_hypersphere_norm(
         applied_update / torch.linalg.vector_norm(applied_update),
         raw_update / torch.linalg.vector_norm(raw_update),
     )
-    assert optimizer._fixed_weight_norms[param].item() == pytest.approx(fixed_norm)
+    assert optimizer._fixed_weight_norms[param][0].item() == pytest.approx(fixed_norm)
 
     # The target is cached; a subsequent call measures only the update, not the weight.
     norm_calls = 0
@@ -138,9 +138,124 @@ def test_md_muon_normalizes_update_to_fixed_hypersphere_norm(
         return compiled_squared_norm(tensor)
 
     monkeypatch.setattr(md_module, "_local_squared_norm", count_squared_norm)
-    second = optimizer._normalize_muon_update_to_fixed_weight_norm(param, raw_update * 3)
+    second = optimizer._normalize_muon_update_blocks(
+        param, [raw_update * 3], None
+    )[0]
     assert norm_calls == 1
     assert torch.linalg.vector_norm(second).item() == pytest.approx(fixed_norm, rel=1e-6)
+
+
+@requires_cuda_and_emerging
+def test_md_update_weight_norm_supersedes_shape_up_scaling(monkeypatch):
+    param = torch.nn.Parameter(torch.ones((3, 2), device="cuda"))
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.1,
+        hypersphere_mode="flat",
+        hypersphere_radius_mode="fan_in",
+        scale_mode="spectral",
+        normalize_update_to_weight_norm=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+    )
+    monkeypatch.setattr(md_module, "newton_schulz_tp", lambda grad, **kwargs: grad)
+    monkeypatch.setattr(
+        md_module,
+        "_get_muon_scale_factor",
+        lambda *args, **kwargs: pytest.fail("shape scaling must be skipped"),
+    )
+
+    update = torch.arange(1, 7, dtype=torch.float32, device="cuda").view(3, 2)
+    torch.testing.assert_close(optimizer._orthogonalize_tensor(update, None, None), update)
+
+
+@requires_cuda
+def test_md_update_weight_norm_is_applied_per_existing_logical_split():
+    common = dict(
+        lr=0.1,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        normalize_update_to_weight_norm=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+    )
+    flag = lambda name: lambda p: getattr(p, name, False)
+    specs = [
+        (
+            (8, 4),
+            {"is_qkv": True},
+            True,
+            False,
+            dict(split_qkv=True, is_qkv_fn=flag("is_qkv"), qkv_split_shapes=(4, 2, 2)),
+        ),
+        ((8, 4), {"glu_split_dim": 0}, False, False, dict(split_fc1=True)),
+        (
+            (6, 4),
+            {"is_qkv_down_proj": True},
+            False,
+            False,
+            dict(
+                split_qkv=True,
+                is_qkv_down_proj_fn=flag("is_qkv_down_proj"),
+                qkv_down_proj_split_shapes=(4, 2),
+            ),
+        ),
+        (
+            (4, 8),
+            {"is_kv_up_proj": True},
+            False,
+            False,
+            dict(
+                split_qkv=True,
+                split_mla_per_head=True,
+                is_kv_up_proj_fn=flag("is_kv_up_proj"),
+                kv_up_proj_split_shapes=(1, 1),
+            ),
+        ),
+        (
+            (6, 4),
+            {"is_q_up_proj": True},
+            False,
+            False,
+            dict(
+                split_mla_per_head=True,
+                is_q_up_proj_fn=flag("is_q_up_proj"),
+                q_up_proj_head_dim=2,
+            ),
+        ),
+        (
+            (2, 8, 3),
+            {"glu_split_dim": 1, "merged_offload_expert": True},
+            False,
+            True,
+            dict(split_fc1=True),
+        ),
+        ((2, 4, 3), {"merged_offload_expert": True}, False, True, {}),
+    ]
+
+    for shape, attrs, is_qkv, is_merged_expert, optimizer_kwargs in specs:
+        param = torch.nn.Parameter(
+            torch.arange(1, math.prod(shape) + 1, dtype=torch.float32, device="cuda").view(shape)
+        )
+        for name, value in attrs.items():
+            setattr(param, name, value)
+        optimizer = MDDecoupling(params=[param], **common, **optimizer_kwargs)
+        optimizer._cache_fixed_weight_norms(param, is_qkv, False, False, is_merged_expert)
+        optimizer._orthogonalize_tensor = lambda grad, *args, **kwargs: grad
+        normalized = optimizer._orthogonalize_param(
+            param,
+            torch.linspace(0.1, 3.0, param.numel(), device="cuda").view_as(param),
+            is_qkv=is_qkv,
+            is_merged_offload_expert=is_merged_expert,
+        )
+        weight_blocks, _ = optimizer._logical_blocks(param, param, is_qkv, is_merged_expert)
+        update_blocks, _ = optimizer._logical_blocks(param, normalized, is_qkv, is_merged_expert)
+
+        assert len(weight_blocks) > 1
+        torch.testing.assert_close(
+            torch.stack([torch.linalg.vector_norm(block) for block in update_blocks]),
+            torch.stack([torch.linalg.vector_norm(block) for block in weight_blocks]),
+        )
 
 
 def _gqa_qkv_optimizer(param, **kwargs):

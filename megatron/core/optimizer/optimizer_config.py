@@ -389,9 +389,11 @@ class OptimizerConfig:
     LM head ALWAYS use the Adam branch regardless of this flag."""
 
     md_normalize_update_to_weight_norm: bool = False
-    """If true, rescale each MuonMD update ``U`` to
-    ``U / ||U||_F * R_W``. The weight norm ``R_W`` is measured once, immediately before the
-    first update, and cached; only the update norm is measured on subsequent steps."""
+    """If true, rescale each existing logical MuonMD update block ``U`` to
+    ``U / ||U||_F * R_W``. This measures the actual update norm instead of assuming an ideal
+    semi-orthogonal norm of ``sqrt(min(d_out, d_in))``. Each corresponding weight-block norm
+    ``R_W`` is measured once before the first update and cached. Muon scale modes and other
+    scalar update factors are superseded for this path."""
 
     hypersphere_gains_mode: Optional[str] = 'rowcol'
     """Learnable per-axis gains for matrix params. One of

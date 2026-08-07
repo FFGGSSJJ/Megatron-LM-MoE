@@ -64,13 +64,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(dynamic=True)
 def _local_squared_norm(tensor: torch.Tensor) -> torch.Tensor:
     """Return a local FP32 squared Frobenius norm in a compiled graph."""
     return tensor.float().square().sum()
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(dynamic=True)
 def _scale_update_to_fixed_norm(
     update: torch.Tensor,
     update_squared_norm: torch.Tensor,
@@ -408,7 +408,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.router_scale_mode = router_scale_mode
         self.normalize_update_to_weight_norm = normalize_update_to_weight_norm
         self.extra_scale_factor = extra_scale_factor
-        self._fixed_weight_norms: Dict[torch.Tensor, torch.Tensor] = {}
+        self._fixed_weight_norms: Dict[torch.Tensor, tuple[torch.Tensor, ...]] = {}
 
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
@@ -498,7 +498,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if group["use_orthogonal_updates"] and self.normalize_update_to_weight_norm:
             # Cache before decoupled weight decay so preserve-init captures the actual first-step
             # weight norm and ordinary hypersphere mode captures its projected fixed radius.
-            self._cache_fixed_weight_norm(p, is_embedding, is_router)
+            self._cache_fixed_weight_norms(
+                p,
+                is_qkv,
+                is_embedding,
+                is_router,
+                is_merged_offload_expert,
+            )
 
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
@@ -523,15 +529,21 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 self._resolve_mode(is_embedding, is_router), is_router
             )
             with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                update = self._orthogonalize_param(p, grad, is_qkv=is_qkv, use_radius_scale=use_radius_scale, is_merged_offload_expert=is_merged_offload_expert, is_router=is_router)
+                update = self._orthogonalize_param(
+                    p,
+                    grad,
+                    is_qkv=is_qkv,
+                    use_radius_scale=use_radius_scale,
+                    is_merged_offload_expert=is_merged_offload_expert,
+                    is_router=is_router,
+                )
             # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
             # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
-            # target radius 1/sqrt(2L) the bare update needs the same shrink factor.
+            # target radius 1/sqrt(2L) the bare update needs the same shrink factor. Fixed-norm
+            # updates are already normalized per logical block, which supersedes this scale.
             radius_scale = self._resolve_radius_scale(is_out_proj)
-            if radius_scale != 1.0:
+            if radius_scale != 1.0 and not self.normalize_update_to_weight_norm:
                 update = update * radius_scale
-            if self.normalize_update_to_weight_norm:
-                update = self._normalize_muon_update_to_fixed_weight_norm(p, update)
         else:  # AdamW branch.
             beta2 = group["beta2"]
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -672,9 +684,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                         else self.pg_collection.tp)
         else:
             tp_group = None
-        partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            partition_dim = None
+        norm_partition_dim = getattr(p, "partition_dim", None)
+        if norm_partition_dim == -1:
+            norm_partition_dim = None
+        partition_dim = None if self.tp_mode == "blockwise" else norm_partition_dim
 
         split = self._split_param_tensor(p, grad, is_qkv)
         if split is not None:
@@ -690,14 +703,43 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 )
                 for g in parts
             ]
+            if self.normalize_update_to_weight_norm:
+                parts = self._normalize_muon_update_blocks(
+                    p,
+                    parts,
+                    self._split_partition_dim(p, norm_partition_dim),
+                )
             return merge(parts)
 
         if is_merged_offload_expert:
             experts = _split_experts(grad)
             for i, expert in enumerate(experts):
-                experts[i] = self._orthogonalize_tensor(expert, tp_group, partition_dim, use_radius_scale, is_router=is_router)
+                experts[i] = self._orthogonalize_tensor(
+                    expert,
+                    tp_group,
+                    partition_dim,
+                    use_radius_scale,
+                    is_router=is_router,
+                )
+            if self.normalize_update_to_weight_norm:
+                experts = self._normalize_muon_update_blocks(
+                    p, experts, norm_partition_dim
+                )
             return _merge_experts(experts)
-        return self._orthogonalize_tensor(grad, tp_group, partition_dim, use_radius_scale, is_router=is_router)
+
+
+        update = self._orthogonalize_tensor(
+            grad,
+            tp_group,
+            partition_dim,
+            use_radius_scale,
+            is_router=is_router,
+        )
+        if self.normalize_update_to_weight_norm:
+            update = self._normalize_muon_update_blocks(
+                p, [update], norm_partition_dim
+            )[0]
+        return update
 
     def _resolve_scale_mode(self, is_router: bool) -> str:
         """Muon scale-factor mode for this param. Routers use ``router_scale_mode`` (default
@@ -720,6 +762,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             partition_dim=partition_dim,
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
+        if self.normalize_update_to_weight_norm:
+            # The subsequent measured-norm rescale removes every scalar factor, including
+            # shape_up, radius scaling, and extra_scale_factor.
+            return orth
         if use_radius_scale and self.hypersphere_radius_mode == "fan_in":
             # fan_in pins ||update||_F to the sphere radius outright, so the scale-mode factor
             # drops out (it is exactly shape_up * _init_radius_scale, and scale_mode is asserted
@@ -769,6 +815,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 f"Unknown hypersphere_radius_mode {self.hypersphere_radius_mode!r} (expected "
                 "'shape_native', 'init' or 'fan_in')"
             )
+        if self.normalize_update_to_weight_norm:
+            # Measured block norms supersede the shape-derived Muon update scale.
+            return
         # fan_in derives every radius from the block's own d_out/d_in, so both sides of the
         # constraint must see the same GLOBAL shape. blockwise scales the update from the LOCAL
         # shard shape while _normalize keeps projecting with global sizes, so the two disagree
@@ -865,10 +914,15 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             return max(size_out, size_in) ** 0.5 * self._init_radius_scale(size_out, size_in)
         return 1.0
 
-    def _global_squared_norm(self, tensor: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        """Compiled local norm plus a TP reduction when ``p`` is sharded."""
+    def _global_squared_norm(
+        self,
+        tensor: torch.Tensor,
+        p: torch.Tensor,
+        partition_dim: Optional[int],
+    ) -> torch.Tensor:
+        """Compiled local norm plus a TP reduction when this logical block is sharded."""
         squared_norm = _local_squared_norm(tensor)
-        if getattr(p, "partition_dim", None) in (0, 1) and self.pg_collection is not None:
+        if partition_dim in (0, 1) and self.pg_collection is not None:
             tp_group = (
                 self.pg_collection.expt_tp
                 if getattr(p, "expert_tp", False)
@@ -878,13 +932,33 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 torch.distributed.all_reduce(squared_norm, group=tp_group)
         return squared_norm
 
-    def _cache_fixed_weight_norm(
+    def _logical_blocks(
         self,
         p: torch.Tensor,
+        tensor: torch.Tensor,
+        is_qkv: bool,
+        is_merged_offload_expert: bool,
+    ) -> tuple[list[torch.Tensor], Optional[int]]:
+        """Return logical matrix blocks and their TP partition dimension."""
+        partition_dim = getattr(p, "partition_dim", None)
+        if partition_dim == -1:
+            partition_dim = None
+        split = self._split_param_tensor(p, tensor, is_qkv)
+        if split is not None:
+            return split[0], self._split_partition_dim(p, partition_dim)
+        if is_merged_offload_expert:
+            return _split_experts(tensor), partition_dim
+        return [tensor], partition_dim
+
+    def _cache_fixed_weight_norms(
+        self,
+        p: torch.Tensor,
+        is_qkv: bool,
         is_embedding: bool,
         is_router: bool,
+        is_merged_offload_expert: bool,
     ) -> None:
-        """Measure ``||W||_F`` once, before the first MuonMD decay/update."""
+        """Measure each logical ``||W||_F`` once, before the first MuonMD decay/update."""
         if p in self._fixed_weight_norms:
             return
         if self._resolve_mode(is_embedding, is_router) is None:
@@ -892,19 +966,34 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 "--md-normalize-update-to-weight-norm requires an active hypersphere mode "
                 "for every MuonMD-managed weight"
             )
-        self._fixed_weight_norms[p] = torch.sqrt(self._global_squared_norm(p, p))
+        blocks, partition_dim = self._logical_blocks(
+            p, p, is_qkv, is_merged_offload_expert
+        )
+        self._fixed_weight_norms[p] = tuple(
+            torch.sqrt(self._global_squared_norm(block, p, partition_dim))
+            for block in blocks
+        )
 
-    def _normalize_muon_update_to_fixed_weight_norm(
+    def _normalize_muon_update_blocks(
         self,
         p: torch.Tensor,
-        update: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match ``||update||_F`` to the cached first-step norm of ``p``."""
-        return _scale_update_to_fixed_norm(
-            update,
-            self._global_squared_norm(update, p),
-            self._fixed_weight_norms[p],
-        )
+        blocks: list[torch.Tensor],
+        partition_dim: Optional[int],
+    ) -> list[torch.Tensor]:
+        """Match logical update blocks to cached first-step weight norms before merging."""
+        fixed_norms = self._fixed_weight_norms[p]
+        if len(blocks) != len(fixed_norms):
+            raise RuntimeError(
+                f"MuonMD logical block count changed from {len(fixed_norms)} to {len(blocks)}"
+            )
+        return [
+            _scale_update_to_fixed_norm(
+                block,
+                self._global_squared_norm(block, p, partition_dim),
+                fixed_norm,
+            )
+            for block, fixed_norm in zip(blocks, fixed_norms)
+        ]
 
     def _global_sizes(self, x, partition_dim: Optional[int], is_expert_tp: bool = False):
         """TP-unsharded [d_out, d_in] for the trailing two axes of `x`, for radius/scale math."""

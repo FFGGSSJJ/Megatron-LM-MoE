@@ -1598,27 +1598,29 @@ def validate_args(args, defaults={}):
                 "--hypersphere-radius-mode fan_in only moves the sphere radius, so it needs at "
                 "least one active hypersphere mode."
             )
-            unsupported = {k: v for k, v in active.items() if v not in ("row", "flat")}
-            assert not unsupported, (
-                "--hypersphere-radius-mode fan_in puts ||W||_F at sqrt(d_out), which the 'row' "
-                "(unit rows) and 'flat' modes reach but the column-normalizing modes do not; got "
-                f"{unsupported}."
-            )
-            if args.num_experts is not None:
-                assert args.num_experts <= args.hidden_size, (
-                    "--hypersphere-radius-mode fan_in keeps the router's Muon scale unmodified, "
-                    "which matches the sqrt(num_experts) router sphere only when num_experts <= "
-                    f"hidden_size; got {args.num_experts=} and {args.hidden_size=}."
+            if not args.md_normalize_update_to_weight_norm:
+                unsupported = {k: v for k, v in active.items() if v not in ("row", "flat")}
+                assert not unsupported, (
+                    "--hypersphere-radius-mode fan_in puts ||W||_F at sqrt(d_out), which the "
+                    "'row' (unit rows) and 'flat' modes reach but the column-normalizing modes "
+                    f"do not; got {unsupported}."
                 )
-            assert args.muon_scale_mode == "shape_up", (
-                "--hypersphere-radius-mode fan_in targets ||update||_F = sqrt(d_out), which only "
-                f"agrees with --muon-scale-mode shape_up; got {args.muon_scale_mode}."
-            )
-            assert args.muon_tp_mode != "blockwise", (
-                "--hypersphere-radius-mode fan_in is inconsistent with --muon-tp-mode blockwise "
-                "(the update would be scaled from local shard shapes while the weight is "
-                "projected with global shapes); use duplicated or distributed."
-            )
+                if args.num_experts is not None:
+                    assert args.num_experts <= args.hidden_size, (
+                        "--hypersphere-radius-mode fan_in keeps the router's Muon scale "
+                        "unmodified, which matches the sqrt(num_experts) router sphere only when "
+                        f"num_experts <= hidden_size; got {args.num_experts=} and "
+                        f"{args.hidden_size=}."
+                    )
+                assert args.muon_scale_mode == "shape_up", (
+                    "--hypersphere-radius-mode fan_in targets ||update||_F = sqrt(d_out), which "
+                    f"only agrees with --muon-scale-mode shape_up; got {args.muon_scale_mode}."
+                )
+                assert args.muon_tp_mode != "blockwise", (
+                    "--hypersphere-radius-mode fan_in is inconsistent with --muon-tp-mode "
+                    "blockwise (the update would be scaled from local shard shapes while the "
+                    "weight is projected with global shapes); use duplicated or distributed."
+                )
             warn_rank_0(
                 "--hypersphere-radius-mode fan_in assumes matrix init_std is 1/sqrt(fan_in); set "
                 "the init accordingly, or the first projection will rescale blocks whose d_in "
@@ -3012,9 +3014,10 @@ def _add_training_args(parser):
                        'md_decoupling. Use --no-use-orthogonal-updates to disable. '
                        'Embedding + LM head ALWAYS use the Adam branch.')
     group.add_argument('--md-normalize-update-to-weight-norm', action='store_true',
-                       help='For MuonMD updates, rescale U to U / ||U||_F * R_W. The weight '
-                       'norm R_W is measured once immediately before the first update and '
-                       'cached; only the update norm is measured on subsequent steps.')
+                       help='For each existing logical MuonMD block, rescale U to '
+                       'U / ||U||_F * R_W using the measured update norm rather than the ideal '
+                       'semi-orthogonal norm. Each weight-block norm R_W is cached once. This '
+                       'supersedes --muon-scale-mode and other scalar update scaling.')
     group.add_argument('--use-layer-wise-distributed-optimizer', action='store_true', default=False,
                        help='For --optimizer md_decoupling: wrap the optimizer with '
                        'LayerWiseDistributedOptimizer to shard optimizer state over the '
