@@ -122,7 +122,8 @@ class KimiDeltaAttention(GatedDeltaNet):
       1. `__init__` builds the reference factorized decay/output-gate projections
          and resizes `self.A_log` / `self.dt_bias`.
       2. `forward` delegates the vector decay activation to FLA's fused KDA gate
-         and uses the fused beta sigmoid when the installed kernel exposes it.
+         when the installed kernel exposes it, and otherwise computes it in
+         Python (see _activate_decay) so A_log/dt_bias stay trainable.
       3. `forward` overrides only the splitting + reshape of `qkvzba` (alpha
          is wider) and the FLA-op call (chunk_kda instead of
          chunk_gated_delta_rule). All other plumbing (conv1d, CP/TP all-to-all,
@@ -152,7 +153,14 @@ class KimiDeltaAttention(GatedDeltaNet):
         if not HAVE_KDA:
             raise ImportError(
                 "FLA's chunk_kda op is required for Kimi Delta Attention. "
-                "Install flash-linear-attention >= 0.4.2."
+                "Install a flash-linear-attention build that provides fla.ops.kda.chunk_kda."
+            )
+        if not _KDA_SUPPORTS_FUSED_DECAY_GATE:
+            logger.warning(
+                "The installed flash-linear-attention's chunk_kda does not expose "
+                "'use_gate_in_kernel'; computing the decay gate in Python instead "
+                "(correct, but slower). Upgrade to flash-linear-attention >= 0.5.0 "
+                "for the fused path."
             )
         if not config.linear_attention_use_output_gate:
             raise ValueError(
@@ -283,6 +291,13 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Bind the FLA op.
         self.gated_delta_rule = chunk_kda
+
+        # Let chunk_kda derive the decay from raw alpha/A_log/dt_bias, so the
+        # fp32 [b, s, h, d_k] decay is never materialized.
+        self._use_fused_decay_gate = _KDA_SUPPORTS_FUSED_DECAY_GATE and _env_flag(
+            "KDA_USE_GATE_IN_KERNEL", True
+        )
+
         self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
             not self.config.linear_attention_allow_neg_eigval
             or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
@@ -344,6 +359,21 @@ class KimiDeltaAttention(GatedDeltaNet):
         if self.config.linear_attention_allow_neg_eigval:
             beta = beta * 2.0
         return beta
+
+    def _activate_decay(self, alpha, A_log_local_cp, dt_bias_local_cp):
+        """g = -exp(A_log) * softplus(alpha + dt_bias), fp32, [b, s, h, d_k].
+
+        `alpha` arrives flat ([b, s, h*d_k]), as it leaves decay_out_proj.
+        """
+        alpha = alpha.reshape(*alpha.shape[:-1], -1, self.key_head_dim)
+        return self._activate_decay_torch(alpha, A_log_local_cp, dt_bias_local_cp)
+
+    @jit_fuser
+    def _activate_decay_torch(self, alpha, A_log_local_cp, dt_bias_local_cp):
+        """Torch fallback for `_activate_decay`; `alpha` already [b, s, h, d_k]."""
+        decay_scale = A_log_local_cp.exp().view(1, 1, -1, 1)
+        bias = dt_bias_local_cp.view(1, 1, -1, self.key_head_dim)
+        return -decay_scale * F.softplus(alpha.float() + bias)
 
     def forward(
         self,
@@ -488,8 +518,6 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         nvtx_range_pop(suffix="prepare_qkv_for_kda")
 
-        # FLA computes the vector decay from raw alpha, A_log, and dt_bias inside
-        # chunk_kda. Newer FLA versions can also fuse beta.float().sigmoid().
         nvtx_range_push(suffix="g_and_beta")
         A_log_local_cp = get_parameter_local_cp(
             self.A_log, dim=0, cp_group=self.pg_collection.cp
@@ -499,6 +527,11 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         dt_bias_local_cp = get_parameter_local_cp(
             dt_bias_local_tp, dim=0, cp_group=self.pg_collection.cp
+        )
+        g = (
+            alpha.reshape(batch, seq_len, -1, self.key_head_dim)
+            if self._use_fused_decay_gate
+            else self._activate_decay(alpha, A_log_local_cp, dt_bias_local_cp)
         )
         if not self._use_fused_beta_sigmoid:
             beta = self._activate_beta(beta)
@@ -531,16 +564,16 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         nvtx_range_push(suffix="chunk_kda")
         kda_kwargs = {
-            "g": alpha,
+            "g": g,
             "beta": beta,
-            "A_log": A_log_local_cp,
-            "dt_bias": dt_bias_local_cp.reshape(-1),
             "initial_state": initial_state_f32,
             "output_final_state": need_final_state,
             "use_qk_l2norm_in_kernel": False,
-            "use_gate_in_kernel": True,
-
         }
+        if self._use_fused_decay_gate:
+            kda_kwargs["use_gate_in_kernel"] = True
+            kda_kwargs["A_log"] = A_log_local_cp
+            kda_kwargs["dt_bias"] = dt_bias_local_cp.reshape(-1)
         if self._use_fused_beta_sigmoid:
             kda_kwargs["use_beta_sigmoid_in_kernel"] = True
             if _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
@@ -624,9 +657,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         return y.to(x_dtype)
 
     def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
-        """Reshape alpha from a flat [b, s, h*d_k] slice to [b, s, h, d_k].
-
-        Otherwise identical to the GDN helper (Q,K l2/rmsnorm, GQA expansion).
+        """Q/K/V split + reshape for KDA. alpha stays flat; it is reshaped where
+        consumed, since the fused decay-gate path needs it flat.
         """
         # Same Q,K,V split as GDN
         query_key, value = torch.split(
@@ -654,11 +686,6 @@ class KimiDeltaAttention(GatedDeltaNet):
             repeat_factor = self.num_value_heads // self.num_key_heads
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
-
-        # alpha: [b, s, num_v_heads, key_head_dim]. Use -1 (not self.num_v_heads_local_tp)
-        # since alpha is already CP-sharded by this point (see alpha_local in forward()):
-        # the local head count is num_v_heads_local_tp // cp_size, not num_v_heads_local_tp.
-        alpha = alpha.reshape(batch, seq_len, -1, self.key_head_dim)
 
         query = query.contiguous()
         key = key.contiguous()
