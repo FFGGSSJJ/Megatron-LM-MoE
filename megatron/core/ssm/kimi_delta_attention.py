@@ -63,6 +63,16 @@ except ImportError:
     HAVE_FUSED_RMSNORM_GATED = False
 
 
+try:
+    # Present since fla 0.4.0, but its signature is not stable across versions;
+    # _fused_kda_gate_style() resolves the calling convention below.
+    from fla.ops.kda.gate import fused_kda_gate
+
+    HAVE_FUSED_KDA_GATE = True
+except ImportError:
+    fused_kda_gate = None
+    HAVE_FUSED_KDA_GATE = False
+
 def _have_causal_conv1d_cuda() -> bool:
     """Whether `causal_conv1d(..., backend="cuda")` will actually dispatch.
 
@@ -104,6 +114,28 @@ def _chunk_kda_supports(option: str) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+def _fused_kda_gate_style() -> Optional[str]:
+    """Which `fused_kda_gate` calling convention the installed FLA exposes.
+
+    "0.4" -> fused_kda_gate(g[..., h*d_k], A_log, head_k_dim, g_bias=dt_bias)
+    "0.5" -> fused_kda_gate(g[..., h, d_k], A_log, dt_bias=dt_bias)
+    None  -> unavailable/unrecognized; fall back to the torch implementation.
+    """
+    if not HAVE_FUSED_KDA_GATE:
+        return None
+    try:
+        params = inspect.signature(fused_kda_gate).parameters
+    except (TypeError, ValueError):
+        return None
+    if "g_bias" in params:
+        return "0.4"
+    if "dt_bias" in params:
+        return "0.5"
+    return None
+
+
+_KDA_GATE_STYLE = _fused_kda_gate_style()
 
 _KDA_SUPPORTS_QK_L2NORM_IN_KERNEL = _chunk_kda_supports("use_qk_l2norm_in_kernel")
 _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
@@ -321,6 +353,34 @@ class KimiDeltaAttention(GatedDeltaNet):
         self._use_fused_decay_gate = _KDA_SUPPORTS_FUSED_DECAY_GATE and _env_flag(
             "KDA_USE_GATE_IN_KERNEL", True
         )
+        # Without the in-kernel gate, prefer FLA's fused_kda_gate over torch.
+        self._kda_gate_style = (
+            None
+            if self._use_fused_decay_gate
+            else (_KDA_GATE_STYLE if _env_flag("KDA_FUSED_GATE", True) else None)
+        )
+        if self._kda_gate_style is None and not self._use_fused_decay_gate:
+            logger.warning(
+                "Neither chunk_kda's use_gate_in_kernel nor fused_kda_gate is "
+                "usable in the installed flash-linear-attention; computing the "
+                "decay gate in torch instead (correct, but slower)."
+            )
+
+        # Dtype of the decay when one is materialized at all (None = fp32, the
+        # kernel's native output dtype).
+        _decay_dtype_name = os.environ.get("KDA_DECAY_DTYPE", "").strip().lower()
+        self._decay_dtype = {
+            "": None, "fp32": None, "float32": None,
+            "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+            "fp16": torch.float16, "float16": torch.float16,
+        }.get(_decay_dtype_name)
+        if _decay_dtype_name and self._decay_dtype is None and _decay_dtype_name not in (
+            "fp32", "float32"
+        ):
+            raise ValueError(
+                f"KDA_DECAY_DTYPE={_decay_dtype_name!r} is not one of "
+                "fp32/bf16/fp16."
+            )
 
         # Q/K L2-norm inside chunk_kda. Only the plain L2 path has an in-kernel
         # equivalent; the Schlag-style learnable qk_rmsnorm variant must stay
@@ -408,10 +468,25 @@ class KimiDeltaAttention(GatedDeltaNet):
     def _activate_decay(self, alpha, A_log_local_cp, dt_bias_local_cp):
         """g = -exp(A_log) * softplus(alpha + dt_bias), fp32, [b, s, h, d_k].
 
-        `alpha` arrives flat ([b, s, h*d_k]), as it leaves decay_out_proj.
+        `alpha` arrives flat ([b, s, h*d_k]), as it leaves decay_out_proj. The
+        reshape is per-branch: 0.4's fused_kda_gate splits per head itself.
         """
+        if self._kda_gate_style == "0.4":
+            g = fused_kda_gate(
+                alpha, A_log_local_cp, self.key_head_dim, g_bias=dt_bias_local_cp
+            )
+            return g if self._decay_dtype is None else g.to(self._decay_dtype)
         alpha = alpha.reshape(*alpha.shape[:-1], -1, self.key_head_dim)
-        return self._activate_decay_torch(alpha, A_log_local_cp, dt_bias_local_cp)
+        if self._kda_gate_style == "0.5":
+            # 0.5 can emit the decay in a narrower dtype directly; 0.4 cannot.
+            if self._decay_dtype is None:
+                return fused_kda_gate(alpha, A_log_local_cp, dt_bias_local_cp)
+            return fused_kda_gate(
+                alpha, A_log_local_cp, dt_bias_local_cp,
+                output_dtype=self._decay_dtype,
+            )
+        g = self._activate_decay_torch(alpha, A_log_local_cp, dt_bias_local_cp)
+        return g if self._decay_dtype is None else g.to(self._decay_dtype)
 
     @jit_fuser
     def _activate_decay_torch(self, alpha, A_log_local_cp, dt_bias_local_cp):
