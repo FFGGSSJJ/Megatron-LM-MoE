@@ -298,6 +298,19 @@ class KimiDeltaAttention(GatedDeltaNet):
             "KDA_USE_GATE_IN_KERNEL", True
         )
 
+        # Q/K L2-norm inside chunk_kda. Only the plain L2 path has an in-kernel
+        # equivalent; the Schlag-style learnable qk_rmsnorm variant must stay
+        # external. Bit-identical to the external l2norm() call (same
+        # fla.modules.l2norm Triton kernels), minus one standalone kernel, one
+        # autograd node, and one full-size [b, s, 2h, d_k] activation held
+        # live for backward.
+        self._qk_l2norm_in_kernel = (
+            _KDA_SUPPORTS_QK_L2NORM_IN_KERNEL
+            and self.use_qk_l2norm
+            and self.qk_rmsnorm is None
+            and _env_flag("KDA_QK_L2NORM_IN_KERNEL", True)
+        )
+
         self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
             not self.config.linear_attention_allow_neg_eigval
             or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
@@ -568,7 +581,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             "beta": beta,
             "initial_state": initial_state_f32,
             "output_final_state": need_final_state,
-            "use_qk_l2norm_in_kernel": False,
+            "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
         }
         if self._use_fused_decay_gate:
             kda_kwargs["use_gate_in_kernel"] = True
@@ -669,8 +682,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Normalize fused Q+K before splitting
-        if self.use_qk_l2norm:
+        # Normalize fused Q+K before splitting. Skipped here when chunk_kda
+        # will do it in-kernel instead (self._qk_l2norm_in_kernel).
+        if self.use_qk_l2norm and not self._qk_l2norm_in_kernel:
             query_key = query_key.contiguous()
             if self.qk_rmsnorm is not None:
                 query_key = self.qk_rmsnorm(query_key)
