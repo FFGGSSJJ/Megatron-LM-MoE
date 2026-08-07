@@ -14,6 +14,7 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from . import param_and_grad_buffer
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
+            # Publish for param_and_grad_buffer's diagnostic map (see there).
+            param_and_grad_buffer._PARAM_NAMES[id(param)] = name
 
             if getattr(param, 'allreduce', True):
                 dense_params.append((param, name))
