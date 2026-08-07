@@ -403,6 +403,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             else "triton"
         )
 
+        # One all-gather for both low-rank bottlenecks instead of two.
+        self._fuse_low_rank_gather = _env_flag("KDA_FUSED_LOW_RANK_GATHER", True)
+
         self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
             not self.config.linear_attention_allow_neg_eigval
             or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
@@ -542,26 +545,50 @@ class KimiDeltaAttention(GatedDeltaNet):
         ]
 
         # Q/K/V occupy one contiguous prefix and stay grouped for convolution.
-        # Only split out the tensors that follow different computation paths.
-        qkv, decay_low_rank, gate_low_rank, beta = torch.split(
-            projected,
-            [
-                self.conv_dim_local_tp,
-                low_rank_local_tp,
-                low_rank_local_tp,
-                num_v_heads_tp,
-            ],
-            dim=-1,
-        )
-        # Gather the low-rank activations from TP shards before applying the second-stage projections (it needs the complete input, not only 1/TP part of it).
-        decay_low_rank = gather_from_tensor_model_parallel_region(
-            decay_low_rank, group=self.pg_collection.tp
-        )
-        gate_low_rank = gather_from_tensor_model_parallel_region(
-            gate_low_rank, group=self.pg_collection.tp
-        )
+        nvtx_range_push(suffix="low_rank_proj")
+        if self._fuse_low_rank_gather and self.tp_size > 1:
+            qkv, low_rank_pair, beta = torch.split(
+                projected,
+                [self.conv_dim_local_tp, 2 * low_rank_local_tp, num_v_heads_tp],
+                dim=-1,
+            )
+            # Both bottlenecks are needed at full width, so gather them in one
+            # collective. The all-gather concatenates per-rank blocks, each
+            # [decay_shard | gate_shard], giving [d0 g0 d1 g1 ...]; the view
+            # below de-interleaves that back into the two full-width tensors.
+            gathered = gather_from_tensor_model_parallel_region(
+                low_rank_pair, group=self.pg_collection.tp
+            )
+            gathered = gathered.view(
+                *gathered.shape[:-1], self.tp_size, 2, low_rank_local_tp
+            )
+            decay_low_rank = gathered[..., 0, :].reshape(
+                *gathered.shape[:-3], self.gate_low_rank_dim
+            )
+            gate_low_rank = gathered[..., 1, :].reshape(
+                *gathered.shape[:-3], self.gate_low_rank_dim
+            )
+        else:
+            qkv, decay_low_rank, gate_low_rank, beta = torch.split(
+                projected,
+                [
+                    self.conv_dim_local_tp,
+                    low_rank_local_tp,
+                    low_rank_local_tp,
+                    num_v_heads_tp,
+                ],
+                dim=-1,
+            )
+            if self.tp_size > 1:
+                decay_low_rank = gather_from_tensor_model_parallel_region(
+                    decay_low_rank, group=self.pg_collection.tp
+                )
+                gate_low_rank = gather_from_tensor_model_parallel_region(
+                    gate_low_rank, group=self.pg_collection.tp
+                )
         alpha, _ = self.decay_out_proj(decay_low_rank)
         gate, _ = self.gate_out_proj(gate_low_rank)
+        nvtx_range_pop(suffix="low_rank_proj")
 
         # Keep the logical outputs separate through CP. The CP helper already
         # communicates split sections independently, so packing qkv/gate/beta/
