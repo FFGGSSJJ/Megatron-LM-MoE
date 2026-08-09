@@ -362,7 +362,7 @@ class TopKRouter(Router):
                 raise ValueError(f"Invalid score_function: {self.score_function}")
 
             # NOTE: Legacy average is so that previous checkpoints that used the average method can still be loaded and work correctly.
-            # This backwards compatibility should probably be removed in 1 or 2months from this git blame
+            # This backwards compatibility should probably be removed in 1 or 2 months from this git blame
             qb_scores = (
                 logits_fp32
                 if self.config.moe_router_quantile_balancing_method == 'legacy_average'
