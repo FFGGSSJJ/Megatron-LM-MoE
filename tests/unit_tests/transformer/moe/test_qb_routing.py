@@ -281,6 +281,46 @@ class TestQuantileBalancingRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_legacy_average_qb_uses_raw_logits(self, monkeypatch):
+        config = replace(
+            self.transformer_config,
+            moe_router_quantile_balancing_method="legacy_average",
+        )
+        router = cast(Router, MoELayer(config, self.submodules).router).cuda()
+        router.train()
+
+        logits = torch.tensor(
+            [
+                [3.0, 1.0, 0.9, -1.0, -2.0, -3.0, -4.0, -5.0],
+                [1.0, 3.0, 0.9, -1.0, -2.0, -3.0, -4.0, -5.0],
+            ],
+            device="cuda",
+        )
+        with torch.no_grad():
+            router.qb_beta.zero_()
+            router.qb_beta[0] = 1.0
+        expected_qb_scores = logits.to(torch.bfloat16).float()
+        expected_indices = (expected_qb_scores - router.qb_beta).topk(router.topk, dim=1).indices
+        expected_routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+            1, expected_indices, True
+        )
+        captured = {}
+
+        def fake_qb_dual_update(scores, topk, beta, update_beta=True):
+            captured["scores"] = scores.detach().clone()
+            return expected_indices, scores.mean(dim=0)
+
+        monkeypatch.setattr(router_module, "qb_dual_update", fake_qb_dual_update)
+
+        _, routing_map = router.quantile_balancing(logits.to(torch.bfloat16))
+
+        torch.testing.assert_close(captured["scores"], expected_qb_scores)
+        assert torch.equal(routing_map, expected_routing_map)
+        torch.testing.assert_close(router.qb_beta_accum, expected_qb_scores.mean(dim=0))
+        assert router.qb_beta_count.item() == 1
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_qb_histogram_accumulates_valid_tokens_without_forward_collective(
         self, monkeypatch
     ):

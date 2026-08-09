@@ -898,11 +898,14 @@ class TransformerConfig(ModelParallelConfig):
     updated as `qb_beta = ema * qb_beta + (1 - ema) * quantile_estimate`. The default 0.0 means
     no memory: the bias is replaced by the latest global-batch estimate each step."""
 
-    moe_router_quantile_balancing_method: Literal['average', 'histogram'] = 'histogram'
-    """Quantile estimator used by quantile balancing. "average" is the legacy estimator that
-    averages independently computed microbatch/rank quantiles; this generally differs from the
-    pooled global-batch quantile. "histogram" accumulates fixed-size per-expert histograms over all
-    microbatches and approximates the true pooled quantile at the global-batch boundary."""
+    moe_router_quantile_balancing_method: Literal[
+        'average', 'legacy_average', 'histogram'
+    ] = 'histogram'
+    """Quantile estimator used by quantile balancing. "average" averages independently computed
+    microbatch/rank quantiles in sigmoid/softmax score space. "legacy_average" preserves the
+    raw-logit routing and update scale used by older average-QB checkpoints. "histogram"
+    accumulates fixed-size per-expert histograms over all microbatches and approximates the true
+    pooled global-batch quantile."""
 
     moe_router_quantile_balancing_num_bins: int = 1000
     """Number of uniform bins per expert used by histogram quantile balancing."""
@@ -1757,9 +1760,11 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         if "quantile_balancing" in self.moe_router_load_balancing_type:
-            if self.moe_router_quantile_balancing_method not in {'average', 'histogram'}:
+            valid_qb_methods = {'average', 'legacy_average', 'histogram'}
+            if self.moe_router_quantile_balancing_method not in valid_qb_methods:
                 raise ValueError(
-                    "moe_router_quantile_balancing_method must be 'average' or 'histogram'"
+                    "moe_router_quantile_balancing_method must be 'average', "
+                    "'legacy_average', or 'histogram'"
                 )
             if self.moe_router_quantile_balancing_num_bins <= 0:
                 raise ValueError("moe_router_quantile_balancing_num_bins must be positive")

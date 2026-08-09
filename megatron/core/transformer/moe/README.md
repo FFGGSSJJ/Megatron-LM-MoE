@@ -544,7 +544,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-group-topk | Selected groups in group-limited routing | None |
 | --moe-router-enable-expert-bias | Dynamic per-expert bias | False |
 | --moe-router-bias-update-rate | Bias update rate | 1e-3 |
-| --moe-router-quantile-balancing-method | QB estimator: average or histogram | histogram |
+| --moe-router-quantile-balancing-method | QB estimator: average, legacy_average (raw-logit compatibility), or histogram | histogram |
 | --moe-router-quantile-balancing-num-bins | Per-expert histogram bins for histogram QB | 1000 |
 | --moe-router-bias-metrics | Log router bias mean, standard deviation, minimum, and maximum | False |
 | --moe-router-violation-metrics | Optional violation scopes: mbs, seq, ep; global is always logged | [mbs] |
