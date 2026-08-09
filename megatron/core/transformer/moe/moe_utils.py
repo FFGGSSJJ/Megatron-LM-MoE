@@ -3,7 +3,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -22,7 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api, is_te_min_version
+from megatron.core.utils import get_model_config, internal_api, is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -1085,6 +1085,164 @@ def expert_load_violation_batchwise(
     ideal_tokens_per_expert = effective_total_tokens / num_experts
     violation_ratios = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
     return violation_ratios.max(), violation_ratios.min(), violation_ratios.median()
+
+
+@torch.no_grad()
+def consume_inference_router_violation_metrics(
+    model: Union[torch.nn.Module, Sequence[torch.nn.Module]],
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> Dict[str, float]:
+    """Reduce and clear router violation samples accumulated during inference.
+
+    Every participating rank must call this function at the same synchronization point after the
+    same eager forward or collection window. Each result is the average of the corresponding
+    per-observation, per-layer expert-distribution statistic, weighted correctly for uneven
+    data-parallel batches. Calling this function is also the reset operation for the collection
+    window. Python-side collection is not compatible with CUDA graph replay.
+
+    Args:
+        model: A model or sequence of virtual-pipeline model chunks.
+        pg_collection: Optional process groups. Defaults to the global parallel state.
+
+    Returns:
+        Aggregate min, max, median, and population-standard-deviation violation metrics for each
+        collected scope. When ``moe_per_layer_logging`` is enabled, the same metrics are returned
+        with ``_layer_<zero-based global layer index>`` suffixes. Scopes and layers without
+        observations are omitted.
+    """
+    model_chunks = [model] if isinstance(model, torch.nn.Module) else list(model)
+    model_config = get_model_config(model_chunks[0])
+    per_layer_logging = model_config.moe_per_layer_logging
+    num_metric_layers = model_config.num_layers + (model_config.mtp_num_layers or 0) if per_layer_logging else 0
+
+    router_modules = []
+    sample_sizes = []
+    samples = []
+
+    for model_chunk in model_chunks:
+        for module in model_chunk.modules():
+            mbs_samples = getattr(module, 'inference_mbs_expert_load_samples', None)
+            seq_samples = getattr(module, 'inference_seq_expert_load_samples', None)
+            if not mbs_samples and not seq_samples:
+                continue
+
+            module_samples = []
+            mbs_sample_count = len(mbs_samples) if mbs_samples else 0
+            seq_sample_count = sum(sample.shape[0] for sample in seq_samples) if seq_samples else 0
+            if mbs_sample_count:
+                module_samples.append(torch.stack(mbs_samples))
+            if seq_sample_count:
+                module_samples.append(torch.cat(seq_samples))
+
+            router_modules.append(module)
+            sample_sizes.append((mbs_sample_count, seq_sample_count))
+            samples.append(
+                torch.cat(module_samples) if len(module_samples) > 1 else module_samples[0]
+            )
+
+    if samples:
+        stacked_samples = torch.cat(samples)
+        tp_cp_group = router_modules[0].tp_cp_group
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(tp_cp_group) > 1:
+            # We pool the counts of the TP and CP group as the sequence is devided into mulitple chunks in this group. The counts are then reduced across the group to get the total counts for each expert.
+            torch.distributed.all_reduce(
+                stacked_samples, op=torch.distributed.ReduceOp.SUM, group=tp_cp_group
+            )
+        device = stacked_samples.device
+    else:
+        stacked_samples = None
+        device = next(model_chunks[0].parameters()).device
+
+    # Dimension 0 contains the aggregate followed by optional global layers. Dimension 1 is
+    # mbs/seq; dimension 2 contains max, min, median, std, and observation count.
+    accumulators = torch.zeros(
+        (1 + num_metric_layers, 2, 5), dtype=torch.float64, device=device
+    )
+
+    def accumulate(scope_index: int, module: torch.nn.Module, counts: torch.Tensor) -> None:
+        # Fully padded rows are not logical observations and must not dilute the metrics.
+        counts = counts[counts[:, -1] > 0]
+        if counts.numel() == 0:
+            return
+        tokens_per_expert = counts[:, :-1]
+        total_num_tokens = counts[:, -1:]
+        ideal_tokens_per_expert = total_num_tokens * module.topk / tokens_per_expert.shape[-1]
+        violation = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
+        stats = torch.stack(
+            (
+                violation.max(dim=-1).values,
+                violation.min(dim=-1).values,
+                violation.median(dim=-1).values,
+                violation.std(dim=-1, correction=0),
+            ),
+            dim=-1,
+        )
+        stats_sum = stats.double().sum(dim=0)
+        observation_count = counts.shape[0]
+        accumulators[0, scope_index, :4] += stats_sum
+        accumulators[0, scope_index, 4] += observation_count
+
+        if per_layer_logging:
+            if module.layer_number is None:
+                raise ValueError("Router layer number is required for per-layer inference metrics")
+            layer_index = module.layer_number - 1
+            if module.is_mtp_layer:
+                layer_index += model_config.num_layers
+            if not 0 <= layer_index < num_metric_layers:
+                raise ValueError(
+                    f"Router layer index {layer_index} is outside [0, {num_metric_layers})"
+                )
+            accumulators[layer_index + 1, scope_index, :4] += stats_sum
+            accumulators[layer_index + 1, scope_index, 4] += observation_count
+
+    if stacked_samples is not None:
+        offset = 0
+        for module, (mbs_sample_count, seq_sample_count) in zip(router_modules, sample_sizes):
+            accumulate(0, module, stacked_samples[offset : offset + mbs_sample_count])
+            offset += mbs_sample_count
+            accumulate(1, module, stacked_samples[offset : offset + seq_sample_count])
+            offset += seq_sample_count
+
+    if torch.distributed.is_initialized():
+        if pg_collection is None:
+            dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            dp_group = pg_collection.dp
+            pp_group = pg_collection.pp
+        for group in (dp_group, pp_group):
+            if group is not None and torch.distributed.get_world_size(group) > 1:
+                torch.distributed.all_reduce(
+                    accumulators, op=torch.distributed.ReduceOp.SUM, group=group
+                )
+
+    for module in router_modules:
+        module.inference_mbs_expert_load_samples.clear()
+        module.inference_seq_expert_load_samples.clear()
+
+    metric_names = ('max', 'min', 'median', 'std')
+    metrics = {}
+
+    def export_metrics(accumulator: torch.Tensor, suffix: str = '') -> None:
+        for scope_index, scope_name in enumerate(('mbs', 'seq')):
+            observation_count = accumulator[scope_index, 4]
+            if observation_count.item() == 0:
+                continue
+            values = accumulator[scope_index, :4] / observation_count
+            metrics.update(
+                {
+                    f'moe_router_{scope_name}_{metric_name}_violation{suffix}': value.item()
+                    for metric_name, value in zip(metric_names, values)
+                }
+            )
+
+    export_metrics(accumulators[0])
+    if per_layer_logging:
+        for layer_index in range(num_metric_layers):
+            export_metrics(accumulators[layer_index + 1], suffix=f'_layer_{layer_index}')
+    return metrics
 
 
 def expert_max_violation_batchwise(

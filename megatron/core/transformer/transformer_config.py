@@ -1017,7 +1017,8 @@ class TransformerConfig(ModelParallelConfig):
     the MNNVL case."""
 
     moe_per_layer_logging: bool = False
-    """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
+    """Enable per-layer logging for MoE auxiliary loss, z loss, and inference router violation
+    metrics."""
 
     moe_router_bias_metrics: bool = False
     """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
@@ -1029,6 +1030,14 @@ class TransformerConfig(ModelParallelConfig):
     """Optional expert-load violation scopes to log. Global-batch violation is always logged.
     Defaults to "mbs", which pools each microbatch across TP/CP. "seq" measures each sequence
     across TP/CP, and "ep" additionally pools each microbatch across EP."""
+
+    moe_router_inference_violation_metrics: List[Literal['mbs', 'seq']] = field(
+        default_factory=list
+    )
+    """Expert-load violation scopes to collect during eager inference. Disabled by default.
+    Every model-parallel rank must call ``consume_inference_router_violation_metrics`` at the same
+    synchronization point after a forward or collection window; that call also clears the samples.
+    Python-side collection is not compatible with CUDA graph replay."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
@@ -1684,6 +1693,15 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_router_violation_metrics entries must be 'mbs', 'seq', or 'ep'; "
                 f"got {sorted(invalid_violation_metrics)}"
+            )
+
+        invalid_inference_violation_metrics = set(
+            self.moe_router_inference_violation_metrics
+        ) - {'mbs', 'seq'}
+        if invalid_inference_violation_metrics:
+            raise ValueError(
+                "moe_router_inference_violation_metrics entries must be 'mbs' or 'seq'; "
+                f"got {sorted(invalid_inference_violation_metrics)}"
             )
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:

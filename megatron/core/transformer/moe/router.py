@@ -184,6 +184,9 @@ class TopKRouter(Router):
         # Retain local counts until finalization so TP/CP communication is batched.
         self.mbs_expert_load_samples = []
         self.seq_expert_load_samples = []
+        # Inference samples have an independent consume/reset lifecycle.
+        self.inference_mbs_expert_load_samples = []
+        self.inference_seq_expert_load_samples = []
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -866,8 +869,22 @@ class TopKRouter(Router):
             and torch.is_grad_enabled()
             and self.config.moe_router_violation_metrics
         ):
+            violation_metrics = self.config.moe_router_violation_metrics
+            mbs_samples = self.mbs_expert_load_samples
+            seq_samples = self.seq_expert_load_samples
+        elif (
+            not self.training
+            and not torch.is_grad_enabled()
+            and self.config.moe_router_inference_violation_metrics
+        ):
+            violation_metrics = self.config.moe_router_inference_violation_metrics
+            mbs_samples = self.inference_mbs_expert_load_samples
+            seq_samples = self.inference_seq_expert_load_samples
+        else:
+            violation_metrics = None
+
+        if violation_metrics is not None:
             with torch.no_grad():
-                violation_metrics = self.config.moe_router_violation_metrics
                 expert_load_routing_map = routing_map.reshape(seq_length, bsz, -1)
                 if padding_mask is not None:
                     valid_tokens = ~padding_mask.reshape(seq_length, bsz)
@@ -883,16 +900,14 @@ class TopKRouter(Router):
 
                 seq_tokens_per_expert = expert_load_routing_map.sum(dim=0, dtype=torch.float32)
                 if "seq" in violation_metrics:
-                    self.seq_expert_load_samples.append(
+                    seq_samples.append(
                         torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1)
                     )
 
                 if "mbs" in violation_metrics or "ep" in violation_metrics:
                     mbs_tokens_per_expert = seq_tokens_per_expert.sum(dim=0)
                     mbs_num_tokens = seq_num_tokens.sum(dim=0)
-                    self.mbs_expert_load_samples.append(
-                        torch.cat((mbs_tokens_per_expert, mbs_num_tokens))
-                    )
+                    mbs_samples.append(torch.cat((mbs_tokens_per_expert, mbs_num_tokens)))
 
         return probs, routing_map
 
