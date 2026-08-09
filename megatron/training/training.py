@@ -179,6 +179,10 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.muon_logging import (
+    collect_md_gain_stats,
+    collect_muon_stats,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -2022,6 +2026,7 @@ def training_log(
     skipped_iter,
     grad_norm,
     params_norm,
+    md_gain_stats,
     num_zeros_in_grad,
     max_attention_logit,
     pg_collection=None,
@@ -2192,6 +2197,13 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+
+    if md_gain_stats:
+        if writer:
+            for metric_name, metric_value in md_gain_stats.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+        if wandb_writer:
+            wandb_writer.log(md_gain_stats, iteration)
 
     # Log MoE metrics.
     if args.num_experts is not None:
@@ -3244,9 +3256,26 @@ def train(
         else:
             loss_scale = 1.0
         params_norm = None
+        md_gain_stats = None
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+        if args.log_muon_gains or args.log_muon_sparsity or args.log_muon_param_rms:
+            muon_log_interval = args.muon_log_interval or args.log_interval
+            if iteration % muon_log_interval == 0:
+                stats_collector = (
+                    collect_md_gain_stats
+                    if args.optimizer == "md_decoupling"
+                    else collect_muon_stats
+                )
+                md_gain_stats = stats_collector(
+                    optimizer,
+                    per_layer=args.log_muon_per_layer,
+                    sparsity_thresholds=args.muon_sparsity_thresholds,
+                    log_gains=args.log_muon_gains,
+                    log_sparsity=args.log_muon_sparsity,
+                    log_param_rms=args.log_muon_param_rms,
+                )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3261,6 +3290,7 @@ def train(
             skipped_iter,
             grad_norm,
             params_norm,
+            md_gain_stats,
             num_zeros_in_grad,
             max_attention_logit,
             pg_collection=model_pg_collection,
