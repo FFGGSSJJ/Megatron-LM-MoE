@@ -88,10 +88,11 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused
 from megatron.core.transformer.moe.experts_offloading_util import (
     StreamManager,
     ExpertsWgradScheduler,
+    build_offloading_expert_sharded_tensor,
 )
 
 from megatron.core.transformer.moe.experts_offloading import (
-    offloading_grouped_swiglu_mlp,
+    offloading_grouped_mlp,
 )
 
 logger = logging.getLogger(__name__)
@@ -1501,7 +1502,7 @@ class OffloadingExpertsMLP(MegatronModule):
             )
             self.weight1.append(getattr(self, f'weight1_expert_{i}'))
             self.weight1[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook and not config.moe_offloading_experts_debug_mode
-            self.weight1[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+            self.weight1[i].is_cpu_offloaded_expert = not self.config.moe_offloading_experts_debug_mode
 
             self.register_parameter(
                 f'weight2_expert_{i}',
@@ -1516,7 +1517,7 @@ class OffloadingExpertsMLP(MegatronModule):
             )
             self.weight2.append(getattr(self, f'weight2_expert_{i}'))
             self.weight2[i].skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook and not config.moe_offloading_experts_debug_mode
-            self.weight2[i].is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+            self.weight2[i].is_cpu_offloaded_expert = not self.config.moe_offloading_experts_debug_mode
 
             # Set for the expert weights
             setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
@@ -1603,7 +1604,7 @@ class OffloadingExpertsMLP(MegatronModule):
         ]
 
         # cuda stream manager for h2d transfer and computation
-        self.stream_manager = StreamManager.get_instance(num_compute_streams=1 if self.config.moe_use_inplace_fp8_param else 4)
+        self.stream_manager = StreamManager.get_instance(num_compute_streams=1)
 
         # scheduler to determine when to trigger wgrad compute
         self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
@@ -1689,7 +1690,7 @@ class OffloadingExpertsMLP(MegatronModule):
     def _apply(self, fn, recurse=True):
         saved = {}
         for name, p in list(self._parameters.items()):
-            if p is not None and getattr(p, 'is_cpu_offloaded', False):
+            if p is not None and getattr(p, 'is_cpu_offloaded_expert', False):
                 saved[name] = self._parameters.pop(name)
         out = super()._apply(fn, recurse=recurse)
         for name, p in saved.items():
@@ -1703,7 +1704,7 @@ class OffloadingExpertsMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         if permuted_local_hidden_states.nelement() != 0:
-            output = offloading_grouped_swiglu_mlp(
+            output = offloading_grouped_mlp(
                 self.weight1,
                 self.weight2,
                 self.experts1_gpu_buffers,
@@ -1723,7 +1724,7 @@ class OffloadingExpertsMLP(MegatronModule):
             # NOTE: it should be safe to pass empty tensor to the custom function,
             # but it will introduce meanless h2d transfer.
             # TODO: add cost free path for empty input
-            output = offloading_grouped_swiglu_mlp(
+            output = offloading_grouped_mlp(
                 self.weight1,
                 self.weight2,
                 self.experts1_gpu_buffers,
@@ -1759,9 +1760,6 @@ class OffloadingExpertsMLP(MegatronModule):
         orientation, so a checkpoint saved by one is loadable by the other:
 
         - bf16 variant: per-expert params already ``(in, out)`` -> saved directly.
-        - inplace-fp8 variant: a single fused ``(num_local, out, in)`` master is
-          transposed per expert via a ``ShardedTensorFactory`` (one per fused
-          param, keyed by the real param name so ``load_state_dict`` maps it back).
         """
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
@@ -1770,30 +1768,6 @@ class OffloadingExpertsMLP(MegatronModule):
         num_global_experts = self.ep_group.size() * self.num_local_experts
         local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
         replica_id = (0, 0, self.dp_group.rank())
-
-        if self.config.moe_use_inplace_fp8_param:
-            # The fused bf16 master is only valid when fp8 lives in extra storage;
-            # otherwise self.weight1/2 are overwritten in place with packed fp8 bytes
-            # (see _quantize_weight in experts_offloading_fp8_util.py).
-            assert self.config.moe_use_extra_fp8_param_storage, (
-                "Checkpointing inplace-fp8 OffloadingExpertsMLP requires "
-                "moe_use_extra_fp8_param_storage=True so the bf16 weights are "
-                "preserved (otherwise self.weight1/2 hold packed fp8 bytes)."
-            )
-            sharded_state_dict = {}
-            for wname, fused_weight in (('weight1', self.weight1), ('weight2', self.weight2)):
-                sharded_state_dict[f'{prefix}{wname}'] = make_fused_experts_sharded_factory(
-                    fused_weight,
-                    prefix,
-                    wname,
-                    num_local_experts=self.num_local_experts,
-                    local_expert_indices_offset=local_expert_indices_offset,
-                    num_global_experts=num_global_experts,
-                    sharded_offsets=sharded_offsets,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                )
-            return sharded_state_dict
 
         sharded_state_dict = {}
         for i in range(self.num_local_experts):

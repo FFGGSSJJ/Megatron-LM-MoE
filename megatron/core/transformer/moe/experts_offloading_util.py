@@ -12,6 +12,7 @@ import queue
 from typing import Optional
 
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 try:
     from transformer_engine.pytorch import (
@@ -39,169 +40,6 @@ class ExpertsWgradScheduler:
             # If there is no token assigned to the expert in this MoE layer,
             # then there will be case that the wgrad compute is not registered
             return
-
-class MergedSwiGLU(torch.autograd.Function):
-    """Re-implementation of Silu
-    """
-
-    @classmethod
-    @torch.compile()
-    def call_forward(
-        cls,
-        input_tensor: torch.Tensor,
-        probs: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """forward with optional probability scaling for SwiGLU activation. 
-        If `probs` is provided, it will be used to scale the output of the SwiGLU activation, 
-        otherwise it will compute the standard SwiGLU activation without scaling.
-
-        Args:
-            input_tensor (torch.Tensor): input tensor to the activation function
-            probs (torch.Tensor | None, optional): Defaults to None.
-
-        Returns:
-            torch.Tensor: activation output
-        """
-        if probs is not None:
-            return MergedSwiGLU.call_forward_silu_probs(input_tensor, probs)
-        else:
-            return MergedSwiGLU.call_forward_silu(input_tensor)
-
-    @classmethod
-    @torch.compile()
-    def call_forward_silu(
-        cls,
-        input_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        """forward pass for SwiGLU activation without probability scaling.
-
-        Args:
-            input_tensor (torch.Tensor): input tensor to the activation function
-
-        Returns:
-            torch.Tensor: activation output
-        """
-        a, b = input_tensor.chunk(2, dim=-1)
-        return (torch.nn.functional.silu(a) * b).to(input_tensor.dtype)
-    
-    @classmethod
-    @torch.compile()
-    def call_forward_silu_probs(
-        cls,
-        input_tensor: torch.Tensor,
-        probs: torch.Tensor
-    ) -> torch.Tensor:
-        """actual forward function with probability.
-
-        Args:
-            input_tensor (torch.Tensor): input tensor to the activation function
-            probs (torch.Tensor): probability derived from router
-
-        Returns:
-            torch.Tensor: activation output
-        """
-        a, b = input_tensor.chunk(2, dim=-1)
-        return ((torch.nn.functional.silu(a) * b) * probs).to(input_tensor.dtype)
-    
-    @classmethod
-    @torch.compile()
-    def call_backward(
-        cls,
-        grad_output: torch.Tensor,
-        input_tensor: torch.Tensor,
-        probs: torch.Tensor | None = None
-    ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor | None]:
-        """backward function for SwiGLU activation with optional probability scaling.
-
-        Args:
-            grad_output (torch.Tensor): gradient of the output from the activation function
-            input_tensor (torch.Tensor): input tensor to the activation function
-            probs (torch.Tensor | None, optional): Defaults to None.
-        """
-        if probs is not None:
-            return MergedSwiGLU.call_backward_silu_probs(grad_output, input_tensor, probs)
-        else:
-            return MergedSwiGLU.call_backward_silu(grad_output, input_tensor)
-    
-    @classmethod
-    @torch.compile()
-    def call_backward_silu(
-        cls,
-        grad_output: torch.Tensor,
-        input_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        """actual backward function without probability.
-
-        Args:
-            grad_output (torch.Tensor): gradient of the output from the activation function
-            input_tensor (torch.Tensor): input tensor to the activation function
-
-        Returns:
-            torch.Tensor: gradient of the input tensor
-        """
-        a, b = input_tensor.chunk(2, dim=-1)
-        sigmoid_a = torch.sigmoid(a)
-        ones = torch.ones(sigmoid_a.shape, device=sigmoid_a.device, dtype=sigmoid_a.dtype)
-        grad_a = grad_output * (sigmoid_a + a * sigmoid_a * (ones - sigmoid_a)) * b
-        grad_b = grad_output * torch.nn.functional.silu(a)
-        return torch.cat([grad_a, grad_b], dim=-1)
-    
-    @classmethod
-    @torch.compile()
-    def call_backward_silu_probs(
-        cls,
-        grad_output: torch.Tensor,
-        input_tensor: torch.Tensor,
-        probs: torch.Tensor
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """actual backward function with probability. 
-        It computes the gradient of the input tensor and the probability.
-
-        Args:
-            grad_output (torch.Tensor): gradient of the output from the activation function
-            input_tensor (torch.Tensor): input tensor to the activation function
-            probs (torch.Tensor): probability derived from router
-        """
-        input_grad = MergedSwiGLU.call_backward_silu(
-            grad_output * probs, 
-            input_tensor
-        )
-        weights_grad = MergedSwiGLU.call_forward_silu(
-            input_tensor
-        ) * grad_output.to(probs.dtype)
-        weights_grad = torch.sum(
-            weights_grad, dim=-1
-        )
-
-        return input_grad.to(input_tensor.dtype) if input_grad is not None else None, \
-        weights_grad.to(probs.dtype) if weights_grad is not None else None
-    
-    @staticmethod
-    def forward(
-        ctx,
-        *args,
-    ):
-        args_q = collections.deque(args)
-        input_tensor: torch.Tensor = args_q.popleft()
-        probs: torch.Tensor | None = args_q.popleft()
-
-        ctx.save_for_backward(input_tensor, probs)
-        return MergedSwiGLU.call_forward(input_tensor, probs)
-    
-    @staticmethod
-    def backward(
-        ctx, 
-        *grad_outputs
-    ):
-        grad_y: torch.Tensor = grad_outputs[0]
-        (x, probs) = ctx.saved_tensors
-        input_grad, prob_grad = MergedSwiGLU.call_backward(
-            grad_y, x, probs
-        )
-        if prob_grad is not None:
-            prob_grad = prob_grad.unsqueeze(-1)
-        return input_grad, prob_grad
-        
 
 def release(t: torch.Tensor):
     """Helper function to release tensors that are no longer needed to save memory.
@@ -243,6 +81,9 @@ class StreamManager:
 
     def get_compute_streams(self) -> list[int]:
         return self.compute_cuda_streams
+
+    def get_compute_stream_objects(self) -> list[torch.cuda.Stream]:
+        return self.compute_streams
 
     def get_launch_streams(self) -> list[torch.cuda.Stream]:
         # VPP can execute a model chunk on a non-default current stream.
@@ -321,6 +162,63 @@ def get_dummy_wgrad(
     if zero:
         _dummy_wgrads[wgard_key].fill_(0)
     return _dummy_wgrads[wgard_key].detach()
+
+def build_offloading_expert_sharded_tensor(
+    weight_slice: torch.Tensor,
+    prefix: str,
+    weight_name: str,
+    global_expert_idx: int,
+    *,
+    sharded_offsets: tuple,
+    num_global_experts: int,
+    replica_id,
+    singleton_local_shards: bool,
+    transpose: bool,
+):
+    """Build the ShardedTensor for a single offloaded expert weight.
+
+    Produces the *same* on-disk representation for both OffloadingExpertsMLP
+    variants so their checkpoints are interchangeable:
+
+    - bf16 variant: per-expert params stored as ``(in, out)`` -> ``transpose=False``
+    - inplace-fp8 variant: fused master stored as ``(out, in)`` (NT layout)
+      -> ``transpose=True`` to land on the same ``(in, out)`` checkpoint layout.
+
+    The expert is expressed as a *prepended* axis fragment exactly like
+    ``SequentialMLP``/``TEGroupedMLP`` (see ``apply_swiglu_sharded_factory``),
+    i.e. ``prepend_axis_num == len(offsets)``, which is what makes the expert
+    dimension compose cleanly with any pipeline/tensor ``sharded_offsets``.
+
+    Args:
+        weight_slice (torch.Tensor): one expert's 2D weight. ``(in, out)`` when
+            ``transpose=False`` else ``(out, in)``.
+        prefix (str): module prefix for the on-disk key.
+        weight_name (str): ``'weight1'`` or ``'weight2'``.
+        global_expert_idx (int): this expert's index in the global expert range.
+        sharded_offsets (tuple): offsets inherited from parent modules (PP, ...).
+        num_global_experts (int): total experts across the expert-parallel group.
+        replica_id: ShardedTensor replica id (PP, TP, DP).
+        singleton_local_shards (bool): when True each expert is saved under its own
+            global key with no expert sharding axis.
+        transpose (bool): transpose ``(out, in) -> (in, out)`` before saving.
+    """
+    data = weight_slice.transpose(0, 1).contiguous() if transpose else weight_slice
+    if singleton_local_shards:
+        key = f'{prefix}experts.{global_expert_idx}.{weight_name}'
+        offsets = sharded_offsets
+    else:
+        key = f'{prefix}experts.{weight_name}'
+        offsets = (
+            *sharded_offsets,
+            (len(sharded_offsets), global_expert_idx, num_global_experts),
+        )
+    return ShardedTensor.from_rank_offsets(
+        key,
+        data,
+        *offsets,
+        replica_id=replica_id,
+        prepend_axis_num=len(offsets),
+    )
 
 def grouped_swiglu_mlp_torch_ref(
     w1,
