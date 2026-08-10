@@ -738,16 +738,20 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "qkv", "mlp", "moe",
+    "shared_experts".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
+    "qkv": recompute the linear-attention input projection, i.e. everything from in_proj
+        through the q/k/v/gate/beta/alpha handed to the chunkwise kernel. Only implemented
+        for experimental_attention_variant="kda".
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "moe_act", "layernorm", "mla_up_proj", and "qkv" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1934,6 +1938,7 @@ class TransformerConfig(ModelParallelConfig):
                     # KimiDeltaAttention._kda_core.
                     "linear_attn",
                     "mla_up_proj",
+                    "qkv",
                     "mlp",
                     "moe",
                     "shared_experts",
@@ -1953,6 +1958,12 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if "qkv" in self.recompute_modules and self.experimental_attention_variant != "kda":
+                raise ValueError(
+                    "qkv in recompute_modules is only supported with "
+                    "experimental_attention_variant='kda'."
                 )
 
             if "core_attn" in self.recompute_modules:

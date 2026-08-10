@@ -450,6 +450,7 @@ def _get_moe_module_spec(
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
         use_te_activation_func=config.use_te_activation_func,
+        moe_use_offloading_experts=config.moe_use_offloading_experts,
     )
     moe_spec.metainfo["fuse_pre_mlp_layernorm"] = False
     return moe_spec
