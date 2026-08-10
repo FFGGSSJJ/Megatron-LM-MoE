@@ -125,6 +125,19 @@ def _chunk_kda_supports(option: str) -> bool:
         return False
 
 
+def _chunk_kda_accepts(option: str) -> bool:
+    """Return whether chunk_kda can receive an argument, named or through **kwargs."""
+    if not HAVE_KDA:
+        return False
+    try:
+        params = inspect.signature(chunk_kda).parameters
+    except (TypeError, ValueError):
+        return False
+    return option in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _fused_kda_gate_style() -> Optional[str]:
     """Which `fused_kda_gate` calling convention the installed FLA exposes.
 
@@ -153,10 +166,12 @@ _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
 )
 _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL = _chunk_kda_supports("allow_neg_eigval")
 
-# Probe "use_gate_in_kernel" only, NOT "A_log": FLA takes A_log/dt_bias through
-# chunk_kda's **kwargs, which inspect.signature() cannot see, so probing for
-# them would disable the fused path on builds that fully support it.
-_KDA_SUPPORTS_FUSED_DECAY_GATE = _chunk_kda_supports("use_gate_in_kernel")
+# Needs both an implementation (only builds with a fused gate name the flag) and
+# a way in for A_log, which FLA 0.5.x takes through **kwargs -- so A_log is
+# probed with _chunk_kda_accepts, not _chunk_kda_supports.
+_KDA_SUPPORTS_FUSED_DECAY_GATE = _chunk_kda_supports(
+    "use_gate_in_kernel"
+) and _chunk_kda_accepts("A_log")
 
 logger = logging.getLogger(__name__)
 
