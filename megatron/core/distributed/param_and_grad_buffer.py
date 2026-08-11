@@ -1134,6 +1134,12 @@ class _ParamAndGradBuffer:
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
 
+        # CPU expert params
+        self.use_cpu_param_data = False
+        if all(p.device == torch.device("cpu") for p in self.params) and \
+            all(p.is_cpu_offloaded_expert for p in self.params):
+            self.use_cpu_param_data = True
+
         # Check that params are unique.
         unique_params = set()
         for param, _ in params_with_names:
@@ -1264,7 +1270,8 @@ class _ParamAndGradBuffer:
                     self.param_data = torch.zeros(
                         numel,
                         dtype=self.param_dtype,
-                        device=torch.cuda.current_device(),
+                        device=torch.cuda.current_device() if not self.use_cpu_param_data else "cpu",
+                        pin_memory=self.use_cpu_param_data,
                         requires_grad=False,
                     )
                 self.grad_data = torch.zeros(

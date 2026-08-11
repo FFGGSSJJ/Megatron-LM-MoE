@@ -4,15 +4,16 @@ This module implements utilities for MoE experts offloading, including:
 1) OffloadingExpertsGroupedMLP: an autograd function for the forward and backward pass of the grouped SwiGLU MLP in offloading experts, with chunk-level interleaving of GPU computation and CPU-GPU communication to hide the data transfer latency of expert weights.
 """
 from __future__ import annotations
+
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
-    from transformer_engine.pytorch import (
-        Float8BlockQuantizer,
-    )
+    from transformer_engine.pytorch import Float8BlockQuantizer
     from transformer_engine.pytorch.constants import TE_DType
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+    from transformer_engine.pytorch.module.base import get_multi_stream_cublas_workspace
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
@@ -25,16 +26,37 @@ except ImportError:
     grouped_gemm = None
     HAVE_BATCHED_H2D= False
 
+from megatron.core.fusions.fused_bias_swiglu import weighted_swiglu, weighted_swiglu_back
 from megatron.core.transformer.moe.experts_offloading_util import (
-    StreamManager,
     ExpertsWgradScheduler,
-    release
+    StreamManager,
+    get_dummy_wgrad,
+    release,
 )
 
-from megatron.core.fusions.fused_bias_swiglu import (
-    weighted_swiglu,
-    weighted_swiglu_back,
-)
+
+def split_per_expert(
+    t: torch.Tensor,
+    total_token_num_per_chunk: list[int],
+    tokens_per_expert_chunks: list[list[int]],
+) -> list[list[torch.Tensor]]:
+    """Split a ``[sum(tokens), K]`` tensor into per-expert views.
+
+    Returns ``[num_chunks][chunk_size]`` views: ``out[i]`` is the operand list for
+    offloading chunk ``i``, and ``flatten_per_expert(out)`` is the operand list for
+    a whole-layer wgrad gemm.
+    """
+    return [
+        list(torch.split(chunk, tokens))
+        for chunk, tokens in zip(
+            torch.split(t, total_token_num_per_chunk), tokens_per_expert_chunks
+        )
+    ]
+
+
+def flatten_per_expert(per_expert: list[list[torch.Tensor]]) -> list[torch.Tensor]:
+    """Flatten ``split_per_expert`` output into one view per local expert."""
+    return [t for chunk in per_expert for t in chunk]
 
 
 class OffloadingExpertsGroupedMLP(torch.autograd.Function):
@@ -46,9 +68,9 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
     @staticmethod
     def _grouped_gemm(
-        a: torch.Tensor,
-        b: torch.Tensor | list[torch.Tensor],
-        tokens_per_expert: torch.Tensor,
+        a_chunks: list[torch.Tensor],
+        b_chunks: list[torch.Tensor],
+        m_splits: list[int],
         trans_a: bool,
         trans_b: bool,
         compute_streams: list[torch.cuda.Stream],
@@ -57,55 +79,51 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         beta: float = 0.0,
     ):
         """
-        A loop based groupgemm wrapper for easy stream control.
+        A grouped gemm wrapper over TE's ``general_grouped_gemm``.
 
-        Computes ``c[i] = beta * c[i] + alpha * (op(a[i]) @ op(b[i]))`` per expert.
+        Computes ``c[i] = beta * c[i] + alpha * (op(a_chunks[i]) @ op(b_chunks[i]))``.
 
-        ``trans_a=False`` is the dgrad/fprop layout: ``a`` is a token-major
-        ``[sum(tokens), K]`` tensor, ``b`` holds one ``[K, N]`` weight per expert and
-        ``c`` is a token-major ``[sum(tokens), N]`` tensor.
+        Both operands arrive already split into one view per expert: ``a_chunks``
+        always comes from ``split_per_expert``, ``b_chunks`` either from the GPU
+        weight buffers (fprop/dgrad) or from ``split_per_expert`` too (wgrad).
 
-        ``trans_a=True`` is the wgrad layout: both ``a`` and ``b`` are token-major
-        and ``c`` holds one ``[K, N]`` weight gradient per expert.
+        ``trans_a=False`` is the dgrad/fprop layout: ``c`` is a single token-major
+        ``[sum(m_splits), N]`` tensor that TE splits internally via ``m_splits``.
+
+        ``trans_a=True`` is the wgrad layout: ``c`` holds one ``[K, N]`` weight
+        gradient per expert.
+
+        TE runs the per-expert gemms on its own pool of cuBLAS streams, forking from
+        and joining back into whichever stream is current at call time. We enter from
+        ``compute_streams[0]`` so that the ordering ``StreamManager`` has already
+        established for the compute streams (the H2D copy-done event before the call,
+        the h2d/launch stream waits after it) also applies to TE's internal streams.
         """
+        assert HAVE_TE, "Offloading experts grouped gemm requires TransformerEngine."
         assert alpha == 1.0 and beta in (0.0, 1.0)
-        tokens = (
-            tokens_per_expert.tolist()
-            if isinstance(tokens_per_expert, torch.Tensor)
-            else list(tokens_per_expert)
-        )
-        a_chunks = torch.split(a, tokens, dim=0)
         if trans_a:
-            b_chunks = torch.split(b, tokens, dim=0)
-            c_chunks = list(torch.unbind(c, dim=0)) if isinstance(c, torch.Tensor) else list(c)
+            out = c
+            single_output = False
         else:
-            b_chunks = list(torch.unbind(b, dim=0)) if isinstance(b, torch.Tensor) else list(b)
-            c_chunks = torch.split(c, tokens, dim=0)
+            out = [c]
+            single_output = True
 
-        for i, num_tokens in enumerate(tokens):
-            out = c_chunks[i]
-            stream = compute_streams[i % len(compute_streams)]
+        # TE evaluates ``D = op(B) @ op(A)`` in row-major terms, so ``A`` takes ``b``
+        # and ``B`` takes ``a``; layout[0] transposes ``b`` and layout[1] transposes ``a``.
+        layout = ('T' if trans_b else 'N') + ('T' if trans_a else 'N')
 
-            if num_tokens == 0:
-                if trans_a and beta == 0.0:
-                    with torch.cuda.stream(stream):
-                        out.zero_()
-                continue
-
-            lhs = a_chunks[i].t() if trans_a else a_chunks[i]
-            rhs = b_chunks[i].t() if trans_b else b_chunks[i]
-            with torch.cuda.stream(stream):
-                if out.dtype == lhs.dtype:
-                    if beta == 0.0:
-                        torch.mm(lhs, rhs, out=out)
-                    else:
-                        torch.addmm(out, lhs, rhs, beta=beta, alpha=alpha, out=out)
-                else:
-                    if beta == 0.0:
-                        torch.mm(lhs, rhs, out=out)
-                    else:
-                        partial = torch.mm(lhs, rhs)
-                        out.add_(partial, alpha=alpha)
+        with torch.cuda.stream(compute_streams[0]):
+            general_grouped_gemm(
+                A=b_chunks,
+                B=a_chunks,
+                out=out,
+                out_dtype=out[0].dtype,
+                workspaces=get_multi_stream_cublas_workspace(),
+                layout=layout,
+                m_splits=m_splits,
+                single_output=single_output,
+                accumulate=(beta == 1.0),
+            )
 
         return c
 
@@ -131,7 +149,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
             assert len(cpu_weights_slice) == len(buf), \
                 f"Number of weights in CPU slice {len(cpu_weights_slice)} does not match number of GPU buffers {len(buf)}"
             # NOTE: batched H2D copy is used to reduce cpu overhead
-            if cpu_weights_slice[0].is_pinned() and HAVE_BATCHED_H2D:
+            if HAVE_BATCHED_H2D:
                 batched_h2d_async(
                     cpu_weights_slice,
                     buf,
@@ -146,7 +164,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
         # NOTE: this is a temp solution to resolve a correctness issue encoutered
         # when VPP is enabled
-        h2d_stream.synchronize()
+        # h2d_stream.synchronize()
 
         return (
             gpu_buffer_idx,
@@ -162,9 +180,9 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         cpu_w1: list[torch.nn.Parameter],
         gpu_w1_buffers: list[list[torch.Tensor]],
         permuted_local_hidden_states: list[torch.Tensor],
-        hidden_state_per_chunk: list[torch.Tensor],
+        x_per_expert: list[list[torch.Tensor]],
         total_token_num_per_chunk: list[int],
-        tokens_per_expert_chunks: list[torch.Tensor],
+        tokens_per_expert_chunks: list[list[int]],
         stream_manager: StreamManager,
         config: TransformerConfig,
     ):
@@ -181,6 +199,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         curr_buffer_metadata = cls._prefetch_expert_weights(0, cpu_w1, gpu_w1_buffers, stream_manager, config)
 
         # fc1 chunk-level interleaving computation
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -188,26 +207,25 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
             # computation on the current GPU buffer
             experts_chunk = gpu_w1_buffers[curr_buffer_metadata[0]]
-            hidden_states_chunk = hidden_state_per_chunk[chunk_idx]
+            hidden_states_chunk = x_per_expert[chunk_idx]
             fc1_output_chunk = fc1_output_per_chunk[chunk_idx]
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             OffloadingExpertsGroupedMLP._grouped_gemm(
-                a=hidden_states_chunk,
-                b=experts_chunk,
-                tokens_per_expert=tokens_per_expert_chunk,
+                a_chunks=hidden_states_chunk,
+                b_chunks=experts_chunk,
+                m_splits=tokens_per_expert_chunk,
                 trans_a=False,
                 trans_b=False,
                 compute_streams=stream_manager.get_compute_stream_objects(),
                 c=fc1_output_chunk
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
+        stream_manager.launch_streams_wait_compute_streams()
 
         return fc1_output
     
@@ -219,7 +237,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         permuted_local_hidden_states: torch.Tensor,
         fc1_output: torch.Tensor,
         total_token_num_per_chunk: list[int],
-        tokens_per_expert_chunks: list[torch.Tensor],
+        tokens_per_expert_chunks: list[list[int]],
         permuted_probs: torch.Tensor,
         stream_manager: StreamManager,
         config: TransformerConfig,
@@ -228,12 +246,13 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         curr_buffer_metadata = cls._prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, config)
 
         s = weighted_swiglu(fc1_output, permuted_probs.unsqueeze(-1))
-        s_per_chunk = list(torch.split(s, total_token_num_per_chunk))
+        s_per_expert = split_per_expert(s, total_token_num_per_chunk, tokens_per_expert_chunks)
 
         # fc2 chunk-level interleaving computation
         fc2_output = torch.empty_like(permuted_local_hidden_states)
         fc2_output_per_chunk = list(torch.split(fc2_output, total_token_num_per_chunk))
 
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -241,26 +260,25 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
             # computation on the current GPU buffer
             experts_chunk = gpu_w2_buffers[curr_buffer_metadata[0]]
-            s_chunk = s_per_chunk[chunk_idx]
+            s_chunk = s_per_expert[chunk_idx]
             fc2_output_chunk = fc2_output_per_chunk[chunk_idx]
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             cls._grouped_gemm(
-                a=s_chunk,
-                b=experts_chunk,
-                tokens_per_expert=tokens_per_expert_chunk,
+                a_chunks=s_chunk,
+                b_chunks=experts_chunk,
+                m_splits=tokens_per_expert_chunk,
                 trans_a=False,
                 trans_b=False,
                 compute_streams=stream_manager.get_compute_stream_objects(),
                 c=fc2_output_chunk,
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
+        stream_manager.launch_streams_wait_compute_streams()
         
         return fc2_output, s
     
@@ -268,16 +286,16 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
     def call_backward_grad_a(
         cls,
         grad_y: torch.Tensor,
+        grad_y_per_expert: list[list[torch.Tensor]],
         a: torch.Tensor,
         cpu_w2: list[torch.nn.Parameter],
         gpu_w2_buffers: list[torch.Tensor],
         total_token_num_per_chunk: list[int],
-        tokens_per_expert_chunks: list[torch.Tensor],
+        tokens_per_expert_chunks: list[list[int]],
         permuted_probs: torch.Tensor,
         stream_manager: StreamManager,
         config: TransformerConfig,
     ):
-        grad_y_per_chunk = list(torch.split(grad_y, total_token_num_per_chunk))
         grad_s = torch.empty(
             grad_y.shape[0],
             config.moe_ffn_hidden_size,
@@ -289,6 +307,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls._prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, config)
 
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -296,26 +315,25 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
             # computation on the current GPU buffer
             experts_chunk = gpu_w2_buffers[curr_buffer_metadata[0]]
-            grad_y_chunk = grad_y_per_chunk[chunk_idx]
+            grad_y_chunk = grad_y_per_expert[chunk_idx]
             grad_s_chunk = grad_s_per_chunk[chunk_idx]
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             cls._grouped_gemm(
-                a=grad_y_chunk,
-                b=experts_chunk,
-                tokens_per_expert=tokens_per_expert_chunk,
+                a_chunks=grad_y_chunk,
+                b_chunks=experts_chunk,
+                m_splits=tokens_per_expert_chunk,
                 trans_a=False,
                 trans_b=True,
                 compute_streams=stream_manager.get_compute_stream_objects(),
                 c=grad_s_chunk,
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
 
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
+        stream_manager.launch_streams_wait_compute_streams()
 
         grad_a, grad_probs = weighted_swiglu_back(grad_s, a, permuted_probs.unsqueeze(-1))
         return grad_a, grad_probs.squeeze(-1)
@@ -324,14 +342,14 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
     def call_backward_grad_x(
         cls,
         grad_a: torch.Tensor,
+        grad_a_per_expert: list[list[torch.Tensor]],
         cpu_w1: list[torch.nn.Parameter],
         gpu_w1_buffers: list[torch.Tensor],
         total_token_num_per_chunk: list[int],
-        tokens_per_expert_chunks: list[torch.Tensor],
+        tokens_per_expert_chunks: list[list[int]],
         stream_manager: StreamManager,
         config: TransformerConfig,
     ):
-        grad_a_per_chunk = list(torch.split(grad_a, total_token_num_per_chunk))
         grad_x = torch.empty(
             grad_a.shape[0],
             config.hidden_size,
@@ -343,6 +361,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls._prefetch_expert_weights(0, cpu_w1, gpu_w1_buffers, stream_manager, config)
 
+        stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):            
             # prefetch the next chunk of expert weights to GPU buffer
             if chunk_idx + 1 < config.moe_offloading_num_chunks:
@@ -350,26 +369,25 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
             # computation on the current GPU buffer
             experts_chunk = gpu_w1_buffers[curr_buffer_metadata[0]]
-            grad_a_chunk = grad_a_per_chunk[chunk_idx]
+            grad_a_chunk = grad_a_per_expert[chunk_idx]
             grad_x_chunk = grad_x_per_chunk[chunk_idx]
             tokens_per_expert_chunk = tokens_per_expert_chunks[chunk_idx]
 
-            stream_manager.compute_streams_wait_launch_streams()
             stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
             cls._grouped_gemm(
-                a=grad_a_chunk,
-                b=experts_chunk,
-                tokens_per_expert=tokens_per_expert_chunk,
+                a_chunks=grad_a_chunk,
+                b_chunks=experts_chunk,
+                m_splits=tokens_per_expert_chunk,
                 trans_a=False,
                 trans_b=True,
                 compute_streams=stream_manager.get_compute_stream_objects(),
                 c=grad_x_chunk,
             )
             stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
-            stream_manager.launch_streams_wait_compute_streams()
             
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
+        stream_manager.launch_streams_wait_compute_streams()
 
         return grad_x
     
@@ -385,16 +403,17 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         for i in range(len(w)):
             if fuse_gradient_accumulation:
                 w[i].grad_added_to_main_grad = True
-                w[i].grad = torch.empty_like(w[i].data)
+                w[i].grad = get_dummy_wgrad(w[i].shape, w[i].dtype, w[i].device)
     
     @classmethod
     def call_backward_grad_w2(
         cls,
         grad_y: torch.Tensor,
+        grad_y_per_expert: list[torch.Tensor],
         a: torch.Tensor,
         cpu_w2: list[torch.nn.Parameter],
         gpu_w2_buffers: list[torch.Tensor],
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: list[int],
         permuted_probs: torch.Tensor,
         stream_manager: StreamManager,
         config: TransformerConfig,
@@ -402,7 +421,8 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool = False,
     ):
         s = weighted_swiglu(a,permuted_probs.unsqueeze(-1))
-        
+        s_per_expert = list(torch.split(s, tokens_per_expert))
+
         wgrad_output = None
         alpha = 1.0
         beta = 0.0
@@ -420,9 +440,9 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         # compute wgrad immediately if not delay_wgrad_compute or wgrad_scheduler is None
         stream_manager.compute_streams_wait_launch_streams()
         grad_w2 = cls._grouped_gemm(
-            a=s,
-            b=grad_y,
-            tokens_per_expert=tokens_per_expert,
+            a_chunks=s_per_expert,
+            b_chunks=grad_y_per_expert,
+            m_splits=tokens_per_expert,
             trans_a=True,
             trans_b=False,
             compute_streams=stream_manager.get_compute_stream_objects(),
@@ -439,9 +459,10 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
     def call_backward_grad_w1(
         cls,
         grad_a: torch.Tensor,
-        x: torch.Tensor,
+        grad_a_per_expert: list[torch.Tensor],
+        x_per_expert: list[torch.Tensor],
         cpu_w1: list[torch.nn.Parameter],
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: list[int],
         stream_manager: StreamManager,
         wgrad_scheduler: ExpertsWgradScheduler = None,
         delay_wgrad_compute: bool = False,
@@ -452,9 +473,10 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
         Args:
             grad_a (torch.Tensor): gradient of the input to the activation function
-            x (torch.Tensor): input to the first linear layer
+            grad_a_per_expert (list[torch.Tensor]): ``grad_a`` as one view per local expert
+            x_per_expert (list[torch.Tensor]): input to the first linear layer, one view per local expert
             w1 (torch.nn.Parameter): weight parameter for the first linear layer
-            tokens_per_expert (torch.Tensor): number of tokens assigned to each expert
+            tokens_per_expert (list[int]): number of tokens assigned to each expert
             fuse_gradient_accumulation (bool, optional): Fuse gradient accumulation in gemm. Defaults to False.
 
         Returns:
@@ -478,9 +500,9 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         # compute wgrad immediately if not delay_wgrad_compute or wgrad_scheduler is None
         stream_manager.compute_streams_wait_launch_streams()
         grad_w1 = cls._grouped_gemm(
-            a=x,
-            b=grad_a,
-            tokens_per_expert=tokens_per_expert,
+            a_chunks=x_per_expert,
+            b_chunks=grad_a_per_expert,
+            m_splits=tokens_per_expert,
             trans_a=True,
             trans_b=False,
             compute_streams=stream_manager.get_compute_stream_objects(),
@@ -518,16 +540,23 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         wgrad_accumulation_and_reduce_hooks: list = args[-1]
 
         # split hidden states, outputs and token_per_experts into chunks for each expert chunks
-        tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
-        total_token_num_per_chunk = [chunk.sum().item() for chunk in tokens_per_expert_chunks]
-        hidden_state_per_chunk = list(torch.split(permuted_local_hidden_states, total_token_num_per_chunk))
+        chunk_size = config.moe_offloading_chunk_size
+        tokens_per_expert = tokens_per_expert.tolist()
+        tokens_per_expert_chunks = [
+            tokens_per_expert[i : i + chunk_size]
+            for i in range(0, len(tokens_per_expert), chunk_size)
+        ]
+        total_token_num_per_chunk = [sum(chunk) for chunk in tokens_per_expert_chunks]
+        x_per_expert = split_per_expert(
+            permuted_local_hidden_states, total_token_num_per_chunk, tokens_per_expert_chunks
+        )
 
         # forward for the first linear layer
         fc1_output = OffloadingExpertsGroupedMLP.call_forward_a(
             cpu_w1,
             gpu_w1_buffers,
             permuted_local_hidden_states,
-            hidden_state_per_chunk,
+            x_per_expert,
             total_token_num_per_chunk,
             tokens_per_expert_chunks,
             stream_manager,
@@ -635,15 +664,17 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
         stream_manager: StreamManager = ctx.stream_manager
         expert_wgrad_scheduler: ExpertsWgradScheduler = ctx.expert_wgrad_scheduler
         total_token_num_per_chunk: list[int] = ctx.total_token_num_per_chunk
-        tokens_per_expert_chunks: tuple[torch.Tensor] = ctx.tokens_per_expert_chunks
-        tokens_per_expert: torch.Tensor = ctx.tokens_per_expert
+        tokens_per_expert_chunks: list[list[int]] = ctx.tokens_per_expert_chunks
+        tokens_per_expert: list[int] = ctx.tokens_per_expert
         (permuted_local_hidden_states, fc1_output, permuted_probs) = ctx.saved_tensors
 
         # rematerialize activation if needed
         # NOTE: fp8 tensors have to be manually released after dequantization
         if config.moe_use_fp8_activation:
             permuted_local_hidden_states = ctx.qx.dequantize()
-            hidden_state_per_chunk = list(torch.split(permuted_local_hidden_states, total_token_num_per_chunk))
+            x_per_expert = split_per_expert(
+                permuted_local_hidden_states, total_token_num_per_chunk, tokens_per_expert_chunks
+            )
             release(ctx.qx)
             if not ctx.activation_recompute:
                 fc1_output = ctx.qa.dequantize()
@@ -653,20 +684,22 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
                     cpu_w1,
                     gpu_w1_buffers,
                     permuted_local_hidden_states,
-                    hidden_state_per_chunk,
+                    x_per_expert,
                     total_token_num_per_chunk,
                     tokens_per_expert_chunks,
                     stream_manager,
                     config,
                 )
         else:
-            hidden_state_per_chunk = list(torch.split(permuted_local_hidden_states, total_token_num_per_chunk))
+            x_per_expert = split_per_expert(
+                permuted_local_hidden_states, total_token_num_per_chunk, tokens_per_expert_chunks
+            )
             if ctx.activation_recompute:
                 fc1_output = OffloadingExpertsGroupedMLP.call_forward_a(
                     cpu_w1,
                     gpu_w1_buffers,
                     permuted_local_hidden_states,
-                    hidden_state_per_chunk,
+                    x_per_expert,
                     total_token_num_per_chunk,
                     tokens_per_expert_chunks,
                     stream_manager,
@@ -674,10 +707,16 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
                 )
 
         grad_y = grad_outputs[0].contiguous()
+        # ``grad_y`` feeds both the dgrad and the wgrad gemm, ``grad_a`` likewise, so
+        # each is split once here and the views are reused by both consumers.
+        grad_y_per_expert = split_per_expert(
+            grad_y, total_token_num_per_chunk, tokens_per_expert_chunks
+        )
 
         # backward computation
         grad_a, grad_probs = OffloadingExpertsGroupedMLP.call_backward_grad_a(
             grad_y,
+            grad_y_per_expert,
             fc1_output,
             cpu_w2,
             gpu_w2_buffers,
@@ -688,8 +727,13 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
             config,
         )
 
+        grad_a_per_expert = None if grad_a is None else split_per_expert(
+            grad_a, total_token_num_per_chunk, tokens_per_expert_chunks
+        )
+
         grad_x = None if grad_a is None else OffloadingExpertsGroupedMLP.call_backward_grad_x(
             grad_a,
+            grad_a_per_expert,
             cpu_w1,
             gpu_w1_buffers,
             total_token_num_per_chunk,
@@ -700,6 +744,7 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
         grad_w2 = OffloadingExpertsGroupedMLP.call_backward_grad_w2(
             grad_y,
+            flatten_per_expert(grad_y_per_expert),
             fc1_output,
             cpu_w2,
             gpu_w2_buffers,
@@ -713,7 +758,8 @@ class OffloadingExpertsGroupedMLP(torch.autograd.Function):
 
         grad_w1 = None if grad_a is None else OffloadingExpertsGroupedMLP.call_backward_grad_w1(
             grad_a,
-            permuted_local_hidden_states,
+            flatten_per_expert(grad_a_per_expert),
+            flatten_per_expert(x_per_expert),
             cpu_w1,
             tokens_per_expert,
             stream_manager,
