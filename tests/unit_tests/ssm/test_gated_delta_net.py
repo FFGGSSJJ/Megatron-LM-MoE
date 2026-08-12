@@ -143,9 +143,8 @@ class TestGatedDeltaNet:
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
     def test_forward_thd_correctness(self):
-        """Packed (THD) forward with cross-document masking must match running each
-        document independently in dense (SBHD) mode -- i.e. cu_seqlens correctly
-        resets the chunkwise recurrence at every document boundary."""
+        """Packed (THD) forward must match running each document independently
+        in dense (SBHD) mode."""
         if self.cp_size > 1 or self.sp_size > 1:
             pytest.skip("Packed-sequence GDN forward does not support CP/SP yet.")
         gdn = self.gdn
@@ -172,8 +171,7 @@ class TestGatedDeltaNet:
         )
         packed_out, _ = gdn(hidden_states, attention_mask=None, packed_seq_params=packed_seq_params)
 
-        # Dense reference: same tokens, reshaped so each document is its own batch
-        # element, run with no packed_seq_params (plain SBHD path).
+        # Dense reference: each document as its own batch element.
         dense_hidden_states = hidden_states.view(num_docs, doc_len, hidden).transpose(0, 1).contiguous()
         dense_out, _ = gdn(dense_hidden_states, attention_mask=None)
         dense_out_flat = dense_out.transpose(0, 1).reshape(total_len, 1, hidden)

@@ -1121,6 +1121,19 @@ def validate_args(args, defaults={}):
         # enabled; disable the flag to avoid a TP broadcast mismatch.
         if args.create_attention_mask_in_dataloader:
             args.create_attention_mask_in_dataloader = False
+        assert not args.sft, (
+            '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
+            'SFT packing already restricts attention to each packed sequence.'
+        )
+        assert args.context_parallel_size == 1, (
+            '--dataloader-inter-document-masking does not support context parallelism '
+            'yet: document boundaries are not guaranteed to be divisible by '
+            '2 * context-parallel-size, which the THD CP partitioning requires.'
+        )
+        assert not args.hybrid_context_parallel, (
+            '--dataloader-inter-document-masking does not support hybrid context '
+            'parallelism yet.'
+        )
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None

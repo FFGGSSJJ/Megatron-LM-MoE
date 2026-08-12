@@ -20,7 +20,6 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
@@ -67,6 +66,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch.
@@ -189,7 +189,6 @@ def loss_func(
     """
     args = get_args()
 
-
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
@@ -264,10 +263,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params,
                 )
-                
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
-                
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )

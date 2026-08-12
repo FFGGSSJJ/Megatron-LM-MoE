@@ -189,6 +189,42 @@ def test_inter_document_masking():
     assert not torch.any(sample["loss_mask"])
     assert "cu_seqlens" in sample
 
+    # The token stream itself must be untouched.
+    baseline_config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=sequence_length,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+        inter_document_masking=False,
+    )
+    baseline = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [100, 100, 100], lambda: True, baseline_config
+    ).build()
+
+    for idx in range(N):
+        packed = datasets[0][idx]
+        plain = baseline[0][idx]
+        assert torch.equal(packed["tokens"], plain["tokens"])
+        assert torch.equal(packed["labels"], plain["labels"])
+        assert torch.equal(packed["loss_mask"], plain["loss_mask"])
+        assert "cu_seqlens" not in plain
+
+    # Samples with different document counts must collate into one batch.
+    from torch.utils.data._utils.collate import default_collate
+
+    batch = default_collate([datasets[0][i] for i in range(4)])
+    assert batch["cu_seqlens"].shape == (4, sequence_length + 1)
+    assert batch["max_seqlen"].shape == (4,)
+    merged = _merge_cu_seqlens_across_micro_batch(batch["cu_seqlens"], sequence_length)
+    assert merged[0].item() == 0
+    assert merged[-1].item() == 4 * sequence_length
+    assert torch.all(merged[1:] - merged[:-1] > 0)
+
 
 if __name__ == "__main__":
     test_mock_gpt_dataset()

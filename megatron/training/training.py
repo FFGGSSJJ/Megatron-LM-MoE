@@ -3457,6 +3457,8 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
 
@@ -3511,8 +3513,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=_pipeline_shape_args(args)[0],
-                micro_batch_size=_pipeline_shape_args(args)[1],
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3583,8 +3585,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                seq_length=_pipeline_shape_args(args)[0],
-                micro_batch_size=_pipeline_shape_args(args)[1],
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,

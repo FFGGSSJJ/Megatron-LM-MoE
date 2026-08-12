@@ -523,16 +523,19 @@ class GPTDataset(MegatronDataset):
                     document_lengths[-1] += shortfall
                 else:
                     document_lengths.append(shortfall)
+            assert shortfall >= 0, (
+                f"packed sample is longer than sequence_length: "
+                f"{sum(document_lengths)} > {self.config.sequence_length}"
+            )
             cu_seqlens = torch.tensor(numpy.cumsum([0] + document_lengths), dtype=torch.int32)
 
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seqlens.max()
 
             # Reset position IDs per document.
-            position_ids = position_ids.clone()
-            for i in range(1, cu_seqlens.numel()):
-                start = cu_seqlens[i - 1].item()
-                end = cu_seqlens[i].item()
-                position_ids[start:end] = torch.arange(end - start, dtype=torch.long)
+            position_ids = torch.arange(
+                self.config.sequence_length, dtype=torch.long
+            ) - torch.repeat_interleave(cu_seqlens[:-1].long(), seqlens.long())
 
             # Pad cu_seqlens to a fixed length so that default_collate can stack
             # samples with different numbers of documents. Trailing entries are

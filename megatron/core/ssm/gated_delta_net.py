@@ -297,6 +297,7 @@ class GatedDeltaNet(MegatronModule):
             raise NotImplementedError("GDN does not support inference for now.")
 
         cu_seqlens = None
+        conv_seq_idx = None
         if packed_seq_params is not None:
             assert packed_seq_params.qkv_format == 'thd', (
                 "GDN packed-sequence support expects THD-format packed_seq_params "
@@ -323,11 +324,30 @@ class GatedDeltaNet(MegatronModule):
                     "deterministic_mode's torch_chunk_gated_delta_rule fallback does "
                     "not support cu_seqlens."
                 )
+            if causal_conv1d_fn is None:
+                raise NotImplementedError(
+                    "GDN packed sequence requires the causal_conv1d CUDA kernel "
+                    "(its seq_idx argument is what resets the conv at document "
+                    "boundaries); the nn.Conv1d fallback cannot mask them."
+                )
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv), (
                 "GDN packed sequence requires cu_seqlens_q == cu_seqlens_kv."
             )
             cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
+            assert int(cu_seqlens[-1].item()) == seq_len, (
+                f"cu_seqlens must cover the whole packed sequence: "
+                f"cu_seqlens[-1]={int(cu_seqlens[-1].item())} != seq_len={seq_len}"
+            )
+            # causal_conv1d masks document boundaries with per-token segment
+            # ids, not with cu_seqlens.
+            _doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            conv_seq_idx = torch.repeat_interleave(
+                torch.arange(
+                    _doc_lengths.numel(), device=cu_seqlens.device, dtype=torch.int32
+                ),
+                _doc_lengths,
+            ).unsqueeze(0)
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -365,9 +385,7 @@ class GatedDeltaNet(MegatronModule):
                 weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
                 bias=self.conv1d.bias,
                 activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                seq_idx=conv_seq_idx,
             )
         nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
