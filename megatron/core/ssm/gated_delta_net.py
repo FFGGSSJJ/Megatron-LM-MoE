@@ -374,7 +374,11 @@ class GatedDeltaNet(MegatronModule):
         alpha = alpha.reshape(batch, seq_len, -1)
 
         # Convolution on qkv
-        qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+        qkv = qkv.transpose(1, 2)  # b, s, d -> b, d, s
+        if conv_seq_idx is None:
+            # seq_idx requires channel-last input, so only materialize the
+            # transpose on the unpacked path.
+            qkv = qkv.contiguous()
         nvtx_range_push(suffix="conv1d")
         if (causal_conv1d_fn is None) or self.config.deterministic_mode:
             qkv = self.act_fn(self.conv1d(qkv)[..., :seq_len])
