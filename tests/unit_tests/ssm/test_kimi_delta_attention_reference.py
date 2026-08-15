@@ -150,7 +150,10 @@ class TestKimiDeltaAttentionReferenceParameterization:
         finally:
             self.kda.gated_delta_rule = original_gated_delta_rule
 
-        assert kernel_kwargs["use_qk_l2norm_in_kernel"] is False
+        assert (
+            kernel_kwargs["use_qk_l2norm_in_kernel"]
+            == self.kda._qk_l2norm_in_kernel
+        )
         assert (
             kernel_kwargs.get("use_gate_in_kernel", False)
             == self.kda._use_fused_decay_gate

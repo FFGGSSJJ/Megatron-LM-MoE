@@ -1931,6 +1931,12 @@ class TransformerConfig(ModelParallelConfig):
                     "core_attn",
                     "moe_act",
                     "layernorm",
+                    # Linear-attention (KDA/GDN) core: conv1d -> chunk kernel ->
+                    # gated norm. The FLA chunk kernels hold q/k/v, the fp32
+                    # decay and beta for their own backward, so this region is
+                    # the only place those can be freed. See
+                    # KimiDeltaAttention._kda_core.
+                    "linear_attn",
                     "mla_up_proj",
                     "qkv",
                     "mlp",
