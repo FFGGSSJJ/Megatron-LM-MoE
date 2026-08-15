@@ -1830,6 +1830,24 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _pipeline_shape_args(args):
+    """
+    Return the (seq_length, micro_batch_size) used to size pipeline P2P buffers.
+
+    When using THD packing (`dataloader_inter_document_masking` or `sft`) with
+    `micro_batch_size > 1`, the packed token stream is laid out as
+    `(mbs * seq, 1)` rather than `(seq, mbs)`. Report the collapsed shape
+    so the pipeline send/recv buffers match the actual tensor layout.
+    """
+    is_packed = (
+        getattr(args, 'dataloader_inter_document_masking', False)
+        or getattr(args, 'sft', False)
+    )
+    if is_packed and args.micro_batch_size > 1:
+        return args.seq_length * args.micro_batch_size, 1
+    return args.seq_length, args.micro_batch_size
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1895,13 +1913,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=pp_seq_length,
+            micro_batch_size=pp_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -2217,13 +2236,18 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
-        track_names.append("expert_max_violation")
-        track_names.append("expert_min_violation")
-        track_names.append("expert_median_violation")
+        if "mbs" in args.moe_router_violation_metrics:
+            track_names.append("expert_max_violation")
+            track_names.append("expert_min_violation")
+            track_names.append("expert_median_violation")
+        if "seq" in args.moe_router_violation_metrics:
+            track_names.append("seq_expert_max_violation")
+            track_names.append("seq_expert_min_violation")
+            track_names.append("seq_expert_median_violation")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
-        if args.moe_router_ep_violation_metrics:
+        if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")
@@ -3438,6 +3462,8 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
 
@@ -3492,8 +3518,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3564,8 +3590,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,

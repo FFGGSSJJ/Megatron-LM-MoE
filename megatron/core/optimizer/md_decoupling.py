@@ -505,6 +505,17 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 is_router,
                 is_merged_offload_expert,
             )
+        # A hypersphere-normalized matrix is projected back onto its fixed-radius sphere at the
+        # end of this step (see the post-step normalization below), which discards any global
+        # rescaling of `p`. Weight decay on such a param does NOT decay it — it only re-weights
+        # the direction update to an effective lr/(1 - wd*lr). Skip WD for those: magnitude is
+        # carried by the gains (decayed via gains_weight_decay) and the non-normalized params are
+        # decayed by the chained Adam. `_will_normalize` mirrors the guard on the post-step
+        # normalization so the two stay in lockstep.
+        _will_normalize = (
+            (p.ndim == 2 or (p.ndim == 3 and is_merged_offload_expert))
+            and self._resolve_mode(is_embedding, is_router) is not None
+        )
 
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
@@ -519,7 +530,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             assert emerging_optimizers is not None, (
                 "emerging_optimizers package required for --use-orthogonal-updates"
             )
-            self._apply_weight_decay_inplace(p, group)
+            if not _will_normalize:
+                self._apply_weight_decay_inplace(p, group)
             exp_avg.lerp_(grad, 1 - momentum_beta)
             if self.use_nesterov:
                 grad = grad.lerp(exp_avg, momentum_beta)
@@ -558,14 +570,14 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
                 update = exp_avg.div(bias_correction1) / denom
 
-            self._apply_weight_decay_inplace(p, group)
+            if not _will_normalize:
+                self._apply_weight_decay_inplace(p, group)
 
         # Apply update.
         p.add_(update, alpha=-group["lr"])
 
         # Post-step hypersphere normalization (matrix clipping).
-        is_valid_p = (p.ndim == 2 or (len(p.shape) == 3 and is_merged_offload_expert))
-        if is_valid_p and self._resolve_mode(is_embedding, is_router) is not None:
+        if _will_normalize:
             self._normalize(p, p, is_qkv=is_qkv, is_out_proj=is_out_proj,
                             is_embedding=is_embedding, is_router=is_router,
                             is_merged_offload_expert=is_merged_offload_expert)
