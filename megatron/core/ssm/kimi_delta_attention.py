@@ -48,6 +48,7 @@ from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNetSubmodules,
     causal_conv1d,
     get_parameter_local_cp,
+    conv1d_input_for_backend,
     nvtx_range_pop,
     nvtx_range_push,
     tensor_a2a_cp2hp,
@@ -216,7 +217,8 @@ class KimiDeltaAttention(GatedDeltaNet):
       4. The normal per-channel output-gate path uses FLA's fused sigmoid-gated
          RMSNorm; the optional scalar/disabled gate modes retain an unfused path.
 
-    TP/CP forward execution is supported. KDA distributed-checkpoint splitting
+    TP/CP forward execution is supported, including cross-document masking through
+    THD `packed_seq_params`. KDA distributed-checkpoint splitting
     remains a separate TODO because the inherited GDN checkpoint factory assumes
     the GDN projection layout.
     """
@@ -550,6 +552,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         hidden_states: torch.Tensor,
         batch: int,
         seq_len: int,
+        packed_seq_params=None,
+        cu_seqlens=None,
     ):
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -619,24 +623,28 @@ class KimiDeltaAttention(GatedDeltaNet):
             head_dim=-1,
             cp_group=self.pg_collection.cp,
             split_sections=qkv_channels_split_sections,
+            packed_seq_params=packed_seq_params,
         )
         gate = tensor_a2a_cp2hp(
             gate,
             seq_dim=0,
             head_dim=-1,
             cp_group=self.pg_collection.cp,
+            packed_seq_params=packed_seq_params,
         )
         beta = tensor_a2a_cp2hp(
             beta,
             seq_dim=0,
             head_dim=-1,
             cp_group=self.pg_collection.cp,
+            packed_seq_params=packed_seq_params,
         )
         alpha = tensor_a2a_cp2hp(
             alpha,
             seq_dim=0,
             head_dim=-1,
             cp_group=self.pg_collection.cp,
+            packed_seq_params=packed_seq_params,
         )
 
         # Transpose separately: s b x --> b s x.
@@ -672,10 +680,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             qkv = qkv.transpose(1, 2)
         else:
             assert self.activation in ["silu", "swish"]
+            qkv, backend = conv1d_input_for_backend(qkv, self._conv1d_backend)
             qkv, _ = causal_conv1d(
                 x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
                 activation=self.activation, initial_state=None,
-                output_final_state=False, backend=self._conv1d_backend,
+                output_final_state=False, backend=backend,
+                cu_seqlens=cu_seqlens,
             )
         nvtx_range_pop(suffix="conv1d")
 
@@ -711,9 +721,25 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         if inference_context is not None:
             raise NotImplementedError("KDA does not support inference for now.")
-        if packed_seq_params is not None:
-            raise NotImplementedError("KDA does not support packed sequence for now.")
         assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
+
+        # Cross-document masking. The conv and chunk_kda both run on the full
+        # sequence (SP undone by in_proj's all-gather, CP by the cp2hp all-to-all),
+        # so the dataloader's global cu_seqlens is what both kernels want.
+        cu_seqlens = self._resolve_packed_cu_seqlens(packed_seq_params, seq_len, batch)
+        if cu_seqlens is not None:
+            if self.config.deterministic_mode:
+                raise NotImplementedError(
+                    "KDA packed sequence requires the FLA kernels; deterministic_mode's "
+                    "F.conv1d fallback ignores cu_seqlens and leaks the convolution "
+                    "window across document boundaries."
+                )
+            if self.initial_state_param is not None or self._carry_enabled:
+                raise NotImplementedError(
+                    "KDA packed sequence does not support a recurrent initial state: "
+                    "cu_seqlens makes chunk_kda expect one state per document, while "
+                    "the learnable/carried state is per batch element."
+                )
 
         # 1. in_proj + conv1d + split
         # 2. decay_out_proj (low-rank -> vector decay)
@@ -725,12 +751,19 @@ class KimiDeltaAttention(GatedDeltaNet):
             # Only tensors may be passed as checkpoint args (they go through
             # ctx.save_for_backward); bind the shape ints into the callable instead.
             query, key, value, gate, beta, alpha = self.qkv_checkpoint.checkpoint(
-                partial(self._in_proj_to_attn_inputs, batch=batch, seq_len=seq_len),
+                partial(
+                    self._in_proj_to_attn_inputs,
+                    batch=batch,
+                    seq_len=seq_len,
+                    packed_seq_params=packed_seq_params,
+                    cu_seqlens=cu_seqlens,
+                ),
                 hidden_states,
             )
         else:
-            query, key, value, gate, beta, alpha = \
-                self._in_proj_to_attn_inputs(hidden_states, batch, seq_len)
+            query, key, value, gate, beta, alpha = self._in_proj_to_attn_inputs(
+                hidden_states, batch, seq_len, packed_seq_params, cu_seqlens
+            )
 
         # FLA computes the vector decay from raw alpha, A_log, and dt_bias inside
         # chunk_kda. Newer FLA versions can also fuse beta.float().sigmoid().
@@ -778,7 +811,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         # state must escape, since the bookkeeping below must not run twice.
         core_args = (query, key, value, gate, beta, alpha,
                      A_log_local_cp, dt_bias_local_cp,
-                     initial_state_f32, need_final_state)
+                     initial_state_f32, need_final_state, cu_seqlens)
         if self._recompute_core and torch.is_grad_enabled() and not need_final_state:
             norm_out, last_recurrent_state = torch.utils.checkpoint.checkpoint(
                 self._kda_core, *core_args, use_reentrant=False,
@@ -828,7 +861,13 @@ class KimiDeltaAttention(GatedDeltaNet):
         # Transpose back to sbhd, CP a2a HP→CP, output projection.
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
-        norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+        norm_out = tensor_a2a_hp2cp(
+            norm_out,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+            packed_seq_params=packed_seq_params,
+        )
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
@@ -836,7 +875,7 @@ class KimiDeltaAttention(GatedDeltaNet):
 
     def _kda_core(self, query, key, value, gate, beta, alpha,
                   A_log_local_cp, dt_bias_local_cp,
-                  initial_state_f32, need_final_state):
+                  initial_state_f32, need_final_state, cu_seqlens=None):
         """chunk_kda -> gated norm: the region that frees what the kernel saves.
 
         Kept self-contained so it can be handed to `torch.utils.checkpoint`
@@ -863,6 +902,8 @@ class KimiDeltaAttention(GatedDeltaNet):
             "output_final_state": need_final_state,
             "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
         }
+        if cu_seqlens is not None:
+            kda_kwargs["cu_seqlens"] = cu_seqlens
         if self._use_fused_decay_gate:
             kda_kwargs["use_gate_in_kernel"] = True
             kda_kwargs["A_log"] = A_log_local_cp
