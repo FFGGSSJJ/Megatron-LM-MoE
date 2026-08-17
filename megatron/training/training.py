@@ -2050,6 +2050,7 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    config=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2418,7 +2419,12 @@ def training_log(
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                report_theoretical_memory(
+                    args,
+                    num_microbatches=num_microbatches,
+                    verbose=True,
+                    config=config,
+                )
             report_memory(f'(after {iteration} iterations)')
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
@@ -3314,6 +3320,7 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            config=config,
         )
         is_first_iteration = False
 
