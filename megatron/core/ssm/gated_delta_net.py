@@ -873,6 +873,24 @@ class GatedDeltaNet(MegatronModule):
             beta = beta * self.config.linear_attention_beta_scale
         return g, beta
 
+    def _in_proj_sharded_split(self):
+        """Per-TP-rank sections of the fused in_proj, and a name for each.
+
+        Subclasses that repack in_proj override this. The sections must sum to
+        in_proj_dim // tp_size, or _split_tensor_factory rejects the checkpoint.
+        """
+        return (
+            [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+            ["query", "key", "value", "z", "beta", "alpha"],
+        )
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         # Guard for cases metadata is not provided
@@ -924,17 +942,11 @@ class GatedDeltaNet(MegatronModule):
             sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 
+        in_proj_sections, in_proj_names = self._in_proj_sharded_split()
         sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            ["query", "key", "value", "z", "beta", "alpha"],
+            in_proj_sections,
+            in_proj_names,
             0,
         )
 

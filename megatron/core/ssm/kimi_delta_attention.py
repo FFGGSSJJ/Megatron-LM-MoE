@@ -218,9 +218,9 @@ class KimiDeltaAttention(GatedDeltaNet):
          RMSNorm; the optional scalar/disabled gate modes retain an unfused path.
 
     TP/CP forward execution is supported, including cross-document masking through
-    THD `packed_seq_params`. KDA distributed-checkpoint splitting
-    remains a separate TODO because the inherited GDN checkpoint factory assumes
-    the GDN projection layout.
+    THD `packed_seq_params`. Distributed checkpointing overrides
+    `_in_proj_sharded_split` so the fused in_proj is split on KDA's own layout
+    rather than GDN's.
     """
 
     def __init__(
@@ -489,6 +489,28 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         self.qkv_checkpoint = None
 
+
+    def _in_proj_sharded_split(self):
+        """KDA repacks in_proj, so the inherited GDN split does not apply.
+
+        GDN fuses [Q, K, V, z, beta, alpha]; KDA fuses
+        [Q, K, V, f_a, g_a, beta], where the two low-rank bottlenecks replace
+        GDN's full-width z and per-head alpha. Using GDN's sections here asks
+        _split_tensor_factory for 2*qk + 2*v + 2*num_v_heads rows out of a
+        tensor that only has 2*qk + v + 2*gate_low_rank + num_v_heads, which
+        fails the moment a distributed checkpoint is saved.
+        """
+        return (
+            [
+                self.qk_dim_local_tp,                     # Q
+                self.qk_dim_local_tp,                     # K
+                self.v_dim_local_tp,                      # V
+                self.gate_low_rank_dim // self.tp_size,   # f_a, decay bottleneck
+                self.gate_low_rank_dim // self.tp_size,   # g_a, output-gate bottleneck
+                self.num_value_heads // self.tp_size,     # beta
+            ],
+            ["query", "key", "value", "decay_low_rank", "gate_low_rank", "beta"],
+        )
 
     def _reset_kda_decay_params(self, A_init_range: Tuple[float, float]) -> None:
         if not self.config.perform_initialization:
