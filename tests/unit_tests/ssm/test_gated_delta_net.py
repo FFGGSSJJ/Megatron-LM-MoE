@@ -22,7 +22,9 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.packed_seq_utils import (
     assert_masking_isolates_documents,
+    assert_packed_backward_matches_dense,
     assert_packed_matches_dense,
+    gated_backward_blocked_by_fla,
 )
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -150,6 +152,14 @@ class TestGatedDeltaNet:
         in dense (SBHD) mode."""
         assert_packed_matches_dense(self.gdn, self.sp_size, self.cp_size)
 
+    @pytest.mark.skipif(
+        gated_backward_blocked_by_fla(),
+        reason="FLA blocks the gated chunk backward on Hopper with triton <3.7.1 (#640).",
+    )
+    def test_backward_thd_matches_per_document_dense(self):
+        """Packed backward must match the per-document dense reference."""
+        assert_packed_backward_matches_dense(self.gdn, self.sp_size, self.cp_size)
+
     def test_forward_thd_masks_across_documents(self):
         """Uneven documents must stay isolated from each other."""
         assert_masking_isolates_documents(
@@ -166,6 +176,10 @@ class TestGatedDeltaNet:
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(
+    gated_backward_blocked_by_fla(),
+    reason="FLA blocks the gated chunk backward on Hopper with triton <3.7.1 (#640).",
+)
 def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     # Constants
     seed = 123
