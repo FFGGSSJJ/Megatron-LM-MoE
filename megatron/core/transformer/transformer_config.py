@@ -559,6 +559,16 @@ class TransformerConfig(ModelParallelConfig):
     SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
     gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
 
+    kda_disable_output_norm: bool = False
+    """If True, skip the inner per-head RMSNorm in the Kimi Delta Attention output path (the
+    reference "gated norm"), keeping only the sigmoid output gate: out = core_out * sigmoid(gate)
+    instead of RMSNorm(core_out) * sigmoid(gate). This removes only the normalization, not the
+    gate. Intended for stacks that already normalize this path externally (e.g. sandwich-norm's
+    post-sublayer norm, applied after out_proj), where the inner normalization is redundant.
+    Honored by KimiDeltaAttention: the fused RMSNorm+gate kernel is bypassed and the inherited
+    out_norm is dropped when this is set. The output gate itself (linear_attention_use_output_gate)
+    is unaffected."""
+
     linear_attention_carry_state: bool = False
     """If True, carry the recurrent state across forward passes. Each forward pulls the
     previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back
