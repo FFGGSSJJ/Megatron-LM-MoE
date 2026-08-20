@@ -441,9 +441,46 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        cu_seqlens = None
         if packed_seq_params is not None:
-            # TODO: support packed sequence
-            raise NotImplementedError("GDN does not support packed sequence for now.")
+            assert packed_seq_params.qkv_format == 'thd', (
+                "GDN packed-sequence support expects THD-format packed_seq_params "
+                f"(got qkv_format={packed_seq_params.qkv_format!r})."
+            )
+            if self.pg_collection.cp.size() > 1:
+                # TODO: support packed sequence + CP. Needs a THD-aware CP all-to-all
+                # permutation, which this repo's CP scheme does not implement yet.
+                raise NotImplementedError(
+                    "GDN does not support packed sequence (cross-document masking) "
+                    "together with context parallelism yet."
+                )
+            if self.sp_size > 1:
+                # TODO: support packed sequence + sequence-parallelism. The TP-sharded
+                # sequence chunk each rank sees would need to carry its own slice of
+                # cu_seqlens, which nothing here computes yet.
+                raise NotImplementedError(
+                    "GDN does not support packed sequence (cross-document masking) "
+                    "together with sequence-parallelism yet."
+                )
+            if self.config.deterministic_mode:
+                raise NotImplementedError(
+                    "GDN packed sequence requires the FLA kernels; deterministic_mode's "
+                    "F.conv1d / torch_chunk_gated_delta_rule fallbacks ignore cu_seqlens."
+                )
+            if self.n_hh > 1:
+                raise NotImplementedError(
+                    "GDN packed sequence does not support DeltaProduct "
+                    "(--linear-attention-n-householder > 1) yet."
+                )
+            assert batch == 1, "Packed sequence expects batch dimension to be 1"
+            assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv), (
+                "GDN packed sequence requires cu_seqlens_q == cu_seqlens_kv."
+            )
+            cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
+            assert int(cu_seqlens[-1].item()) == seq_len, (
+                f"cu_seqlens must cover the whole packed sequence: "
+                f"cu_seqlens[-1]={int(cu_seqlens[-1].item())} != seq_len={seq_len}"
+            )
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -538,6 +575,7 @@ class GatedDeltaNet(MegatronModule):
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
+                cu_seqlens=cu_seqlens,
             )
         nvtx_range_pop(suffix="conv1d")
 
@@ -645,6 +683,8 @@ class GatedDeltaNet(MegatronModule):
 
         nvtx_range_push(suffix="gated_delta_rule")
         fla_extra_kwargs = {"num_householder": n_hh} if n_hh > 1 else {}
+        if cu_seqlens is not None:
+            fla_extra_kwargs["cu_seqlens"] = cu_seqlens
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query,
             key,

@@ -178,9 +178,10 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-from megatron.core.optimizer.md_decoupling import (
+from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
-    get_megatron_mddecoupling_optimizer,
+    collect_muon_stats,
 )
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -1858,6 +1859,24 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _pipeline_shape_args(args):
+    """
+    Return the (seq_length, micro_batch_size) used to size pipeline P2P buffers.
+
+    When using THD packing (`dataloader_inter_document_masking` or `sft`) with
+    `micro_batch_size > 1`, the packed token stream is laid out as
+    `(mbs * seq, 1)` rather than `(seq, mbs)`. Report the collapsed shape
+    so the pipeline send/recv buffers match the actual tensor layout.
+    """
+    is_packed = (
+        getattr(args, 'dataloader_inter_document_masking', False)
+        or getattr(args, 'sft', False)
+    )
+    if is_packed and args.micro_batch_size > 1:
+        return args.seq_length * args.micro_batch_size, 1
+    return args.seq_length, args.micro_batch_size
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1923,13 +1942,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=pp_seq_length,
+            micro_batch_size=pp_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -2059,6 +2079,7 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    config=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2204,11 +2225,6 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if md_gain_stats:
-            for metric_name, metric_value in md_gain_stats.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
-            if wandb_writer:
-                wandb_writer.log(md_gain_stats, iteration)
         if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
@@ -2231,6 +2247,13 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
 
+    if md_gain_stats:
+        if writer:
+            for metric_name, metric_value in md_gain_stats.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+        if wandb_writer:
+            wandb_writer.log(md_gain_stats, iteration)
+
     # Log MoE metrics.
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
@@ -2243,13 +2266,18 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
-        track_names.append("expert_max_violation")
-        track_names.append("expert_min_violation")
-        track_names.append("expert_median_violation")
+        if "mbs" in args.moe_router_violation_metrics:
+            track_names.append("expert_max_violation")
+            track_names.append("expert_min_violation")
+            track_names.append("expert_median_violation")
+        if "seq" in args.moe_router_violation_metrics:
+            track_names.append("seq_expert_max_violation")
+            track_names.append("seq_expert_min_violation")
+            track_names.append("seq_expert_median_violation")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
-        if args.moe_router_ep_violation_metrics:
+        if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")
@@ -2420,7 +2448,12 @@ def training_log(
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                report_theoretical_memory(
+                    args,
+                    num_microbatches=num_microbatches,
+                    verbose=True,
+                    config=config,
+                )
             report_memory(f'(after {iteration} iterations)')
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
@@ -3281,8 +3314,22 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if args.log_muon_md_gains and iteration % args.tensorboard_log_interval == 0:
-            md_gain_stats = collect_md_gain_stats(optimizer)
+        if args.log_muon_gains or args.log_muon_sparsity or args.log_muon_param_rms:
+            muon_log_interval = args.muon_log_interval or args.log_interval
+            if iteration % muon_log_interval == 0:
+                stats_collector = (
+                    collect_md_gain_stats
+                    if args.optimizer == "md_decoupling"
+                    else collect_muon_stats
+                )
+                md_gain_stats = stats_collector(
+                    optimizer,
+                    per_layer=args.log_muon_per_layer,
+                    sparsity_thresholds=args.muon_sparsity_thresholds,
+                    log_gains=args.log_muon_gains,
+                    log_sparsity=args.log_muon_sparsity,
+                    log_param_rms=args.log_muon_param_rms,
+                )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3302,6 +3349,7 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            config=config,
         )
         is_first_iteration = False
 
@@ -3450,6 +3498,8 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
 
@@ -3504,8 +3554,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3576,8 +3626,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
