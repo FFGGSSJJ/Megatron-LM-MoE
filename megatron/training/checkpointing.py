@@ -871,11 +871,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
                                   cpu_priority=None, io_priority=None):
     """Module-level function for async checkpoint deletion.
-    
+
     This function can be pickled and executed by the async worker process.
     Note: This is only called from rank 0, so we use regular print() instead of print_rank_0()
     since torch.distributed won't be initialized in the async worker process.
-    
+
     Args:
         save_path (str): Path to the checkpoints directory
         iteration_to_delete (int): Iteration number of checkpoint to delete
@@ -1555,6 +1555,9 @@ def load_args_from_checkpoint(
     _set_arg('qk_layernorm', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    _set_arg('window_size', force=True)
+    _set_arg('window_attn_skip_freq', force=True)
+    _set_arg('no_rope_freq', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
@@ -1578,6 +1581,9 @@ def load_args_from_checkpoint(
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
+    # Quantile balancing changes inference routing through the checkpointed qb_beta.
+    _set_arg('moe_router_load_balancing_type', force=True)
+    _set_arg('moe_router_quantile_balancing_method', force=True)
 
     # MLA args.
     _set_arg('multi_latent_attention', force=True)
@@ -1900,7 +1906,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     )
 
     del load_kwargs
-    # collect the freed reference to load_kwargs so that CUDA can let go of load_kwargs["sharded_state_dict"] 
+    # collect the freed reference to load_kwargs so that CUDA can let go of load_kwargs["sharded_state_dict"]
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -2097,10 +2103,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
-                 
+
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg="After loading checkpoint")
-        
+
     # Additional callback for wandb (last rank)
     if not torch.distributed.is_initialized() \
        or is_last_rank():
