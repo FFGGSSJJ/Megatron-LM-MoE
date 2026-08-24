@@ -353,6 +353,10 @@ class GatedDeltaNet(MegatronModule):
         # Slot for per-step state stats; populated by forward when state-stats logging is on.
         self._last_state_stats: Optional[dict] = None
 
+        # The packed-sequence shape checks read device memory, so run them the
+        # first time this layer sees packed params and not on every step.
+        self._packed_cu_seqlens_validated = False
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
@@ -399,6 +403,33 @@ class GatedDeltaNet(MegatronModule):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
+    def _resolve_packed_cu_seqlens(
+        self,
+        packed_seq_params: Optional[PackedSeqParams],
+        seq_len: int,
+        batch: int,
+    ) -> Optional[torch.Tensor]:
+        """The cu_seqlens the FLA kernels want, or None when unpacked.
+
+        ``seq_len`` is the GLOBAL sequence length: the layer materializes the
+        whole sequence before the convolution (sequence-parallelism is undone by
+        in_proj's all-gather, context-parallelism by the cp2hp all-to-all), so
+        the dataloader's cu_seqlens applies verbatim on every rank.
+        """
+        if packed_seq_params is None:
+            return None
+        assert packed_seq_params.qkv_format == 'thd', (
+            f"{type(self).__name__} packed-sequence support expects THD-format "
+            f"packed_seq_params (got qkv_format={packed_seq_params.qkv_format!r})."
+        )
+        cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
+        if not self._packed_cu_seqlens_validated:
+            validate_packed_cu_seqlens(
+                packed_seq_params, cu_seqlens, seq_len, batch, type(self).__name__
+            )
+            self._packed_cu_seqlens_validated = True
+        return cu_seqlens
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -441,27 +472,8 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
-        cu_seqlens = None
-        if packed_seq_params is not None:
-            assert packed_seq_params.qkv_format == 'thd', (
-                "GDN packed-sequence support expects THD-format packed_seq_params "
-                f"(got qkv_format={packed_seq_params.qkv_format!r})."
-            )
-            if self.pg_collection.cp.size() > 1:
-                # TODO: support packed sequence + CP. Needs a THD-aware CP all-to-all
-                # permutation, which this repo's CP scheme does not implement yet.
-                raise NotImplementedError(
-                    "GDN does not support packed sequence (cross-document masking) "
-                    "together with context parallelism yet."
-                )
-            if self.sp_size > 1:
-                # TODO: support packed sequence + sequence-parallelism. The TP-sharded
-                # sequence chunk each rank sees would need to carry its own slice of
-                # cu_seqlens, which nothing here computes yet.
-                raise NotImplementedError(
-                    "GDN does not support packed sequence (cross-document masking) "
-                    "together with sequence-parallelism yet."
-                )
+        cu_seqlens = self._resolve_packed_cu_seqlens(packed_seq_params, seq_len, batch)
+        if cu_seqlens is not None:
             if self.config.deterministic_mode:
                 raise NotImplementedError(
                     "GDN packed sequence requires the FLA kernels; deterministic_mode's "
@@ -472,15 +484,12 @@ class GatedDeltaNet(MegatronModule):
                     "GDN packed sequence does not support DeltaProduct "
                     "(--linear-attention-n-householder > 1) yet."
                 )
-            assert batch == 1, "Packed sequence expects batch dimension to be 1"
-            assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv), (
-                "GDN packed sequence requires cu_seqlens_q == cu_seqlens_kv."
-            )
-            cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
-            assert int(cu_seqlens[-1].item()) == seq_len, (
-                f"cu_seqlens must cover the whole packed sequence: "
-                f"cu_seqlens[-1]={int(cu_seqlens[-1].item())} != seq_len={seq_len}"
-            )
+            if self.initial_state_param is not None or self._carry_enabled:
+                raise NotImplementedError(
+                    "GDN packed sequence does not support a recurrent initial state: "
+                    "cu_seqlens makes the kernel expect one state per document, "
+                    "while the learnable/carried state is per batch element."
+                )
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -503,6 +512,7 @@ class GatedDeltaNet(MegatronModule):
                 n_hh * num_v_heads_tp,               # beta (per-Householder)
                 num_v_heads_tp,                      # alpha (per-token)
             ],
+            packed_seq_params=packed_seq_params,
         )
 
         # Transpose: s b x --> b s x
@@ -754,7 +764,11 @@ class GatedDeltaNet(MegatronModule):
 
         # CP all to all: HP to CP
         norm_out = tensor_a2a_hp2cp(
-            norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            norm_out,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+            packed_seq_params=packed_seq_params,
         )
 
         # Output projection
@@ -859,6 +873,24 @@ class GatedDeltaNet(MegatronModule):
             beta = beta * self.config.linear_attention_beta_scale
         return g, beta
 
+    def _in_proj_sharded_split(self):
+        """Per-TP-rank sections of the fused in_proj, and a name for each.
+
+        Subclasses that repack in_proj override this. The sections must sum to
+        in_proj_dim // tp_size, or _split_tensor_factory rejects the checkpoint.
+        """
+        return (
+            [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+            ["query", "key", "value", "z", "beta", "alpha"],
+        )
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         # Guard for cases metadata is not provided
@@ -910,17 +942,11 @@ class GatedDeltaNet(MegatronModule):
             sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 
+        in_proj_sections, in_proj_names = self._in_proj_sharded_split()
         sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            ["query", "key", "value", "z", "beta", "alpha"],
+            in_proj_sections,
+            in_proj_names,
             0,
         )
 
@@ -1068,6 +1094,53 @@ def get_parameter_local_cp(
     return param
 
 
+def conv1d_input_for_backend(qkv: torch.Tensor, backend: str):
+    """Make `qkv` [b, s, d] acceptable to causal_conv1d's chosen backend.
+
+    The CUDA kernel sees x as channel-last [b, d, t] and rejects batch/channel
+    strides that are not multiples of 8. `qkv` arrives as a slice of the fused
+    in_proj output, so its strides carry the whole projection width, which is
+    8-aligned only by luck. Copy only when the check would fail, and fall back
+    to Triton (no alignment rule) when a copy cannot fix it either.
+    """
+    if backend != "cuda":
+        return qkv, backend
+    # Strides of the [b, d, t] view the kernel is handed.
+    if qkv.stride(0) % 8 or qkv.stride(1) % 8:
+        qkv = qkv.contiguous()
+        seq_len, width = qkv.shape[1], qkv.shape[2]
+        if (seq_len * width) % 8 or width % 8:
+            return qkv, "triton"
+    return qkv, backend
+
+
+def validate_packed_cu_seqlens(
+    packed_seq_params: PackedSeqParams,
+    cu_seqlens: torch.Tensor,
+    seq_len: int,
+    batch: int,
+    layer_name: str,
+) -> None:
+    """Check THD packed-sequence params against the shape the layer sees.
+
+    Both remaining checks read device memory, so callers run this once per layer
+    rather than once per step -- a mis-wired cu_seqlens is a configuration bug,
+    not something that appears mid-run.
+    """
+    assert batch == 1, (
+        f"{layer_name} packed sequence expects batch dimension to be 1 "
+        f"(flatten_batch_for_packed_sequences folds micro-batches into the "
+        f"sequence), but got batch={batch}."
+    )
+    assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv), (
+        f"{layer_name} packed sequence requires cu_seqlens_q == cu_seqlens_kv."
+    )
+    assert int(cu_seqlens[-1].item()) == seq_len, (
+        f"cu_seqlens must cover the whole packed sequence: "
+        f"cu_seqlens[-1]={int(cu_seqlens[-1].item())} != seq_len={seq_len}"
+    )
+
+
 def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
     seq_dim: int,
@@ -1075,6 +1148,7 @@ def tensor_a2a_cp2hp(
     cp_group: torch.distributed.ProcessGroup,
     split_sections: Optional[List[int]] = None,
     undo_attention_load_balancing: bool = True,
+    packed_seq_params: Optional[PackedSeqParams] = None,
 ):
     """All-to-all context parallel to hidden parallel.
 
@@ -1088,6 +1162,9 @@ def tensor_a2a_cp2hp(
             head_dim into sections first, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         undo_attention_load_balancing (bool): Whether to undo the attention load balancing of CP.
+        packed_seq_params (Optional[PackedSeqParams]): THD params. When set, the CP
+            shards were cut per document by ``tex.thd_get_partitioned_indices``
+            rather than by the plain zigzag, so the inverse permutation differs.
 
     Returns:
         torch.Tensor: The all-to-all tensor.
@@ -1127,7 +1204,7 @@ def tensor_a2a_cp2hp(
 
     # Undo attention load balancing last if needed.
     if undo_attention_load_balancing:
-        tensor = _undo_attention_load_balancing(tensor, cp_size)
+        tensor = _undo_attention_load_balancing(tensor, cp_size, packed_seq_params)
     return tensor
 
 
@@ -1138,6 +1215,7 @@ def tensor_a2a_hp2cp(
     cp_group: torch.distributed.ProcessGroup,
     split_sections: Optional[List[int]] = None,
     redo_attention_load_balancing: bool = True,
+    packed_seq_params: Optional[PackedSeqParams] = None,
 ):
     """All-to-all hidden parallel to context parallel.
 
@@ -1151,6 +1229,8 @@ def tensor_a2a_hp2cp(
             dimension head_dim into sections, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         redo_attention_load_balancing (bool): Whether to redo the attention load balancing of HP.
+        packed_seq_params (Optional[PackedSeqParams]): THD params; must match whatever
+            was passed to the paired tensor_a2a_cp2hp call.
 
     Returns:
         torch.Tensor: The all-to-all tensor.
@@ -1173,7 +1253,7 @@ def tensor_a2a_hp2cp(
 
     # Redo attention load balancing first if needed.
     if redo_attention_load_balancing:
-        tensor = _redo_attention_load_balancing(tensor, cp_size)
+        tensor = _redo_attention_load_balancing(tensor, cp_size, packed_seq_params)
 
     # Split first if needed.
     if split_sections is not None:
