@@ -138,6 +138,11 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "kda":
+        from megatron.core.ssm.kimi_delta_attention import (
+            get_kimi_delta_attention_module_spec,
+        )
+        return get_kimi_delta_attention_module_spec(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -284,7 +289,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "kda"]
     return experimental_attention_variant in linear_attention_variants
 
 
@@ -445,6 +450,7 @@ def _get_moe_module_spec(
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
         use_te_activation_func=config.use_te_activation_func,
+        moe_use_offloading_experts=config.moe_use_offloading_experts,
     )
     moe_spec.metainfo["fuse_pre_mlp_layernorm"] = False
     return moe_spec

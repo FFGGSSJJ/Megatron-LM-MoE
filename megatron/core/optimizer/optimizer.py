@@ -97,10 +97,9 @@ def _multi_tensor_copy_this_to_that(
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
 # Parameter routing attributes that param-group-aware optimizers (e.g. MDDecoupling) read off the
-# params they step on, but which are NOT covered by copy_tensor_model_parallel_attributes (that
-# only handles expert_tp / is_qkv / tensor_model_parallel / partition_dim / partition_stride).
-# These must be explicitly propagated from the model param onto the fp32 main/shard param,
-# otherwise the optimizer silently sees them as False on the main params it actually optimizes.
+# params they step on, but which are NOT covered by copy_tensor_model_parallel_attributes. That
+# helper already handles TP metadata plus QKV/MLA/KDA projection-splitting attributes. The attrs
+# below must be propagated separately from the model param onto the FP32 main/shard param.
 _MAIN_PARAM_ROUTING_ATTRS = (
     'is_out_proj',
     'is_router',

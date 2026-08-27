@@ -32,6 +32,8 @@ from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accu
 
 logger = logging.getLogger(__name__)
 
+_PARAM_NAMES: dict = {}  # id(parameter) -> qualified name, populated by DistributedDataParallel
+
 try:
     if is_torch_min_version("1.13.0"):
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -252,7 +254,40 @@ class _ParamAndGradBucketGroup:
         """
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             # Record golden per_param_grad_ready_counts.
-            assert len(self.per_param_grad_ready_counts) == len(self.params)
+            if len(self.per_param_grad_ready_counts) != len(self.params):
+                # The upstream bare assert says only "something in this bucket
+                # never fired its grad-ready hook", which on a 32-rank job means
+                # 32 identical stack traces and no lead. Name the offenders.
+                missing = [
+                    p for p in self.params if p not in self.per_param_grad_ready_counts
+                ]
+
+                def _describe(p):
+                    tags = [
+                        a
+                        for a in (
+                            "is_kda_in_proj",
+                            "is_kda_decay_parameter",
+                            "tensor_model_parallel",
+                            "sequence_parallel",
+                            "allreduce",
+                            "is_expert_parallel",
+                            "is_embedding_or_output_parameter",
+                        )
+                        if getattr(p, a, False)
+                    ]
+                    return (
+                        f"{_PARAM_NAMES.get(id(p), '<unnamed>')} "
+                        f"shape={tuple(p.shape)} dtype={p.dtype}"
+                        + (f" tags={tags}" if tags else "")
+                    )
+
+                raise AssertionError(
+                    f"{len(missing)} of {len(self.params)} parameters in this bucket "
+                    "group received no gradient in the first iteration, so "
+                    "--overlap-grad-reduce can never complete. Offenders:\n  "
+                    + "\n  ".join(_describe(p) for p in missing)
+                )
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
