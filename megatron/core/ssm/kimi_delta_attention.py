@@ -215,11 +215,6 @@ class KimiDeltaAttention(GatedDeltaNet):
          output projection, gated norm) is inherited unchanged.
       4. The normal per-channel output-gate path uses FLA's fused sigmoid-gated
          RMSNorm; the optional scalar/disabled gate modes retain an unfused path.
-         With config.kda_disable_output_norm the inner RMSNorm is
-         dropped entirely (out = core_out * sigmoid(gate)); the fused kernel is
-         bypassed and the inherited out_norm is replaced by IdentityOp so its
-         weight is never registered. Intended for use with an external norm such
-         as sandwich-norm, where the inner normalization is redundant.
 
     TP/CP forward execution is supported. KDA distributed-checkpoint splitting
     remains a separate TODO because the inherited GDN checkpoint factory assumes
@@ -449,32 +444,16 @@ class KimiDeltaAttention(GatedDeltaNet):
         # Re-init A_log + dt_bias using the reference KDA time-scale distribution.
         self._reset_kda_decay_params(A_init_range)
 
-        # Drop the inner (per-head) RMSNorm from the output path, keeping only the
-        # sigmoid output gate — for stacks that normalize this path externally
-        # (e.g. sandwich-norm's post-sublayer norm). See _apply_gated_norm.
-        self._disable_output_norm = bool(
-            getattr(self.config, "kda_disable_output_norm", False)
-        )
-
         # Match the reference FLA KDA output path. The norm is per value head,
         # hence its feature dimension is value_head_dim rather than the full
         # (TP-global) v_dim. FLA's fused kernel also applies sigmoid(gate).
-        # The fused kernel always normalizes, so it cannot serve the
-        # norm-disabled path — force it off there and fall through to the
-        # unfused gate-only branch.
         self._use_fused_output_norm_gate = (
             HAVE_FUSED_RMSNORM_GATED
-            and not self._disable_output_norm
             and self.config.normalization == "RMSNorm"
             and not self.config.layernorm_zero_centered_gamma
             and self.config.linear_attention_use_output_gate
             and self.config.linear_attention_output_gate_form == "per_channel"
         )
-        if self._disable_output_norm:
-            # Replace the RMSNorm the parent GDN built from the submodule spec
-            # with a no-op, so its weight is not registered as an unused
-            # parameter (would trip DDP / land in the optimizer and checkpoint).
-            self.out_norm = IdentityOp()
         if self._use_fused_output_norm_gate:
             self.out_norm = FusedRMSNormGated(
                 self.value_head_dim,
@@ -913,28 +892,9 @@ class KimiDeltaAttention(GatedDeltaNet):
 
     def _apply_gated_norm(self, x, gate):
         """Apply per-head RMSNorm and the reference KDA sigmoid output gate."""
-        if self._disable_output_norm:
-            return self._apply_output_gate_only(x, gate)
         if self._use_fused_output_norm_gate:
             return self.out_norm(x, gate)
         return self._apply_gated_norm_unfused(x, gate)
-
-    @jit_fuser
-    def _apply_output_gate_only(self, x, gate):
-        """Output gate WITHOUT the inner RMSNorm (kda_disable_output_norm=True).
-
-        Reduces the reference gated RMSNorm to just the sigmoid output gate:
-        out = x * sigmoid(gate), on the assumption that an outer norm (e.g.
-        sandwich-norm's post-sublayer norm) already normalizes this path. Mirrors
-        the gate handling of _apply_gated_norm_unfused, minus self.out_norm.
-        """
-        x_dtype = x.dtype
-        y = x.reshape(-1, x.shape[-1]).float()
-        if self.config.linear_attention_output_gate_form == "scalar":
-            gate = gate.mean(dim=-1, keepdim=True)
-        gate = gate.reshape(-1, gate.shape[-1])
-        y = y * torch.sigmoid(gate.float())
-        return y.to(x_dtype)
 
     @jit_fuser
     def _apply_gated_norm_unfused(self, x, gate):
